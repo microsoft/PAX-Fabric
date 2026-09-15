@@ -18,11 +18,13 @@ Each dict in the returned list is one written table::
      "is_init": <bool>, "added_cols": [<str>, ...]}
 
 Behavior notes:
-    * Same-shape CSVs from different runs land in the **same** Delta table
-      (e.g. every ``Purview_Audit_UsageActivity_CopilotInteraction_*.csv``
-      appends to ``CopilotInteraction_Raw``) — matches v1.11.1 PowerShell
-      append semantics so downstream Power BI / SQL endpoint consumers see
-      a single accumulating table per logical dataset.
+    * Same-shape CSVs from different runs land in the **same** Delta table.
+      Dashboard-shaped outputs are namespaced by a short prefix
+      (``AIO_`` / ``ValueLens_`` / ``M365_`` / ``AISID_``); dashboard-agnostic
+      tables (``CopilotInteractions_Raw``, ``Entra_Users_Raw``, ``Audit_Raw``,
+      ``Agent365``) stay shared. Same-run appends match v1.11.1 PowerShell
+      semantics so downstream Power BI / SQL endpoint consumers see a single
+      accumulating table per logical dataset.
     * Delegates the actual Delta write to
       :func:`pax_fabric.mod16_pax_delta.write_delta_append`, which provides:
         - Column-name sanitization (Delta-forbidden chars → ``_``).
@@ -53,57 +55,87 @@ from . import files_io
 # Filename → table-name mapping rules. Order matters (most specific first).
 _TS_RE = r"\d{8}_\d{6}"
 
-# Known legacy case-only columns superseded by the AIO canonical
-# DisplayName/Country rename (see processors/copilot_processor.py
-# _AIO_CANONICAL_RENAMES). The Entra_Users Delta table accumulated these
-# under an earlier schema; schema_mode='merge' never drops unused columns
-# on its own, so they'd otherwise linger forever as stale/NULL fields once
-# the current pipeline stops populating them. Purged automatically after
-# each successful Entra_Users write via mod16_pax_delta.purge_legacy_columns.
+# Tables whose schema/content is dashboard-agnostic — never take the dashboard
+# prefix even when one is resolved for the run.
+SHARED_TABLES: frozenset[str] = frozenset({
+    "CopilotInteractions_Raw",
+    "Entra_Users_Raw",
+    "Audit_Raw",
+    "Agent365",
+})
+
+# Regex-derived base name → short canonical name. Applied AFTER the regex step
+# so raw CSV stems don't need to know about presentation names, but well before
+# the dashboard prefix is stapled on. Anything not listed passes through.
+_BASE_ALIASES: dict[str, str] = {
+    "CopilotInteraction_Raw": "CopilotInteractions_Raw",
+    "CopilotInteraction_Interactions_Rollup": "CopilotInteractions",
+    "CopilotInteraction_ActiveDaysSummary_Rollup": "ActiveDaysSummary",
+    "CopilotInteraction_UserMonthMetrics_Rollup": "UserMonthMetrics",
+    "CopilotInteraction_LicensedUserRankings_Rollup": "LicensedRankings",
+    "CopilotInteraction_UnlicensedUserRankings_Rollup": "UnlicensedRankings",
+    "CopilotInteraction_LicensedUserSummary_Rollup": "LicensedSummary",
+    "CombinedActivityTypes_Raw": "Raw",
+    "CombinedActivityTypes_Rollup_Rollup": "Rollup",
+    "CombinedActivityTypes_UserStats_Rollup": "UserStats",
+    "CombinedActivityTypes_SessionCohort_Rollup": "SessionCohort",
+    "CombinedActivityTypes_SessionStats_Rollup": "SessionStats",
+    "Entra_Users": "Users",
+}
+
+# Legacy lowercase columns AIO's canonical rename superseded; purged only from
+# the AIO Users table because VL never populates them.
 _LEGACY_ENTRA_USERS_COLUMNS: tuple[str, ...] = ("displayName", "country")
 
 
-def table_name_for(csv_stem: str, overrides: Optional[dict[str, str]] = None) -> str:
+def table_name_for(
+    csv_stem: str,
+    overrides: Optional[dict[str, str]] = None,
+    dashboard_prefix: str = "",
+) -> str:
     """Derive a Delta table name from a CSV filename stem.
 
-    Mirrors the regex rules used in the Phase A driver notebook so the
-    Phase A (Files-to-Delta) and Phase B (direct) pipelines emit identical
-    table names for the same logical dataset.
+    Resolution order: ``overrides`` (win) → regex → alias map → shared/prefix.
+    ``dashboard_prefix`` is one of ``""``, ``"AIO"``, ``"VL"``, ``"M365"``,
+    ``"AISID"`` — added to non-shared tables so AIO and VL Copilot outputs
+    (schemas differ) don't collide.
     """
     overrides = overrides or {}
     if csv_stem in overrides:
         return overrides[csv_stem]
 
+    raw: str
     m = re.match(
         rf"^Purview_Audit_UsageActivity_(?P<activity>[^_]+)_{_TS_RE}_(?P<suffix>.+)$",
         csv_stem,
     )
     if m:
-        return f"{m.group('activity')}_{m.group('suffix')}_Rollup"
+        raw = f"{m.group('activity')}_{m.group('suffix')}_Rollup"
+    else:
+        m = re.match(rf"^Purview_Audit_UsageActivity_(?P<activity>[^_]+)_{_TS_RE}$", csv_stem)
+        if m:
+            raw = f"{m.group('activity')}_Raw"
+        else:
+            m = re.match(rf"^EntraUsers_MAClicensing_{_TS_RE}_(?P<suffix>.+)$", csv_stem)
+            if m:
+                raw = f"Entra_{m.group('suffix')}"
+            elif re.match(rf"^EntraUsers_MAClicensing_{_TS_RE}$", csv_stem):
+                raw = "Entra_Users_Raw"
+            elif re.match(rf"^Agent365_{_TS_RE}$", csv_stem):
+                raw = "Agent365"
+            elif re.match(rf"^Purview_Audit_{_TS_RE}$", csv_stem):
+                raw = "Audit_Raw"
+            else:
+                cleaned = re.sub(_TS_RE, "", csv_stem).strip("_")
+                cleaned = re.sub(r"_+", "_", cleaned)
+                raw = cleaned or csv_stem
 
-    m = re.match(rf"^Purview_Audit_UsageActivity_(?P<activity>[^_]+)_{_TS_RE}$", csv_stem)
-    if m:
-        return f"{m.group('activity')}_Raw"
-
-    m = re.match(rf"^EntraUsers_MAClicensing_{_TS_RE}_(?P<suffix>.+)$", csv_stem)
-    if m:
-        return f"Entra_{m.group('suffix')}"
-
-    m = re.match(rf"^EntraUsers_MAClicensing_{_TS_RE}$", csv_stem)
-    if m:
-        return "Entra_Raw"
-
-    # Agent 365 catalog snapshot (mod12 emits Agent365_<ts>.csv).
-    if re.match(rf"^Agent365_{_TS_RE}$", csv_stem):
-        return "Agent365"
-
-    if re.match(rf"^Purview_Audit_{_TS_RE}$", csv_stem):
-        return "Audit_Raw"
-
-    # Generic fallback: strip embedded timestamps and collapse underscores.
-    cleaned = re.sub(_TS_RE, "", csv_stem).strip("_")
-    cleaned = re.sub(r"_+", "_", cleaned)
-    return cleaned or csv_stem
+    base = _BASE_ALIASES.get(raw, raw)
+    if base in SHARED_TABLES:
+        return base
+    if dashboard_prefix:
+        return f"{dashboard_prefix}_{base}"
+    return base
 
 
 def _resolve_target_root(schema: str) -> tuple[str, Optional[dict]]:
@@ -130,6 +162,7 @@ def csv_dir_to_delta(
     log_fn=None,
     max_attempts: int = 4,
     token_refresh_fn=None,
+    dashboard_prefix: str = "",
 ) -> list[dict]:
     """Drain every ``*.csv`` in ``csv_dir`` into a Delta table (append mode).
 
@@ -214,7 +247,7 @@ def csv_dir_to_delta(
     results: list[dict] = []
     for csv_path in csv_files:
         stem = os.path.splitext(os.path.basename(csv_path))[0]
-        table = table_name_for(stem, name_overrides)
+        table = table_name_for(stem, name_overrides, dashboard_prefix)
         target_path = (
             f"{target_root}/{table}"
             if "://" in target_root
@@ -235,18 +268,9 @@ def csv_dir_to_delta(
         run_id_tag = f" run_id={run_id}" if run_id else ""
         _log(f"Delta append start: {table}{run_id_tag}  source={os.path.basename(csv_path)}")
 
-        # One-time cleanup: purge the legacy lowercase displayName/country
-        # columns from Entra_Users BEFORE writing. This must run before the
-        # write, not after: Delta Lake forbids two columns that differ only
-        # by case, so once the CSV carries the canonical DisplayName/Country
-        # (see processors/copilot_processor.py _AIO_CANONICAL_RENAMES) a
-        # write against a table that still has the old lowercase columns
-        # fails outright with a case-collision schema error rather than
-        # merely leaving stale data. No-op once already purged (or if the
-        # table never had them); failures are logged but never abort the
-        # write -- this is best-effort schema hygiene, not a hard
-        # dependency for the append itself.
-        if table == "Entra_Users":
+        # Legacy displayName/country are only ever written by the AIO copilot
+        # profile; purge only on the AIO Users table so ValueLens_Users isn't churned.
+        if table == "AIO_Users":
             pre_dropped = mod16_pax_delta.purge_legacy_columns(
                 target_path,
                 list(_LEGACY_ENTRA_USERS_COLUMNS),
