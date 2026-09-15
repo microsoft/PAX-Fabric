@@ -46,6 +46,7 @@ from .mod1_pax_config import (
     SCRIPT_VERSION,
     SCRIPT_RELEASE_TYPE,
     SCRIPT_RELEASE_DATE,
+    COPILOT_BASE_ACTIVITY_TYPE,
     script_version_banner,
     config_from_params,
     initialize_config,
@@ -492,6 +493,56 @@ def _recompute_userstats_from_delta(
     return results
 
 
+# -- PS-parity helpers for metrics JSON emission ------------------------------
+
+# Fields whose PascalCase form uses an acronym PS spells uppercase.
+_PARAM_KEY_OVERRIDES = {
+    "use_eom": "UseEOM",
+}
+
+
+def _to_pascal_key(name: str) -> str:
+    """snake_case -> PascalCase; PS acronym overrides applied.
+
+    Already-PascalCase strings (no underscore) pass through unchanged
+    beyond a first-letter uppercase, so activity-name dict keys like
+    ``CopilotInteraction`` remain intact.
+    """
+    if not name:
+        return name
+    if name in _PARAM_KEY_OVERRIDES:
+        return _PARAM_KEY_OVERRIDES[name]
+    if "_" not in name:
+        return name[:1].upper() + name[1:]
+    parts = [p for p in name.split("_") if p]
+    return "".join(p[:1].upper() + p[1:] for p in parts)
+
+
+def _pascalize_keys(obj: Any) -> Any:
+    """Recursively convert every dict key to PascalCase. Lists are walked."""
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            new_key = _to_pascal_key(k) if isinstance(k, str) else k
+            out[new_key] = _pascalize_keys(v)
+        return out
+    if isinstance(obj, list):
+        return [_pascalize_keys(v) for v in obj]
+    return obj
+
+
+def _iso_z(dt_val: Any) -> Any:
+    """Datetime -> PS ``Get-Date -Format 'o'`` shape (``...Z`` suffix).
+
+    Non-datetime values are returned untouched so callers can pipe every
+    field through unconditionally.
+    """
+    if isinstance(dt_val, datetime):
+        s = dt_val.isoformat()
+        return s[:-6] + "Z" if s.endswith("+00:00") else s
+    return dt_val
+
+
 def _emit_metrics_json(
     config: PAXConfig,
     ctx: PAXRunContext,
@@ -509,13 +560,21 @@ def _emit_metrics_json(
             $emitObj | ConvertTo-Json -Depth 6 | Out-File $metricsPath
         }
 
-    Fabric-side simplifications:
-      - `parameters` snapshot = dataclass-serializable view of `config`
-        (Path and non-serializable objects coerced to str). This mirrors
-        PS's ``$paramSnapshot`` intent without invoking the PS-specific
-        `Get-AISIDSnapshotFields` helper (AISID dashboard fields are absent
-        from the Fabric port surface).
-      - `metrics` = ctx.metrics dataclass -> dict (asdict).
+    Fabric parity notes:
+      - Emit-time key layout mirrors PS: PascalCase keys throughout
+        ``parameters`` and ``metrics`` blocks, plus a sibling ``aisid``
+        block (camelCase — matches PS shape). Internal Python code still
+        consumes/produces snake_case; conversion is emit-only.
+      - ``ClientSecret`` is redacted to ``"[securestring provided]"``
+        whenever a secret is present (parity with PS SecureString marker).
+      - ``IncludeCopilotInteraction`` is derived from resolved
+        ``activity_types`` so the metric reflects intent even when the
+        explicit switch was not passed (PS auto-includes when
+        ``-ActivityTypes`` contains ``CopilotInteraction``).
+      - Datetimes are serialized in PS ``Get-Date -Format 'o'`` shape
+        (``YYYY-MM-DDTHH:MM:SS.ffffffZ``).
+      - ``ActivityTypes``/``RecordTypes``/``ServiceTypes`` collapse to
+        comma-joined strings, and empty string knobs render as ``""``.
       - Failure is non-fatal: a WARN log line matches PS behavior.
 
     Returns the emit path on success, None otherwise. Also stamps
@@ -561,11 +620,57 @@ def _emit_metrics_json(
             if isinstance(v, Path):
                 params_dict[k] = str(v)
 
+        # -- PS-parity: parameters snapshot --
+        # 1. Redact client secret (PS shows literal "[securestring provided]").
+        if params_dict.get("client_secret"):
+            params_dict["client_secret"] = "[securestring provided]"
+        # 2. Derive IncludeCopilotInteraction from resolved activity_types so
+        #    Fabric metrics match PS when the switch is implicit.
+        _at = params_dict.get("activity_types") or []
+        if (
+            isinstance(_at, (list, tuple))
+            and COPILOT_BASE_ACTIVITY_TYPE in _at
+            and not params_dict.get("exclude_copilot_interaction")
+        ):
+            params_dict["include_copilot_interaction"] = True
+        # 3. PS emits comma-joined strings, not lists, for these fields.
+        for _lk in ("activity_types", "record_types", "service_types"):
+            _v = params_dict.get(_lk)
+            if isinstance(_v, (list, tuple)):
+                params_dict[_lk] = ",".join(str(x) for x in _v)
+            elif _v is None:
+                params_dict[_lk] = ""
+        # 4. PS emits "" for optional string knobs when unset.
+        for _sk in ("agent_id", "user_ids", "prompt_filter", "filler_label_text"):
+            if params_dict.get(_sk) is None:
+                params_dict[_sk] = ""
+        # 5. PS shows "none" when no filler label is chosen.
+        if params_dict.get("filler_label") is None:
+            params_dict["filler_label"] = "none"
+
+        # -- PS-parity: metrics snapshot -- datetime -> PS "o" format.
+        for _mk, _mv in list(metrics_dict.items()):
+            metrics_dict[_mk] = _iso_z(_mv)
+
+        # -- PS-parity: aisid sibling block (camelCase keys). --
+        aisid_block = {
+            "resolvedAISIDOutputDir": None,
+            "appendDefenderUsage": params_dict.get("append_defender_usage"),
+            "disableAISIDDeltaCache": bool(
+                params_dict.get("disable_aisid_delta_cache", False)
+            ),
+        }
+
+        # PascalCase all top-level keys in parameters + metrics (recursive).
+        params_pc = _pascalize_keys(params_dict)
+        metrics_pc = _pascalize_keys(metrics_dict)
+
         emit_obj = {
-            "version": params_dict.get("script_version") or result.get("script_version") or "",
-            "timestampUtc": datetime.now(timezone.utc).isoformat(),
-            "parameters": params_dict,
-            "metrics": metrics_dict,
+            "version": SCRIPT_VERSION,
+            "timestampUtc": _iso_z(datetime.now(timezone.utc)),
+            "parameters": params_pc,
+            "aisid": aisid_block,
+            "metrics": metrics_pc,
         }
 
         # Ensure directory exists (PS relies on OutputPath already existing).
