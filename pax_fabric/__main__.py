@@ -1442,6 +1442,20 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             log_fn=lambda msg, lvl='info': write_log(msg, level=str(lvl).upper()),
         )
 
+        ctx.metrics.filtering_user_ids = len(_scope.requested_user_ids)
+        ctx.metrics.filtering_group_names = len(_scope.requested_groups)
+        ctx.metrics.scope_resolved_groups = len(_scope.resolved_groups)
+        ctx.metrics.scope_failed_groups = sum((
+            len(_scope.failed_groups),
+            len(_scope.ambiguous_groups),
+            len(_scope.zero_member_groups),
+            len(_scope.unauthorized_groups),
+            len(_scope.transport_error_groups),
+            len(_scope.resolution_error_groups),
+        ))
+        ctx.metrics.scope_expanded_members = len(_scope.resolved_transitive_members)
+        ctx.metrics.scope_final_target_users = len(_scope.final_target_users)
+
         if _scope.outcome != 'Succeeded':
             # PS parity: fail closed rather than run an unfiltered query.
             _details = []

@@ -96,6 +96,18 @@ class PAXMetrics:
     filtering_group_names: int = 0
     filtering_other: int = 0
 
+    # --- User/group scope resolution ---
+    scope_resolved_groups: int = 0
+    scope_failed_groups: int = 0
+    scope_expanded_members: int = 0
+    scope_final_target_users: int = 0
+
+    # Reserved for scoped Entra directory exports. Fabric currently exports
+    # the complete directory, so these remain zero until that path filters it.
+    directory_rows_before_scope: int = 0
+    directory_rows_after_scope: int = 0
+    directory_rows_excluded_by_scope: int = 0
+
     # --- Adaptive safeguards ---
     adaptive_events: list[str] = field(default_factory=list)
     adaptive_memory_reductions: int = 0
