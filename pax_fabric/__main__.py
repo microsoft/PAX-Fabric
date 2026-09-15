@@ -1455,6 +1455,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         ))
         ctx.metrics.scope_expanded_members = len(_scope.resolved_transitive_members)
         ctx.metrics.scope_final_target_users = len(_scope.final_target_users)
+        ctx.resolved_user_scope = _scope
 
         if _scope.outcome != 'Succeeded':
             # PS parity: fail closed rather than run an unfiltered query.
@@ -3516,6 +3517,88 @@ def _fetch_entra_users_with_overrides(
     return entra_data
 
 
+def _scope_entra_users(
+    ctx: PAXRunContext,
+    entra_data: list[dict[str, Any]],
+    entra_session: Any,
+) -> list[dict[str, Any]]:
+    """Apply the run's Fabric user/group scope to an Entra directory export."""
+    config = ctx.config
+    requested_user_ids = list(getattr(config, 'user_ids', None) or [])
+    requested_group_names = list(getattr(config, 'group_names', None) or [])
+    if not requested_user_ids and not requested_group_names:
+        return entra_data
+
+    scope = ctx.resolved_user_scope
+    if scope is None:
+        roster_upns = {
+            str(row.get('userPrincipalName') or '').strip().lower()
+            for row in entra_data
+            if row.get('userPrincipalName')
+        }
+
+        def _scope_graph_get(_method: str, url: str) -> dict:
+            response = entra_session.get(url, timeout=60)
+            response.raise_for_status()
+            try:
+                return response.json() or {}
+            except ValueError:
+                return {}
+
+        scope = resolve_pax_user_scope(
+            user_ids=requested_user_ids,
+            group_names=requested_group_names,
+            graph_request_fn=_scope_graph_get,
+            roster_validator=lambda user_id: user_id.strip().lower() in roster_upns,
+            log_fn=lambda msg, lvl='info': write_log(msg, level=str(lvl).upper()),
+        )
+        ctx.resolved_user_scope = scope
+        ctx.metrics.filtering_user_ids = len(scope.requested_user_ids)
+        ctx.metrics.filtering_group_names = len(scope.requested_groups)
+        ctx.metrics.scope_resolved_groups = len(scope.resolved_groups)
+        ctx.metrics.scope_failed_groups = sum((
+            len(scope.failed_groups),
+            len(scope.ambiguous_groups),
+            len(scope.zero_member_groups),
+            len(scope.unauthorized_groups),
+            len(scope.transport_error_groups),
+            len(scope.resolution_error_groups),
+        ))
+        ctx.metrics.scope_expanded_members = len(scope.resolved_transitive_members)
+        ctx.metrics.scope_final_target_users = len(scope.final_target_users)
+
+    if scope.outcome != 'Succeeded':
+        raise RuntimeError(
+            f"User scope resolution failed ({scope.failure_stage}); refusing "
+            "to export an unscoped Entra directory."
+        )
+    if not scope.final_target_users:
+        raise RuntimeError(
+            "User scope resolution produced zero target users; refusing to "
+            "export an unscoped Entra directory."
+        )
+
+    target_upns = {
+        str(user_id).strip().lower()
+        for user_id in scope.final_target_users
+        if str(user_id).strip()
+    }
+    before_count = len(entra_data)
+    scoped_data = [
+        row for row in entra_data
+        if str(row.get('userPrincipalName') or '').strip().lower() in target_upns
+    ]
+    after_count = len(scoped_data)
+    ctx.metrics.directory_rows_before_scope = before_count
+    ctx.metrics.directory_rows_after_scope = after_count
+    ctx.metrics.directory_rows_excluded_by_scope = before_count - after_count
+    write_log(
+        f"Entra directory scope applied: {before_count} -> {after_count} "
+        f"({before_count - after_count} excluded)"
+    )
+    return scoped_data
+
+
 def _export_entra_users_only(ctx: PAXRunContext) -> None:
     """Export Entra user/license data as the sole output (-OnlyUserInfo mode).
 
@@ -3576,6 +3659,7 @@ def _export_entra_users_only(ctx: PAXRunContext) -> None:
         write_log(f"Entra directory fetch failed: {ex}", level="ERROR")
         ctx.metrics.entra_directory_fetch_failed = True
         entra_data = []
+    entra_data = _scope_entra_users(ctx, entra_data, entra_session)
     if entra_data:
         if getattr(config, 'deidentify', False):
             from .mod18_pax_deidentify import PaxDeidentifier
@@ -3643,6 +3727,7 @@ def _export_entra_users(ctx: PAXRunContext) -> None:
     except Exception as ex:
         write_log(f"Entra directory fetch failed: {ex}", level="ERROR")
         ctx.metrics.entra_directory_fetch_failed = True
+    entra_data = _scope_entra_users(ctx, entra_data, entra_session)
     if entra_data:
         if getattr(config, 'deidentify', False):
             from .mod18_pax_deidentify import PaxDeidentifier

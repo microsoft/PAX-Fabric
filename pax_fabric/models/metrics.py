@@ -102,8 +102,7 @@ class PAXMetrics:
     scope_expanded_members: int = 0
     scope_final_target_users: int = 0
 
-    # Reserved for scoped Entra directory exports. Fabric currently exports
-    # the complete directory, so these remain zero until that path filters it.
+    # --- Scoped Entra directory export ---
     directory_rows_before_scope: int = 0
     directory_rows_after_scope: int = 0
     directory_rows_excluded_by_scope: int = 0
