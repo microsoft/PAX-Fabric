@@ -683,6 +683,29 @@ def initialize_checkpoint_for_new_run(
             "useEOM": bool(all_parameters.get("UseEOM")),
             "autoCompleteness": bool(all_parameters.get("AutoCompleteness")),
             "includeTelemetry": bool(all_parameters.get("IncludeTelemetry")),
+            # v1.11.16 additive resume-parity fields (PS L42525 userHistory,
+            # L42525 HistoryEffectiveDate is re-derived from startDate at PS
+            # L66659 so we only persist the raw override string here; L42525
+            # purviewInputFile persisted so a resume can reject cleanly; L69221
+            # emitMetricsJson/metricsPath persisted so a resumed run emits
+            # metrics identically without needing the switches re-supplied).
+            # None of these fields is consumed on resume yet — they are stored
+            # for parity and future resume-side plumbing (item 9).
+            "userHistory": (
+                "On"
+                if str(all_parameters.get("UserHistory") or "").strip().lower() == "on"
+                else "Off"
+            ),
+            "historyEffectiveDate": (
+                str(all_parameters.get("HistoryEffectiveDate") or "").strip()
+            ),
+            "purviewInputFile": (
+                str(all_parameters.get("PurviewInputFile") or "").strip()
+            ),
+            "emitMetricsJson": bool(all_parameters.get("EmitMetricsJson")),
+            "metricsPath": (
+                str(all_parameters.get("MetricsPath") or "").strip()
+            ),
         },
         "outputFiles": {
             "partialCsv": partial_filename,
@@ -709,6 +732,24 @@ def initialize_checkpoint_for_new_run(
             "rowsGenerated": 0,
             "lastUpdateTime": None,
         },
+        # v1.11.16 additive watermark identity block (PS L42707).
+        # Present only when the run was launched with -Watermark. In the
+        # Fabric notebook path the authoritative watermark state lives in
+        # ``.pax_watermark_state.json`` next to the output file — this
+        # checkpoint entry is a resume-side identity marker only, not the
+        # canonical state. Absent block (None) matches legacy checkpoints.
+        # Fully populated at initialize time only when we already know the
+        # resolved window; otherwise a pending marker records intent so a
+        # crashed run is recognisable as incomplete rather than resumable.
+        "watermark": (
+            {
+                "enabled": True,
+                "pending": True,
+                "runTimestamp": run_timestamp,
+            }
+            if bool(all_parameters.get("Watermark"))
+            else None
+        ),
     }
 
     # Save initial checkpoint
@@ -1601,3 +1642,225 @@ def show_checkpoint_exit_message() -> None:
     ])
 
     logger.info("\n".join(lines))
+
+
+# ===========================================================================
+# v1.11.16: Watermark state persistence (Fabric notebook run path parity)
+# ===========================================================================
+# Mirrors PS ``Initialize-PaxWatermarkRun`` (L37744) and the on-success watermark
+# advance path. The Fabric notebook path keeps this minimal: a small JSON file
+# next to the ordinary checkpoint that records the last-covered end date and
+# the running script version. On start, the pipeline reads it to derive the
+# next [Start .. End) window; on successful completion, the pipeline advances
+# it to the just-covered end date.
+#
+# Design choices (kept intentionally small to preserve v1.11.15 behavior when
+# ``config.watermark`` is False — this whole surface is dormant unless the
+# caller opts in):
+#   * State file name: ``.pax_watermark_state.json`` inside the output-path
+#     root that the checkpoint would use (target-scoped).
+#   * Bootstrap: when no state file exists, start_date = watermark_start_date
+#     from config; end_date = today UTC minus one day (exclusive-end semantics
+#     match the PS ``[Start .. End)`` window — the partial current UTC day is
+#     never collected).
+#   * Advance: on success we bump the state to the freshly-covered end date.
+#   * Short-circuit: when start > end (no new full UTC days since last run),
+#     we signal the pipeline to exit cleanly with a "no new days" outcome.
+
+
+_WATERMARK_STATE_FILENAME = ".pax_watermark_state.json"
+
+
+def _watermark_state_dir(output_path: Optional[str], append_file: Optional[str]) -> Optional[str]:
+    """
+    Resolve the directory that owns the watermark state file for this run.
+
+    Mirrors PS ``$paxWatermarkOutputRoot`` at L37744: append target wins over
+    the plain output path so the same catch-up sequence is preserved when the
+    caller switches OutputPath but keeps the same AppendFile target.
+
+    We only collapse to ``.parent`` when the path is unambiguously a FILE that
+    exists — otherwise the path is treated as the directory anchor as-is
+    (existing or not), which is what the pipeline expects since output roots
+    are frequently created lazily by the Fabric lakehouse writer.
+    """
+    target = None
+    if append_file and str(append_file).strip():
+        p = Path(str(append_file))
+        target = str(p.parent if p.is_file() else p)
+    elif output_path and str(output_path).strip():
+        p = Path(str(output_path))
+        target = str(p.parent if p.is_file() else p)
+    if not target:
+        return None
+    # Skip URL-based targets (SharePoint / Fabric OneLake) here — the notebook
+    # run path handles those via the checkpoint infra, and the minimal Fabric
+    # port keeps watermark state next to the local scratch/output directory.
+    if re.match(r'^https?://', target):
+        return None
+    return target
+
+
+def _watermark_state_path(output_path: Optional[str], append_file: Optional[str]) -> Optional[str]:
+    """Return the full path to the watermark state JSON, or None if not addressable."""
+    d = _watermark_state_dir(output_path, append_file)
+    if not d:
+        return None
+    return str(Path(d) / _WATERMARK_STATE_FILENAME)
+
+
+def _read_watermark_state(state_path: str) -> Optional[dict[str, Any]]:
+    """Read the watermark state file. Returns None on any parse/IO failure."""
+    try:
+        if not os.path.isfile(state_path):
+            return None
+        with open(state_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _write_watermark_state(state_path: str, state: dict[str, Any]) -> None:
+    """Atomically write the watermark state file (temp-then-rename)."""
+    Path(state_path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = state_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+    os.replace(tmp, state_path)
+
+
+def resolve_watermark_window(
+    config: Any,
+    running_script_version: str,
+) -> dict[str, Any]:
+    """
+    Derive the effective [start_date, end_date] window for a Watermark run.
+
+    Mirrors PS ``Initialize-PaxWatermarkRun`` (L37744) minimally: the notebook
+    run path only needs (a) the derived catch-up window, and (b) a short-circuit
+    signal when there are no new full UTC days to collect. Contract-hash
+    guarding (PS ``$paxWatermarkContract``) is intentionally NOT ported yet —
+    the CLI ships that; the Fabric surface targets minimum viable parity.
+
+    Called ONLY when ``config.watermark is True and config.resume is None``.
+    Mutates ``config.start_date`` and ``config.end_date`` on the return path.
+
+    Returns a dict with:
+        {
+            "state_path":       str | None,   # where state lives (None = un-addressable target)
+            "bootstrap":        bool,          # True on first watermark run for this target
+            "previous_end":     str | None,    # yyyy-MM-dd of the last covered end
+            "start_date":       str,           # newly derived start (yyyy-MM-dd)
+            "end_date":         str,           # newly derived end   (yyyy-MM-dd, inclusive-to-yesterday-UTC)
+            "short_circuit":    bool,          # True → no new full UTC day to collect; pipeline should exit clean
+            "reason":           str,           # human-readable summary for logs
+        }
+    """
+    append_file = getattr(config, "append_file", None)
+    output_path = getattr(config, "output_path", None)
+    state_path = _watermark_state_path(output_path, append_file)
+
+    # End of window = yesterday UTC (exclusive-end / partial-day semantics —
+    # matches PS ``[Start .. End)`` convention).
+    now_utc = datetime.now(timezone.utc).date()
+    end_of_window = now_utc - timedelta(days=1)
+    end_str = end_of_window.strftime("%Y-%m-%d")
+
+    prior = _read_watermark_state(state_path) if state_path else None
+    if prior and isinstance(prior.get("last_covered_end"), str):
+        # Advance: start = last_covered_end + 1 day.
+        try:
+            prior_end = datetime.strptime(prior["last_covered_end"], "%Y-%m-%d").date()
+            start_of_window = prior_end + timedelta(days=1)
+        except ValueError:
+            # Corrupted state → bootstrap from config.
+            prior_end = None
+            start_of_window = None
+    else:
+        prior_end = None
+        start_of_window = None
+
+    bootstrap = start_of_window is None
+    if bootstrap:
+        wsd = getattr(config, "watermark_start_date", None)
+        if not wsd:
+            # Should have been caught by validate_config; be defensive anyway.
+            raise ValueError(
+                "Watermark bootstrap requires WatermarkStartDate on the first "
+                "run against this target (no prior watermark state on disk)."
+            )
+        try:
+            start_of_window = datetime.strptime(str(wsd), "%Y-%m-%d").date()
+        except ValueError as ex:
+            raise ValueError(
+                f"WatermarkStartDate {wsd!r} is not yyyy-MM-dd."
+            ) from ex
+
+    start_str = start_of_window.strftime("%Y-%m-%d")
+    short_circuit = start_of_window > end_of_window
+
+    if short_circuit:
+        reason = (
+            f"Watermark short-circuit: last covered end = "
+            f"{prior['last_covered_end'] if prior_end else '(none)'}; "
+            f"no new full UTC day to collect (today UTC = {now_utc})."
+        )
+    elif bootstrap:
+        reason = (
+            f"Watermark bootstrap: no prior state; collecting "
+            f"{start_str} .. {end_str} (UTC-inclusive)."
+        )
+    else:
+        reason = (
+            f"Watermark advance: prior covered end = "
+            f"{prior['last_covered_end']}; collecting "
+            f"{start_str} .. {end_str} (UTC-inclusive)."
+        )
+
+    # Rewrite the effective window on config so downstream unchanged.
+    config.start_date = start_str
+    config.end_date = end_str
+
+    return {
+        "state_path": state_path,
+        "bootstrap": bootstrap,
+        "previous_end": (prior["last_covered_end"] if prior_end else None),
+        "start_date": start_str,
+        "end_date": end_str,
+        "short_circuit": short_circuit,
+        "reason": reason,
+    }
+
+
+def save_watermark_state(
+    state_path: Optional[str],
+    covered_end: str,
+    running_script_version: str,
+    extra: Optional[dict[str, Any]] = None,
+) -> bool:
+    """
+    Persist the watermark advance after a successful pipeline run.
+
+    Returns True on success, False on any IO error (non-fatal — watermark
+    advance failure must never abort a run that already wrote its data).
+    """
+    if not state_path:
+        return False
+    try:
+        state: dict[str, Any] = {
+            "last_covered_end": str(covered_end),
+            "script_version": str(running_script_version),
+            "advanced_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        if extra:
+            for k, v in extra.items():
+                if k not in state:
+                    state[k] = v
+        _write_watermark_state(state_path, state)
+        return True
+    except OSError:
+        logger.warning("Failed to persist watermark state at %s", state_path)
+        return False

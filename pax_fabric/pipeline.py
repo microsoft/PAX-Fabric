@@ -32,6 +32,8 @@ Phase A0 (CSV-to-Files bridge) differences from legacy ``__main__.main()``:
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import time
 import traceback
 from datetime import datetime, timezone
@@ -42,6 +44,9 @@ from . import files_io
 from .models import PAXConfig, PAXRunContext
 from .mod1_pax_config import (
     SCRIPT_VERSION,
+    SCRIPT_RELEASE_TYPE,
+    SCRIPT_RELEASE_DATE,
+    script_version_banner,
     config_from_params,
     initialize_config,
 )
@@ -62,6 +67,8 @@ from .mod6_pax_checkpoint import (
     read_checkpoint,
     remove_checkpoint,
     reset_checkpoint_state,
+    resolve_watermark_window,
+    save_watermark_state,
     select_checkpoint,
     set_checkpoint_enabled,
 )
@@ -219,6 +226,29 @@ _ONELAKE_MOUNT_PREFIXES: tuple[str, ...] = (
 )
 
 
+# Short prefixes stapled onto dashboard-shaped Delta tables so AIO/ValueLens/M365
+# outputs don't collide. Standalone modes (OnlyUserInfo / OnlyAgent365Info)
+# get the empty prefix because their outputs are dashboard-agnostic.
+_DASHBOARD_PREFIX_MAP: dict[str, str] = {
+    "AIO": "AIO",
+    "VALUELENS": "ValueLens",
+    "M365": "M365",
+    "AISID": "AISID",
+}
+
+
+def _resolve_dashboard_prefix(config: PAXConfig) -> str:
+    """Return the short prefix (AIO/ValueLens/M365/AISID) or '' for shared modes."""
+    if getattr(config, "only_user_info", False):
+        return ""
+    if getattr(config, "only_agent365_info", False):
+        return ""
+    if getattr(config, "include_m365_usage", False):
+        return "M365"
+    dash = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
+    return _DASHBOARD_PREFIX_MAP.get(dash, "AIO")
+
+
 def _classify_state_path(path: str) -> str:
     """Return 'onelake', 'driver-tmp', or 'other' for the SQLite host mount."""
     import tempfile as _tempfile
@@ -237,6 +267,7 @@ def _prepare_copilot_delta_seeds(
     ctx: PAXRunContext,
     schema: str,
     name_overrides: dict[str, str],
+    dashboard_prefix: str = "",
 ) -> dict[str, str | None]:
     """Stream validated Delta continuity mappings into local SQLite state.
 
@@ -257,8 +288,8 @@ def _prepare_copilot_delta_seeds(
     entra_csv = getattr(ctx, "_entra_csv_path", "") or ""
     fact_stem = f"{Path(ctx.output_file).stem}_Interactions"
     users_stem = f"{Path(entra_csv).stem}_Users" if entra_csv else "Entra_Users"
-    fact_table = table_name_for(fact_stem, name_overrides)
-    users_table = table_name_for(users_stem, name_overrides)
+    fact_table = table_name_for(fact_stem, name_overrides, dashboard_prefix)
+    users_table = table_name_for(users_stem, name_overrides, dashboard_prefix)
     fact_uri = f"{root}/{fact_table}"
     users_uri = f"{root}/{users_table}"
 
@@ -461,6 +492,101 @@ def _recompute_userstats_from_delta(
     return results
 
 
+def _emit_metrics_json(
+    config: PAXConfig,
+    ctx: PAXRunContext,
+    result: dict,
+    output_file: Optional[str],
+    write_log,
+) -> Optional[str]:
+    """v1.11.16: emit structured metrics JSON alongside CSV output.
+
+    PS Anchor: L69221–L69239.
+        if ($EmitMetricsJson) {
+            if ($MetricsPath) { <use MetricsPath, append .json if missing> }
+            else { <baseName>_metrics_<ScriptRunTimestamp>.json }
+            $emitObj = @{ version, timestampUtc, parameters, metrics }
+            $emitObj | ConvertTo-Json -Depth 6 | Out-File $metricsPath
+        }
+
+    Fabric-side simplifications:
+      - `parameters` snapshot = dataclass-serializable view of `config`
+        (Path and non-serializable objects coerced to str). This mirrors
+        PS's ``$paramSnapshot`` intent without invoking the PS-specific
+        `Get-AISIDSnapshotFields` helper (AISID dashboard fields are absent
+        from the Fabric port surface).
+      - `metrics` = ctx.metrics dataclass -> dict (asdict).
+      - Failure is non-fatal: a WARN log line matches PS behavior.
+
+    Returns the emit path on success, None otherwise. Also stamps
+    result['metrics_json_path'] additively.
+    """
+    if not getattr(config, "emit_metrics_json", False):
+        return None
+
+    try:
+        # Resolve output path (PS L69224–L69231).
+        if config.metrics_path:
+            mp = str(config.metrics_path)
+            if not mp.lower().endswith(".json"):
+                mp = mp + ".json"
+            metrics_path = mp
+        else:
+            # PS derives baseName from -OutputFile; Fabric uses the resolved
+            # output_file when present, else the csv_output_root + run_id.
+            if output_file:
+                base = Path(output_file)
+                out_dir = str(base.parent)
+                base_name = base.stem
+            else:
+                out_dir = str(result.get("csv_output_root") or ".")
+                base_name = str(result.get("run_id") or "pax_run")
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            metrics_path = str(Path(out_dir) / f"{base_name}_metrics_{ts}.json")
+
+        # Build snapshot.
+        try:
+            metrics_dict = dataclasses.asdict(ctx.metrics)
+        except Exception:
+            metrics_dict = {}
+
+        try:
+            params_dict = dataclasses.asdict(config)
+        except Exception:
+            params_dict = {}
+        # Coerce Path / non-JSON-native values to strings so json.dump won't
+        # explode on the caller-supplied config (e.g., purview_input_file is
+        # often a Path).
+        for k, v in list(params_dict.items()):
+            if isinstance(v, Path):
+                params_dict[k] = str(v)
+
+        emit_obj = {
+            "version": params_dict.get("script_version") or result.get("script_version") or "",
+            "timestampUtc": datetime.now(timezone.utc).isoformat(),
+            "parameters": params_dict,
+            "metrics": metrics_dict,
+        }
+
+        # Ensure directory exists (PS relies on OutputPath already existing).
+        Path(metrics_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # UTF-8 no-BOM to match PS Out-File -Encoding UTF8 semantics under
+        # pwsh 7 (Out-File UTF8 in PS7 is UTF-8 no-BOM).
+        with open(metrics_path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(emit_obj, fh, indent=2, default=str)
+
+        result["metrics_json_path"] = metrics_path
+        write_log(f"Metrics JSON emitted: {metrics_path}")
+        return metrics_path
+    except Exception as exc:
+        write_log(
+            f"Failed to emit metrics JSON: {exc}",
+            level="WARN",
+        )
+        return None
+
+
 def run(params: Optional[dict] = None) -> dict:
     """Execute the full PAX pipeline against the provided parameter dict.
 
@@ -521,6 +647,9 @@ def run(params: Optional[dict] = None) -> dict:
         )
     keep_scratch = bool(params.get("KeepScratch", False))
     name_overrides = params.get("TableNameOverrides") or {}
+    # None here = auto-resolve later from the validated config so the caller
+    # can force "" to opt out of prefixing entirely.
+    prefix_override = params.get("TableNamePrefix")
 
     result: dict[str, Any] = {
         "success": False,
@@ -536,11 +665,21 @@ def run(params: Optional[dict] = None) -> dict:
         "target_schema": target_schema if output_mode == "delta" else None,
         "elapsed_seconds": 0.0,
         "error": None,
+        "script_version": SCRIPT_VERSION,
+        "script_release_type": SCRIPT_RELEASE_TYPE,
+        "script_release_date": SCRIPT_RELEASE_DATE,
     }
 
     ctx = PAXRunContext()
     ctx.config = config_from_params(params)
     config = ctx.config
+
+    # v1.11.16 item 7: seed script version metadata into metrics so the JSON
+    # emitter (item 8) has one canonical source. Result-dict already carries
+    # these — additive mirror only.
+    ctx.metrics.script_version = SCRIPT_VERSION
+    ctx.metrics.script_release_type = SCRIPT_RELEASE_TYPE
+    ctx.metrics.script_release_date = SCRIPT_RELEASE_DATE
 
     # ------------------------------------------------------------------
     # 0a. Reset module-level state from any prior run in this session.
@@ -573,7 +712,7 @@ def run(params: Optional[dict] = None) -> dict:
     setup_host_logging(log_file)
     ctx.log_file = log_file
     result["log_file"] = log_file
-    write_log(f"PAX Fabric pipeline v{SCRIPT_VERSION}  run_id={run_id}")
+    write_log(f"PAX Fabric pipeline v{script_version_banner()}  run_id={run_id}")
     write_log(f"OutputMode:      {output_mode}")
     if output_mode == "delta":
         write_log(f"TargetSchema:    {target_schema}")
@@ -581,6 +720,11 @@ def run(params: Optional[dict] = None) -> dict:
     write_log(f"Log file:        {log_file}")
 
     start_wall = time.perf_counter()
+
+    # v1.11.16: watermark advance state used by the finally: block below.
+    # Predeclared here so a pre-try exception never NameError's the finally.
+    watermark_state_path: Optional[str] = None
+    watermark_covered_end: Optional[str] = None
 
     try:
         # --------------------------------------------------------------
@@ -596,17 +740,118 @@ def run(params: Optional[dict] = None) -> dict:
 
         write_log(f"Date range: {config.start_date} -> {config.end_date}")
 
+        # --------------------------------------------------------------
+        # 2b. v1.11.16 Watermark short-circuit path.
+        # --------------------------------------------------------------
+        # PS parity: L37684 `if ($Watermark -and -not $ResumeSpecified)`. The
+        # gate is intentionally scoped so v1.11.15 behavior is byte-identical
+        # when config.watermark is False. Resume-path Watermark is already
+        # blocked by validate_config, so this branch cannot fire on a resume.
+        if getattr(config, "watermark", False) and config.resume is None:
+            try:
+                wm_info = resolve_watermark_window(config, SCRIPT_VERSION)
+            except ValueError as ex:
+                write_log(str(ex), level="ERROR")
+                result["error"] = str(ex)
+                return result
+
+            watermark_state_path = wm_info.get("state_path")
+            watermark_covered_end = wm_info.get("end_date")
+            result["watermark_enabled"] = True
+            result["watermark_bootstrap"] = bool(wm_info.get("bootstrap"))
+            result["watermark_previous_end"] = wm_info.get("previous_end")
+            result["watermark_window_start"] = wm_info.get("start_date")
+            result["watermark_window_end"] = wm_info.get("end_date")
+            # v1.11.16 item 7: mirror into metrics for emitter.
+            ctx.metrics.watermark_enabled = True
+            ctx.metrics.watermark_covered_end = str(wm_info.get("end_date") or "")
+            write_log(f"Watermark: {wm_info.get('reason')}")
+
+            if wm_info.get("short_circuit"):
+                # No new full UTC day to collect — exit clean without touching
+                # Purview / Lakehouse. Preserve the existing watermark state.
+                result["success"] = True
+                result["exit_code"] = EXIT_SUCCESS
+                result["watermark_short_circuit"] = True
+                result["elapsed_seconds"] = round(time.perf_counter() - start_wall, 3)
+                write_log(
+                    "Watermark: no new full UTC day to collect — exiting "
+                    "clean without a Purview query."
+                )
+                return result
+
+            # Re-run initialize_config so trim boundaries pick up the new
+            # start_date/end_date. apply_date_defaults is idempotent on
+            # explicit yyyy-MM-dd values, so this is safe to re-invoke.
+            errors = initialize_config(config)
+            if errors:
+                for err in errors:
+                    write_log(err, level="ERROR")
+                result["error"] = "; ".join(errors)
+                return result
+            write_log(
+                f"Date range (post-watermark): {config.start_date} -> {config.end_date}"
+            )
+
+        # v1.11.16 UserHistory — pass-through of the effective-dated user state
+        # switch (PS L1750 `[string]$UserHistory = 'Off'`, ValidateSet at
+        # L19228/L23956). When 'On' and HistoryEffectiveDate is not supplied,
+        # PS derives an implicit yyyy-MM-dd from TrimStartDateUTC at three
+        # merge call sites (L66282, L66319, L66659). We mirror that here — once,
+        # centrally — so downstream consumers (metrics emitter, notebook
+        # summary, future rollup/retention wiring) see one canonical value.
+        # Additive-only: legacy runs (UserHistory='Off') leave result keys
+        # unchanged.
+        uh_state = str(getattr(config, "user_history", "Off") or "Off")
+        if uh_state == "On":
+            hed_supplied = (
+                config.history_effective_date
+                if getattr(config, "history_effective_date", None)
+                else None
+            )
+            if hed_supplied:
+                hed_effective = hed_supplied
+                hed_source = "explicit"
+            else:
+                # PS parity: TrimStartDateUTC.ToString('yyyy-MM-dd'). config.start_date
+                # is already yyyy-MM-dd at this point (post initialize_config).
+                hed_effective = config.start_date
+                hed_source = "derived_from_start_date"
+                # Fill the config field so future consumers (mod18, retention,
+                # rollup) see the resolved value without re-running derivation.
+                config.history_effective_date = hed_effective
+            result["user_history"] = "On"
+            result["history_effective_date"] = hed_effective
+            result["history_effective_date_source"] = hed_source
+            # v1.11.16 item 7: mirror into metrics for emitter.
+            ctx.metrics.user_history = "On"
+            ctx.metrics.history_effective_date = str(hed_effective or "")
+            ctx.metrics.history_effective_date_source = str(hed_source or "")
+            write_log(
+                f"UserHistory: On (HistoryEffectiveDate={hed_effective}, "
+                f"source={hed_source})"
+            )
+        else:
+            result["user_history"] = "Off"
+            ctx.metrics.user_history = "Off"
+
         # --- Checkpoint self-gate (PS L17575) ---
         # Checkpointing disabled for replay-from-CSV and OnlyUserInfo modes.
+        # v1.11.16: BYOD (PurviewInputFile) is a single-shot local load with
+        # no fetch/paging state to preserve, so checkpointing is off too.
         set_checkpoint_enabled(
             not getattr(config, "raw_input_csv", None)
+            and not getattr(config, "purview_input_file", None)
             and not getattr(config, "only_user_info", False)
         )
 
         # --------------------------------------------------------------
-        # 3. Authentication (skip in replay-from-CSV mode).
+        # 3. Authentication (skip in replay-from-CSV and BYOD modes).
         # --------------------------------------------------------------
-        if not config.raw_input_csv:
+        # v1.11.16 BYOD parity (PS L10266): supplying -PurviewInputFile means
+        # the caller owns the raw Purview audit dump — no Search-UnifiedAuditLog
+        # call is made, so we must NOT open a live Purview auth session either.
+        if not config.raw_input_csv and not getattr(config, "purview_input_file", None):
             auth_result = connect_purview_audit(
                 auth_method=config.auth,
                 tenant_id=config.tenant_id,
@@ -900,6 +1145,21 @@ def run(params: Optional[dict] = None) -> dict:
             ctx.metrics.query_ms = _run_query_phase(ctx)
         result["records_fetched"] = ctx.metrics.total_records_fetched
 
+        # v1.11.16 BYOD parity: surface the BYOD source and loaded row count
+        # so the notebook run-summary cell / downstream metrics emitter can
+        # attribute records to the caller-supplied file rather than a live
+        # Purview query. Additive-only — legacy runs leave these absent.
+        if getattr(config, "purview_input_file", None):
+            result["byod_source"] = str(config.purview_input_file)
+            result["byod_records_loaded"] = int(
+                getattr(ctx.metrics, "total_records_fetched", 0)
+            )
+            # v1.11.16 item 7: mirror into metrics for emitter.
+            ctx.metrics.byod_source = str(config.purview_input_file)
+            ctx.metrics.byod_records_loaded = int(
+                getattr(ctx.metrics, "total_records_fetched", 0)
+            )
+
         # Default safety behavior: if query orchestration reports unrecovered
         # partition loss, stop here so partial data is not processed/exported.
         # Raising here preserves checkpoint for resume via the existing error
@@ -1159,11 +1419,16 @@ def run(params: Optional[dict] = None) -> dict:
                 "CopilotInteraction" in (getattr(config, "activity_types", None) or [])
                 and not getattr(config, "include_m365_usage", False)
             )
+            dashboard_prefix = (
+                str(prefix_override) if prefix_override is not None
+                else _resolve_dashboard_prefix(config)
+            )
             if output_mode == "delta" and copilot_only:
                 rollup_seed_paths = _prepare_copilot_delta_seeds(
                     ctx,
                     target_schema,
                     name_overrides,
+                    dashboard_prefix,
                 )
             _run_rollup_processors(ctx, **rollup_seed_paths)
 
@@ -1173,9 +1438,13 @@ def run(params: Optional[dict] = None) -> dict:
         if output_mode == "delta":
             from . import delta_writer
             set_progress_phase("Export", status="Delta drain")
+            drain_prefix = (
+                str(prefix_override) if prefix_override is not None
+                else _resolve_dashboard_prefix(config)
+            )
             write_log(
                 f"Draining {csv_root} -> Tables/{target_schema}/ "
-                f"(run_id={run_id})"
+                f"(run_id={run_id} prefix={drain_prefix or '<none>'})"
             )
 
             # Notebook flow drains via csv_dir_to_delta() here — NOT through
@@ -1192,6 +1461,7 @@ def run(params: Optional[dict] = None) -> dict:
                     write_mode="append",
                     name_overrides=name_overrides,
                     log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
+                    dashboard_prefix=drain_prefix,
                 )
             except Exception as ex:
                 write_log(
@@ -1381,6 +1651,32 @@ def run(params: Optional[dict] = None) -> dict:
                 )
         except Exception:
             pass
+        # v1.11.16: advance watermark state on successful completion so the
+        # next run picks up from the day after covered_end. Failure to persist
+        # is non-fatal — the run already produced its data.
+        if (
+            result.get("success")
+            and watermark_state_path
+            and watermark_covered_end
+        ):
+            try:
+                if save_watermark_state(
+                    watermark_state_path,
+                    watermark_covered_end,
+                    SCRIPT_VERSION,
+                ):
+                    result["watermark_advanced_to"] = watermark_covered_end
+                    # v1.11.16 item 7: mirror into metrics for emitter.
+                    ctx.metrics.watermark_state_persisted = True
+                    write_log(
+                        f"Watermark advanced: last_covered_end = {watermark_covered_end} "
+                        f"(state: {watermark_state_path})"
+                    )
+            except Exception as _wm_exc:
+                write_log(
+                    f"Watermark advance failed (non-fatal): {_wm_exc}",
+                    level="WARN",
+                )
         if ctx.script_completed:
             cp_data_final = get_checkpoint_data() or {}
             cp_parts = (
@@ -1476,5 +1772,29 @@ def run(params: Optional[dict] = None) -> dict:
         # (single concatenated summary lines tend to wrap or get truncated).
         for ev in getattr(m, "data_loss_events", []) or []:
             write_log(f"  [DATA-LOSS] {ev}", level="ERROR")
+
+        # v1.11.16 item 8: emit structured metrics JSON alongside CSV output.
+        # PS Anchor L69221. No-op when config.emit_metrics_json is False, so
+        # legacy callers are unaffected. Runs LAST in finally so ctx.metrics
+        # carries watermark_state_persisted, elapsed_seconds surrogate via
+        # result['elapsed_seconds'], and any data-loss counters.
+        try:
+            _emit_metrics_json(
+                config=config,
+                ctx=ctx,
+                result=result,
+                output_file=result.get("output_file"),
+                write_log=write_log,
+            )
+        except Exception as _emit_exc:
+            # Absolute belt-and-suspenders: emitter has its own try/except,
+            # but a bug in path resolution shouldn't crash the finally: block.
+            try:
+                write_log(
+                    f"Metrics JSON emit unexpected failure (non-fatal): {_emit_exc}",
+                    level="WARN",
+                )
+            except Exception:
+                pass
 
     return result

@@ -133,6 +133,86 @@ def _is_transient_403(exc: BaseException) -> bool:
     return True
 
 
+# PS parity: v1.11.16-prerelease-20260911a Invoke-GraphAuditHardenedCreate 403 branch
+# emits a [403-FORENSIC] block so service reason/trace-id/CAE claims survive the run.
+# Additive logging only; never raises.
+def _emit_403_forensics(context_label: str, exc: BaseException) -> None:
+    try:
+        resp = getattr(exc, "response", None)
+        if resp is None:
+            return
+        fx: Dict[str, str] = {}
+        try:
+            sc = getattr(resp, "status_code", None)
+            if sc is not None:
+                fx["http-status"] = str(sc)
+        except Exception:
+            pass
+        try:
+            fx["classified-as"] = "Transient" if _is_transient_403(exc) else "Permanent"
+        except Exception:
+            pass
+        raw_body = ""
+        try:
+            raw_body = getattr(resp, "text", "") or ""
+        except Exception:
+            pass
+        if raw_body:
+            try:
+                perr = json.loads(raw_body)
+                err = perr.get("error") if isinstance(perr, dict) else None
+                if isinstance(err, dict):
+                    if err.get("code") is not None:
+                        fx["error.code"] = str(err.get("code"))
+                    if err.get("message") is not None:
+                        fx["error.message"] = str(err.get("message"))
+                    inner = err.get("innerError")
+                    if isinstance(inner, dict):
+                        for k_in, k_out in (
+                            ("code", "innerError.code"),
+                            ("request-id", "innerError.request-id"),
+                            ("client-request-id", "innerError.client-request-id"),
+                            ("date", "innerError.date"),
+                        ):
+                            if inner.get(k_in) is not None:
+                                fx[k_out] = str(inner.get(k_in))
+            except Exception:
+                pass
+        try:
+            headers = getattr(resp, "headers", None)
+            if headers is not None:
+                for hn in (
+                    "request-id", "client-request-id",
+                    "x-ms-ags-diagnostic", "x-ms-diagnostics",
+                    "WWW-Authenticate", "Retry-After", "Date",
+                ):
+                    try:
+                        hv = headers.get(hn)
+                        if hv:
+                            fx[f"hdr.{hn}"] = str(hv)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        for k, v in fx.items():
+            logger.warning("[403-FORENSIC] %s %s = %s", context_label, k, v)
+        try:
+            if raw_body:
+                body_out = raw_body if len(raw_body) <= 2000 else (raw_body[:2000] + " ...[truncated]")
+                logger.warning("[403-FORENSIC] %s raw-body = %s", context_label, body_out)
+        except Exception:
+            pass
+        try:
+            headers = getattr(resp, "headers", None)
+            if headers is not None:
+                for hk, hv in headers.items():
+                    logger.warning("[403-FORENSIC] %s all-hdr.%s = %s", context_label, hk, hv)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
@@ -462,6 +542,7 @@ def invoke_graph_audit_query(
                 "Raising GraphForbiddenError for caller retry.",
                 "transient" if is_transient_403 else "non-transient",
             )
+            _emit_403_forensics("query-submit", e)
             raise GraphForbiddenError(
                 f"403 Forbidden on query submit: {e}",
                 is_transient=is_transient_403,
@@ -572,6 +653,7 @@ def get_graph_audit_query_status(
                 "[AUTH-403] Graph query status poll rejected — %s 403.",
                 "transient" if is_transient_403 else "non-transient",
             )
+            _emit_403_forensics("status-poll", e)
             raise GraphForbiddenError(
                 f"403 Forbidden on status poll: {e}",
                 is_transient=is_transient_403,
@@ -834,6 +916,7 @@ def get_graph_audit_records(
                     _total_fetched,
                     e,
                 )
+                _emit_403_forensics("page-fetch", e)
                 raise GraphForbiddenError(
                     f"403 Forbidden on record fetch: {e}",
                     is_transient=is_transient_403,

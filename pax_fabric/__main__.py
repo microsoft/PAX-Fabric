@@ -39,6 +39,7 @@ from typing import Any
 from .models import PAXConfig, PAXRunContext
 from .mod1_pax_config import (
     SCRIPT_VERSION,
+    script_version_banner,
     canonical_filler_mode,
     check_for_updates,
     initialize_config,
@@ -678,7 +679,7 @@ def main() -> int:
                 _pkg_logger.removeHandler(_h)
         _pkg_logger.propagate = True
 
-        write_log(f"PAX Purview Audit Log Processor v{SCRIPT_VERSION}")
+        write_log(f"PAX Purview Audit Log Processor v{script_version_banner()}")
         if not getattr(config, "skip_version_check", False):
             check_for_updates(SCRIPT_VERSION, log=write_log_host)
         write_log(f"Start: {config.start_date}  End: {config.end_date}")
@@ -1144,6 +1145,130 @@ def main() -> int:
 # ---------------------------------------------------------------------------
 
 
+# v1.11.16 BYOD — required Purview export columns.
+# A vanilla Purview UI CSV export always carries these; missing any means the
+# supplied file is not a Purview audit dump and downstream transform would
+# silently produce zero-row output. Mirror PS `Test-PaxPurviewInputCsv`.
+_BYOD_REQUIRED_HEADERS = ('CreationDate', 'AuditData')
+
+
+def _load_byod_purview_csv(ctx: 'PAXRunContext', start_ns: int) -> int:
+    """v1.11.16 BYOD load path — read a customer-supplied Purview audit CSV
+    and spill each row as a JSONL record into ``.pax_incremental/`` so Phase 6
+    can drain it through the standard dedup/trim/structure pipeline exactly
+    as it drains live-fetch shards. Returns elapsed ms.
+
+    Parity notes (PS `Invoke-PaxByodSourcePreparation` L10991):
+    - Local FS read only for the notebook run path. Remote source staging
+      (HTTPS/SharePoint) is the pipeline activity's job — the notebook is
+      handed a lakehouse-local path.
+    - The supplied file is READ-ONLY: nothing is rewritten in place. All
+      downstream mutations happen against the spilled JSONL shards.
+    - Structural validation is header-based; row content is passed through
+      as-is so the transform layer surfaces any semantic issues via its
+      existing FilteringSkippedRecords / FilteringMissingAuditData metrics.
+    """
+    import csv
+
+    config = ctx.config
+    src = str(config.purview_input_file)
+    src_path = Path(src)
+
+    write_log(f"BYOD mode: reading Purview audit records from '{src}'")
+
+    if not src_path.exists():
+        write_log(
+            f"BYOD source not found or unreadable: {src}", level="ERROR"
+        )
+        raise FileNotFoundError(f"PurviewInputFile not found: {src}")
+    if not src_path.is_file():
+        write_log(
+            f"BYOD source is not a file: {src}", level="ERROR"
+        )
+        raise ValueError(f"PurviewInputFile is not a file: {src}")
+
+    # Prepare the same spill layout the live-fetch path uses so Phase 6's
+    # shard iterator sees no difference between BYOD and live sources.
+    spill_run_ts = (
+        config.script_run_timestamp
+        or datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+    )
+    spill_out_dir = Path(_resolve_output_path(config)).parent
+    spill_out_dir.mkdir(parents=True, exist_ok=True)
+    incremental_dir = spill_out_dir / ".pax_incremental"
+    incremental_dir.mkdir(parents=True, exist_ok=True)
+
+    spilled_shards: list[str] = []
+    shard_seq = 0
+    records_total = 0
+    batch: list[dict[str, Any]] = []
+
+    def _flush(recs: list[dict[str, Any]]) -> None:
+        nonlocal shard_seq
+        if not recs:
+            return
+        shard_seq += 1
+        path = _spill_records_to_jsonl(
+            recs,
+            shard_seq=shard_seq,
+            partition_idx=0,  # BYOD has no partitions; use 0 as sentinel
+            run_timestamp=spill_run_ts,
+            incremental_dir=incremental_dir,
+        )
+        if path:
+            spilled_shards.append(path)
+            write_log(
+                f"  [BYOD] shard {shard_seq:04d} ({len(recs)} records) "
+                f"written to {Path(path).name}"
+            )
+
+    # Read CSV with UTF-8-SIG so a Purview UI export's BOM is tolerated.
+    # newline='' is required by csv per stdlib docs.
+    with open(src_path, 'r', encoding='utf-8-sig', newline='') as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            raise ValueError(
+                f"PurviewInputFile has no header row: {src}"
+            )
+        headers = {h.strip() for h in reader.fieldnames if h}
+        missing = [h for h in _BYOD_REQUIRED_HEADERS if h not in headers]
+        if missing:
+            write_log(
+                f"BYOD source missing required column(s): {', '.join(missing)}. "
+                f"Purview audit exports must include: "
+                f"{', '.join(_BYOD_REQUIRED_HEADERS)}.",
+                level="ERROR",
+            )
+            raise ValueError(
+                f"PurviewInputFile missing columns: {', '.join(missing)}"
+            )
+
+        for row in reader:
+            # csv.DictReader yields OrderedDict of strings; JSONL-safe as-is.
+            # The transform layer parses AuditData JSON lazily from the string
+            # value so no pre-parse is required here.
+            batch.append(dict(row))
+            records_total += 1
+            if len(batch) >= _SPILL_BATCH_SIZE:
+                _flush(batch)
+                batch = []
+        _flush(batch)
+        batch = []
+
+    # Hand the shard manifest to Phase 6 exactly as the live path does.
+    ctx.spilled_shards = spilled_shards  # type: ignore[attr-defined]
+    ctx.incremental_dir = str(incremental_dir)  # type: ignore[attr-defined]
+    ctx.all_logs = []
+    ctx.metrics.total_records_fetched = records_total
+    write_log(
+        f"  [BYOD] Loaded {records_total} record(s) across "
+        f"{len(spilled_shards)} JSONL shard(s) in {incremental_dir}"
+    )
+
+    elapsed = (time.perf_counter_ns() - start_ns) // 1_000_000
+    return elapsed
+
+
 def _run_query_phase(ctx: PAXRunContext) -> int:
     """Execute query orchestration. Returns elapsed ms."""
     import requests
@@ -1158,6 +1283,16 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         # with correct signature (logs, output_file, header, convert_fn, ...)
         write_log("Replay inline export not yet wired — skipping.", level="WARN")
         elapsed = (time.perf_counter_ns() - start) // 1_000_000
+        return elapsed
+
+    # v1.11.16 BYOD (Bring-Your-Own-Data) mode — parity with PS
+    # `Invoke-PaxByodSourcePreparation` (L10991) + `Get-PaxByodBootstrap` (L10266).
+    # When -PurviewInputFile is set, the caller has already collected a raw
+    # Purview audit dump; we skip Search-UnifiedAuditLog entirely and drain
+    # the supplied CSV through the same JSONL-shard queue that live fetch uses
+    # so Phase 6 (dedup/trim/structure) is fed identically.
+    if getattr(config, 'purview_input_file', None):
+        elapsed = _load_byod_purview_csv(ctx, start)
         return elapsed
 
     # Expand group memberships to target users
@@ -1243,6 +1378,18 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             "FillerLabelText": getattr(config, 'filler_label_text', None) or "",
             "Deidentify": getattr(config, 'deidentify', False),
             "WithAggregates": getattr(config, 'with_aggregates', False),
+            # v1.11.16 additive checkpoint persistence (item 9). These flow into
+            # mod6.initialize_checkpoint_for_new_run's parameters dict so a
+            # resumed run has full v1.11.16 intent recorded. Legacy configs
+            # (v1.11.15 attrs missing on the dataclass) fall back to False /
+            # empty via getattr defaults, preserving byte-identical output on
+            # the non-additive path.
+            "UserHistory": getattr(config, 'user_history', 'Off'),
+            "HistoryEffectiveDate": getattr(config, 'history_effective_date', '') or '',
+            "PurviewInputFile": getattr(config, 'purview_input_file', '') or '',
+            "EmitMetricsJson": bool(getattr(config, 'emit_metrics_json', False)),
+            "MetricsPath": getattr(config, 'metrics_path', '') or '',
+            "Watermark": bool(getattr(config, 'watermark', False)),
         }
         initialize_checkpoint_for_new_run(
             output_path=config.output_path,
@@ -2976,12 +3123,44 @@ def _run_rollup_processors(
                 _rollup_aggregates_note = (
                     ' + pre-aggregated tables' if agg_paths else ' (aggregates off)'
                 )
+            # v1.11.16 item 10: surface UserHistory + HistoryEffectiveDate on
+            # the rollup banner so notebook operators have evidence the flags
+            # were received. The vendored copilot_processor (v4.2.1) does
+            # NOT currently accept --user-history / --history-effective-date
+            # (those args land in PS-parity v4.3+); when UserHistory=On we
+            # emit a WARN so the operator knows HED isn't yet honored at the
+            # rollup stage. HED is still stamped on the pipeline result +
+            # metrics (item 6) and persisted on the checkpoint (item 9), so
+            # a future processor upgrade is a drop-in.
+            _rollup_user_history = str(
+                getattr(config, 'user_history', None) or 'Off'
+            )
+            _rollup_hed = str(
+                getattr(config, 'history_effective_date', None) or ''
+            )
+            _rollup_history_note = ''
+            if _rollup_user_history.lower() == 'on':
+                _rollup_history_note = (
+                    f'; user-history=On history-effective-date='
+                    f'{_rollup_hed or "<unset>"}'
+                )
             write_log(
                 f"Rollup post-processor: Purview_CopilotInteraction_Processor "
                 f"({_rollup_profile_flag}; profile={_rollup_profile_label}; "
                 f"target={_rollup_profile_label} (Analytics-Hub)"
-                f"{_rollup_aggregates_note}; inputs: Purview CSV + Entra users CSV)"
+                f"{_rollup_aggregates_note}{_rollup_history_note}; "
+                f"inputs: Purview CSV + Entra users CSV)"
             )
+            if _rollup_user_history.lower() == 'on':
+                write_log(
+                    f"UserHistory=On requested but vendored copilot_processor "
+                    f"v4.2.1 does not accept --user-history / "
+                    f"--history-effective-date. HED='{_rollup_hed}' is "
+                    f"stamped on the run result and checkpoint but is NOT "
+                    f"threaded into the rollup fact/dim outputs yet — future "
+                    f"processor upgrade required for full PS L66661 parity.",
+                    level="WARNING",
+                )
 
             try:
                 copilot_run(

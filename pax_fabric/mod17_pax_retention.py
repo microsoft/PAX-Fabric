@@ -43,6 +43,7 @@ def enforce_retention(
     retention_days: int,
     *,
     storage_options: Optional[dict] = None,
+    history_effective_date: Optional[str] = None,
 ) -> dict:
     """Delete rows older than ``retention_days`` from a Delta table.
 
@@ -62,6 +63,13 @@ def enforce_retention(
             deleted.
         storage_options: Storage options dict for deltalake (Fabric
             token, etc.). None for local paths.
+        history_effective_date: v1.11.16 additive protective floor
+            (yyyy-MM-dd). When supplied, rows on or after this date are
+            never deleted even if retention_days would otherwise expire
+            them. Mirrors PS UserHistory semantics — HED marks the
+            temporal-history anchor and rows below it must persist so
+            user-dimension continuity holds across resumed runs. Silently
+            ignored when unparseable so legacy callers stay green.
 
     Returns:
         dict with keys:
@@ -71,6 +79,7 @@ def enforce_retention(
           rows_after (int): Row count after retention.
           rows_deleted (int): Number of rows removed.
           cutoff_date (str): The cutoff date used (YYYY-MM-DD).
+          history_effective_date (str|None): Protective floor applied.
           error (str|None): Error message on failure.
 
     Never raises — always returns a result dict so callers can handle
@@ -84,11 +93,28 @@ def enforce_retention(
             "rows_after": 0,
             "rows_deleted": 0,
             "cutoff_date": None,
+            "history_effective_date": history_effective_date or None,
             "error": "retention_days must be > 0",
         }
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
     cutoff_str = cutoff.strftime("%Y-%m-%d")
+
+    # v1.11.16 protective floor: HED, when supplied and parseable, raises
+    # the cutoff so no row on/after HED can ever be deleted. Silently
+    # ignore malformed dates so legacy behavior is preserved on bad input.
+    hed_applied: Optional[str] = None
+    if history_effective_date:
+        try:
+            hed_dt = datetime.strptime(
+                str(history_effective_date).strip(), "%Y-%m-%d"
+            ).replace(tzinfo=timezone.utc)
+            if hed_dt > cutoff:
+                cutoff = hed_dt
+                cutoff_str = cutoff.strftime("%Y-%m-%d")
+            hed_applied = cutoff.strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            hed_applied = None
 
     try:
         from deltalake import DeltaTable
@@ -102,6 +128,7 @@ def enforce_retention(
             "rows_after": 0,
             "rows_deleted": 0,
             "cutoff_date": cutoff_str,
+            "history_effective_date": hed_applied,
             "error": f"import: {exc}",
         }
 
@@ -120,6 +147,7 @@ def enforce_retention(
                 "rows_after": 0,
                 "rows_deleted": 0,
                 "cutoff_date": cutoff_str,
+                "history_effective_date": hed_applied,
                 "error": "table does not exist",
             }
         return {
@@ -129,6 +157,7 @@ def enforce_retention(
             "rows_after": 0,
             "rows_deleted": 0,
             "cutoff_date": cutoff_str,
+            "history_effective_date": hed_applied,
             "error": str(exc),
         }
 
@@ -151,6 +180,7 @@ def enforce_retention(
             "rows_after": 0,
             "rows_deleted": 0,
             "cutoff_date": cutoff_str,
+            "history_effective_date": hed_applied,
             "error": None,
         }
 
@@ -196,6 +226,7 @@ def enforce_retention(
             "rows_after": rows_before,
             "rows_deleted": 0,
             "cutoff_date": cutoff_str,
+            "history_effective_date": hed_applied,
             "error": str(exc),
         }
 
@@ -225,5 +256,6 @@ def enforce_retention(
         "rows_after": rows_after,
         "rows_deleted": rows_deleted,
         "cutoff_date": cutoff_str,
+        "history_effective_date": hed_applied,
         "error": None,
     }

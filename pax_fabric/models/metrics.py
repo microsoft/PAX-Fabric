@@ -130,3 +130,31 @@ class PAXMetrics:
     # PS parity: $script:Agent365HadGaps -> exit code 40 refinement.
     agent365_had_gaps: bool = False
 
+    # --- v1.11.16 additive fields --------------------------------------------
+    # Mirror the result-dict surface added in this release. Field names are
+    # snake_cased mirrors of the PS-side metric names and are ADDITIVE ONLY —
+    # legacy consumers ignore unknown fields, so this is a safe extension.
+    # PS Anchors:
+    #   Watermark    : L1750+ params, L56174+ watermark state persistence
+    #   BYOD         : L1747 -PurviewInputFile, L45549+ trim-window replay
+    #   UserHistory  : L1750 -UserHistory param, L66282/L66319/L66659 derivation
+    #   Script meta  : L1  $ScriptVersion / L2 $ReleaseType / $ReleaseDate
+
+    # Watermark (item 4 companion)
+    watermark_enabled: bool = False
+    watermark_state_persisted: bool = False
+    watermark_covered_end: str = ''
+
+    # BYOD PurviewInputFile (item 5 companion)
+    byod_source: str = ''
+    byod_records_loaded: int = 0
+
+    # UserHistory / HistoryEffectiveDate (item 6 companion)
+    user_history: str = 'Off'
+    history_effective_date: str = ''
+    history_effective_date_source: str = ''
+
+    # Script version metadata (item 1 companion; populated once at run start)
+    script_version: str = ''
+    script_release_type: str = ''
+    script_release_date: str = ''
