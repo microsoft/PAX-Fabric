@@ -265,10 +265,14 @@ class PaxDeidentifier:
         A malformed value is redacted, never passed through, so enabling the
         switch cannot leak PII through an unparseable nested payload.
         """
+        if not value:
+            return value
         try:
             node = json.loads(value)
         except (TypeError, ValueError, json.JSONDecodeError):
             return "[REDACTED-DEIDENTIFY]"
+        if node is None:
+            return value
 
         def scrub(item: Any, path: str = "") -> Any:
             if isinstance(item, dict):
