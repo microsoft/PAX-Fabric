@@ -730,26 +730,46 @@ def _recompute_userstats_from_delta(
             session_cohort_info = entry
 
     if not rollup_info:
-        _log("Recompute: No Rollup Delta table found in drain results — skipping.", "WARN")
-        return []
+        _log("Recompute: No Rollup Delta table found in drain results.", "ERROR")
+        raise RuntimeError(
+            "M365 accumulated-history recompute requires a Rollup Delta drain result"
+        )
+
+    required_tables = {
+        "SessionStats": session_stats_info,
+        "UserStats": userstats_info,
+        "SessionCohort": session_cohort_info,
+    }
+    missing_tables = [name for name, info in required_tables.items() if not info]
+    if missing_tables:
+        raise RuntimeError(
+            "M365 accumulated-history recompute requires Delta drain results for: "
+            + ", ".join(missing_tables)
+        )
 
     rollup_uri = rollup_info["path"]
     _log(f"Recompute: Streaming from accumulated Rollup Delta: {rollup_info['table']}")
 
     try:
         import deltalake  # noqa: F401
-    except ImportError:
-        _log("Recompute: deltalake not installed — skipping.", "WARN")
-        return []
+    except ImportError as exc:
+        _log("Recompute: deltalake is required to read accumulated history.", "ERROR")
+        raise RuntimeError(
+            "M365 accumulated-history recompute requires the deltalake package"
+        ) from exc
 
     storage_options = _fio.onelake_storage_options()
 
-    # Build streaming iterators
-    rollup_iter = _iter_delta_as_dicts(rollup_uri, storage_options)
-    ss_iter = None
+    # Build factories because the rollup calculation needs two fresh passes.
+    # Each invocation streams bounded Arrow batches directly from Delta.
+    rollup_rows = lambda: _iter_delta_as_dicts(rollup_uri, storage_options)
+    session_stats_rows = None
     if session_stats_info:
         _log(f"Recompute: Will stream SessionStats Delta: {session_stats_info['table']}")
-        ss_iter = _iter_delta_as_dicts(session_stats_info["path"], storage_options)
+        session_stats_uri = session_stats_info["path"]
+        session_stats_rows = lambda: _iter_delta_as_dicts(
+            session_stats_uri, storage_options
+        )
 
     # Write output to a temp directory (output CSVs only — inputs are streamed)
     results: list[dict] = []
@@ -764,12 +784,14 @@ def _recompute_userstats_from_delta(
                 userstats_csv_path=userstats_csv,
                 session_csv_path=session_cohort_csv,
                 quiet=False,
-                aggregated_rows=rollup_iter,
-                session_stats_rows=ss_iter,
+                aggregated_rows=rollup_rows,
+                session_stats_rows=session_stats_rows,
             )
         except Exception as exc:
             _log(f"Recompute: write_userstats_files failed: {exc}", "ERROR")
-            return []
+            raise RuntimeError(
+                "M365 accumulated-history sidecar calculation failed"
+            ) from exc
 
         _log(f"Recompute: UserStats={user_count:,} users, SessionCohort={cohort_count:,} pairs")
 
@@ -802,7 +824,10 @@ def _recompute_userstats_from_delta(
                     "recomputed": True,
                 })
             except Exception as exc:
-                _log(f"Recompute: Failed to write {table_name}: {exc}", "WARN")
+                _log(f"Recompute: Failed to write {table_name}: {exc}", "ERROR")
+                raise RuntimeError(
+                    f"M365 accumulated-history snapshot write failed for {table_name}"
+                ) from exc
 
     return results
 

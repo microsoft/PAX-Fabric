@@ -121,7 +121,7 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Iterator
 
 # ─── Fast JSON: prefer orjson, fall back to stdlib ───────────────────────────
 try:
@@ -2285,8 +2285,16 @@ def write_userstats_files(
     session_csv_path: str | Path,
     quiet: bool,
     session_stats_csv_path: str | Path | None = None,
-    aggregated_rows: Any | None = None,
-    session_stats_rows: Any | None = None,
+    aggregated_rows: (
+        Iterable[dict[str, Any]]
+        | Callable[[], Iterable[dict[str, Any]]]
+        | None
+    ) = None,
+    session_stats_rows: (
+        Iterable[dict[str, Any]]
+        | Callable[[], Iterable[dict[str, Any]]]
+        | None
+    ) = None,
 ) -> tuple[int, int]:
     """
     Read the just-written aggregated rollup CSV and produce two additional files:
@@ -2298,11 +2306,13 @@ def write_userstats_files(
     raw audit-event counts. This matches the AI in One semantics and prevents
     service-principal / plugin-chain inflation from skewing the CE Quadrant.
 
-    When `aggregated_rows` is provided (an iterable of dict[str,str]), it is used
-    as the rollup source instead of reading from `aggregated_csv_path`. This allows
-    callers (pax_fabric's Delta-backed recompute) to stream rows from a Delta table
-    without intermediate temp files. Similarly, `session_stats_rows` replaces
-    `session_stats_csv_path` when provided.
+    When `aggregated_rows` is provided, it is used as the rollup source instead
+    of reading from `aggregated_csv_path`. The rollup calculation requires two
+    passes, so one-shot sources must be supplied as a callable that returns a new
+    iterable for each pass. This allows pax_fabric's Delta-backed recompute to
+    reopen a bounded-memory Delta stream without intermediate input files.
+    `session_stats_rows` replaces `session_stats_csv_path` when provided and is
+    consumed once.
 
     Returns (user_count, session_cohort_row_count).
     """
@@ -2313,6 +2323,39 @@ def write_userstats_files(
             print(f"[UserStats] WARNING: Aggregated CSV not found: {agg_path} — skipping.",
                   file=sys.stderr)
         return 0, 0
+
+    def _csv_rollup_rows() -> Iterator[dict[str, Any]]:
+        with open(agg_path, "r", encoding="utf-8-sig", newline="") as handle:
+            yield from csv.DictReader(handle)
+
+    if aggregated_rows is None:
+        rollup_rows_factory: Callable[[], Iterable[dict[str, Any]]] = _csv_rollup_rows
+    elif callable(aggregated_rows):
+        rollup_rows_factory = aggregated_rows
+    else:
+        if iter(aggregated_rows) is aggregated_rows:
+            raise TypeError(
+                "aggregated_rows is a one-shot iterator; pass a callable that "
+                "returns a fresh iterator for each of the two rollup passes"
+            )
+        rollup_rows_factory = lambda: aggregated_rows
+
+    def _iter_session_stats_rows() -> Iterator[dict[str, Any]]:
+        if session_stats_rows is not None:
+            source = (
+                session_stats_rows()
+                if callable(session_stats_rows)
+                else session_stats_rows
+            )
+            yield from source
+            return
+        if not session_stats_csv_path:
+            return
+        session_path_source = Path(session_stats_csv_path)
+        if not session_path_source.is_file():
+            return
+        with open(session_path_source, "r", encoding="utf-8-sig", newline="") as handle:
+            yield from csv.DictReader(handle)
 
     userstats_path = Path(userstats_csv_path)
     session_path = Path(session_csv_path)
@@ -2361,12 +2404,10 @@ def write_userstats_files(
     # are inclusive lower bounds; a row qualifies for window W iff date_key >= cutoff[W].
     # The "Full" window has no cutoff and always qualifies.
     _d_max_str = ""
-    with open(agg_path, "r", encoding="utf-8-sig", newline="") as _f:
-        _r = csv.DictReader(_f)
-        for _row in _r:
-            _dk = (_row.get("CreationDate", "") or "")[:10]
-            if _dk and _dk > _d_max_str:
-                _d_max_str = _dk
+    for _row in rollup_rows_factory():
+        _dk = (_row.get("CreationDate", "") or "")[:10]
+        if _dk and _dk > _d_max_str:
+            _d_max_str = _dk
     if _d_max_str:
         try:
             _d_max = date.fromisoformat(_d_max_str)
@@ -2386,96 +2427,94 @@ def write_userstats_files(
 
     # ── Stream through aggregated CSV ────────────────────────────────────
     row_count = 0
-    with open(agg_path, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            row_count += 1
+    for row in rollup_rows_factory():
+        row_count += 1
 
-            user_id = row.get("UserId", "")
-            uid_lower = user_id.lower()
-            if uid_lower not in uid_original:
-                uid_original[uid_lower] = user_id
+        user_id = row.get("UserId", "")
+        uid_lower = user_id.lower()
+        if uid_lower not in uid_original:
+            uid_original[uid_lower] = user_id
 
-            date_key = row.get("CreationDate", "")[:10]   # YYYY-MM-DD
-            op = row.get("Operation", "")
-            wl = row.get("Workload", "")
-            ext = (row.get("SourceFileExtension", "") or "").lower()
-            app_host = (row.get("AppHost", "") or "").lower()
+        date_key = row.get("CreationDate", "")[:10]   # YYYY-MM-DD
+        op = row.get("Operation", "")
+        wl = row.get("Workload", "")
+        ext = (row.get("SourceFileExtension", "") or "").lower()
+        app_host = (row.get("AppHost", "") or "").lower()
 
-            if date_key:
-                all_dates.add(date_key)
+        if date_key:
+            all_dates.add(date_key)
 
-            try:
-                event_count = int(row.get("EventCount", "1") or "1")
-            except (ValueError, TypeError):
-                event_count = 1
+        try:
+            event_count = int(row.get("EventCount", "1") or "1")
+        except (ValueError, TypeError):
+            event_count = 1
 
-            copilot = is_copilot(op, wl)
-            excel_file = is_excel_file_op(ext, op)
+        copilot = is_copilot(op, wl)
+        excel_file = is_excel_file_op(ext, op)
 
-            # Core event counts
-            if copilot:
-                cop_ec[uid_lower] += event_count
-            else:
-                m365_ec[uid_lower] += event_count
+        # Core event counts
+        if copilot:
+            cop_ec[uid_lower] += event_count
+        else:
+            m365_ec[uid_lower] += event_count
 
-            # ExCopEC: Copilot interactions in Excel (via AppHost); ExM365EC: Excel file ops by non-Copilot
-            if copilot and app_host == "excel":
-                ex_cop_ec[uid_lower] += 1        # row count, not EventCount
-            if excel_file and not copilot:
-                ex_m365_ec[uid_lower] += 1       # row count, not EventCount
+        # ExCopEC: Copilot interactions in Excel (via AppHost); ExM365EC: Excel file ops by non-Copilot
+        if copilot and app_host == "excel":
+            ex_cop_ec[uid_lower] += 1        # row count, not EventCount
+        if excel_file and not copilot:
+            ex_m365_ec[uid_lower] += 1       # row count, not EventCount
 
-            # Active days (distinct CreationDate values)
-            if wl == "MicrosoftTeams" and op in TEAMS_OPS:
-                t_days[uid_lower].add(date_key)
-            if wl == "Exchange" and op in OUTLOOK_OPS:
-                o_days[uid_lower].add(date_key)
-            if ext in WORD_EXTS and op in FILE_OPS:
-                w_days[uid_lower].add(date_key)
-            if ext in EXCEL_EXTS and op in FILE_OPS:
-                x_days[uid_lower].add(date_key)
-            if ext in PPT_EXTS and op in FILE_OPS:
-                p_days[uid_lower].add(date_key)
+        # Active days (distinct CreationDate values)
+        if wl == "MicrosoftTeams" and op in TEAMS_OPS:
+            t_days[uid_lower].add(date_key)
+        if wl == "Exchange" and op in OUTLOOK_OPS:
+            o_days[uid_lower].add(date_key)
+        if ext in WORD_EXTS and op in FILE_OPS:
+            w_days[uid_lower].add(date_key)
+        if ext in EXCEL_EXTS and op in FILE_OPS:
+            x_days[uid_lower].add(date_key)
+        if ext in PPT_EXTS and op in FILE_OPS:
+            p_days[uid_lower].add(date_key)
 
-            # Activity event counts
-            if wl == "MicrosoftTeams" and op in TEAMS_OPS:
-                t_ec[uid_lower] += event_count
-            if wl == "Exchange" and op in OUTLOOK_OPS:
-                o_ec[uid_lower] += event_count
-            if ext in OFFICE_EXTS and op in FILE_OPS:
-                off_ec[uid_lower] += event_count
+        # Activity event counts
+        if wl == "MicrosoftTeams" and op in TEAMS_OPS:
+            t_ec[uid_lower] += event_count
+        if wl == "Exchange" and op in OUTLOOK_OPS:
+            o_ec[uid_lower] += event_count
+        if ext in OFFICE_EXTS and op in FILE_OPS:
+            off_ec[uid_lower] += event_count
 
-            # ── DAX-aligned raw counts, accumulated per window.
-            # Helper closure: write to Full always; to L60/L30 only if the row's
-            # date_key satisfies the trailing-window cutoff.
-            def _bump(buckets: dict[str, dict[str, int]], n: int) -> None:
-                buckets["Full"][uid_lower] += n
-                if date_key >= cutoff_l60:
-                    buckets["L60"][uid_lower] += n
-                if date_key >= cutoff_l30:
-                    buckets["L30"][uid_lower] += n
+        # ── DAX-aligned raw counts, accumulated per window.
+        # Helper closure: write to Full always; to L60/L30 only if the row's
+        # date_key satisfies the trailing-window cutoff.
+        def _bump(buckets: dict[str, dict[str, int]], n: int) -> None:
+            buckets["Full"][uid_lower] += n
+            if date_key >= cutoff_l60:
+                buckets["L60"][uid_lower] += n
+            if date_key >= cutoff_l30:
+                buckets["L30"][uid_lower] += n
 
-            if wl == "MicrosoftTeams" and op in DAX_TEAMS_OPS:
-                _bump(teams_raw, event_count)
-            if wl == "Exchange" and op in DAX_OUTLOOK_OPS:
-                _bump(outlook_raw, event_count)
-            if op in DAX_FILE_OPS:
-                if ext in WORD_EXTS:
-                    _bump(word_raw, event_count)
-                elif ext in EXCEL_EXTS:
-                    _bump(excel_raw, event_count)
-                elif ext in PPT_EXTS:
-                    _bump(ppt_raw, event_count)
-            if op == "CopilotInteraction":
-                _bump(copilot_chat_raw, event_count)
-            # CE Copilot Percentile filter: Workload="Copilot" OR Operation contains "CopilotInteraction"
-            if wl == "Copilot" or "CopilotInteraction" in op:
-                _bump(ce_copilot_raw, event_count)
+        if wl == "MicrosoftTeams" and op in DAX_TEAMS_OPS:
+            _bump(teams_raw, event_count)
+        if wl == "Exchange" and op in DAX_OUTLOOK_OPS:
+            _bump(outlook_raw, event_count)
+        if op in DAX_FILE_OPS:
+            if ext in WORD_EXTS:
+                _bump(word_raw, event_count)
+            elif ext in EXCEL_EXTS:
+                _bump(excel_raw, event_count)
+            elif ext in PPT_EXTS:
+                _bump(ppt_raw, event_count)
+        if op == "CopilotInteraction":
+            _bump(copilot_chat_raw, event_count)
+        # CE Copilot Percentile filter: Workload="Copilot" OR Operation contains "CopilotInteraction"
+        if wl == "Copilot" or "CopilotInteraction" in op:
+            _bump(ce_copilot_raw, event_count)
 
-            # Session cohort: distinct active dates per (user, app)
-            app = app_column(ext, op, wl)
-            if app != "M365 All Apps":
-                session_ops[(uid_lower, app)].add(date_key)
+        # Session cohort: distinct active dates per (user, app)
+        app = app_column(ext, op, wl)
+        if app != "M365 All Apps":
+            session_ops[(uid_lower, app)].add(date_key)
 
     if row_count == 0:
         if not quiet:
@@ -2577,34 +2616,34 @@ def write_userstats_files(
     # service-principal noise. Falls back to audit-event tally if SessionStats is
     # missing (older script invocations).
     prompt_raw = _wbuckets()
-    if session_stats_csv_path:
-        _ss = Path(session_stats_csv_path)
-        if _ss.is_file():
-            with open(_ss, "r", encoding="utf-8-sig", newline="") as _f:
-                _r = csv.DictReader(_f)
-                for _row in _r:
-                    _uid = (_row.get("UserId") or "").strip().lower()
-                    if not _uid:
-                        continue
-                    _date_key = (_row.get("CreationDate") or "")[:10]
-                    try:
-                        _pc = int(_row.get("PromptCount") or 0)
-                    except ValueError:
-                        _pc = 0
-                    if _pc <= 0:
-                        continue
-                    prompt_raw["Full"][_uid] += _pc
-                    if cutoff_l60 and _date_key >= cutoff_l60:
-                        prompt_raw["L60"][_uid] += _pc
-                    if cutoff_l30 and _date_key >= cutoff_l30:
-                        prompt_raw["L30"][_uid] += _pc
+    if session_stats_rows is not None or session_stats_csv_path:
+        _session_stats_available = session_stats_rows is not None
+        if session_stats_csv_path:
+            _session_stats_available = _session_stats_available or Path(session_stats_csv_path).is_file()
+        if _session_stats_available:
+            for _row in _iter_session_stats_rows():
+                _uid = (_row.get("UserId") or "").strip().lower()
+                if not _uid:
+                    continue
+                _date_key = (_row.get("CreationDate") or "")[:10]
+                try:
+                    _pc = int(_row.get("PromptCount") or 0)
+                except ValueError:
+                    _pc = 0
+                if _pc <= 0:
+                    continue
+                prompt_raw["Full"][_uid] += _pc
+                if cutoff_l60 and _date_key >= cutoff_l60:
+                    prompt_raw["L60"][_uid] += _pc
+                if cutoff_l30 and _date_key >= cutoff_l30:
+                    prompt_raw["L30"][_uid] += _pc
             if not quiet:
                 _tot = sum(prompt_raw["Full"].values())
                 print(f"[UserStats] CE Copilot Percentile source: PromptCount "
                       f"({_tot:,} prompts across {len(prompt_raw['Full']):,} users)")
         else:
             if not quiet:
-                print(f"[UserStats] WARNING: SessionStats CSV not found: {_ss} — "
+                print(f"[UserStats] WARNING: SessionStats CSV not found: {session_stats_csv_path} — "
                       f"falling back to audit-event count for CE Copilot Percentile.",
                       file=sys.stderr)
             prompt_raw = ce_copilot_raw  # fallback to legacy event-based percentile
