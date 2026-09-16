@@ -32,9 +32,8 @@ Behavior notes:
           existing column is missing from the new CSV).
         - Additive schema evolution via ``schema_mode='merge'`` (new
           columns are absorbed automatically).
-        - Provenance columns (``Date_Added``, ``Latest_Append_Date``,
-          ``In_Latest_Append``) flow through unchanged because mod15
-          already wrote them into the CSVs upstream.
+                - Time-series tables replace only the incoming ``CreationDate`` range,
+                    making re-runs idempotent without append-provenance columns.
     * Uses :func:`pax_fabric.files_io.tables_root_abfss` +
       :func:`pax_fabric.files_io.onelake_storage_options` for writes when
       running inside a Fabric notebook (the local ``/lakehouse`` FUSE mount
