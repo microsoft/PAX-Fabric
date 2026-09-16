@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Purview CopilotInteraction Processor v4.2.1
+Purview CopilotInteraction Processor v4.2.2
 -------------------------------------------
 Two-input / two-output preprocessor for the AI Business Value Dashboard
 (ValueLens / AIBV) and AI-in-One (AIO) Rollup PBIPs.
@@ -72,7 +72,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -106,8 +106,20 @@ except ImportError:
     _JSON_ENGINE = "json (stdlib)"
 
 
-SCRIPT_VERSION = "4.2.1"
+def json_loads_rescue(value: str | bytes) -> Any:
+    """Retry optimized-parser failures with the standard library parser."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    return json.loads(value)
+
+
+SCRIPT_VERSION = "4.2.2"
 REJECT_MANIFEST_SCHEMA = "pax-reject-manifest/1"
+EXIT_RESIDUAL_REJECTS = 40
+
+
+class ResidualRejectError(RuntimeError):
+    pass
 
 
 def reject_row_digest(row: dict[str, Any]) -> str:
@@ -127,6 +139,8 @@ def reject_manifest_path_for(output_path: str) -> str:
 
 
 class RejectManifest:
+    """Stream every rejected row's ordinal, reason, and digest to disk."""
+
     def __init__(self, path: str, processor: str, processor_version: str) -> None:
         self.path = path
         self.count = 0
@@ -739,7 +753,7 @@ def resource_rows(ced: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def is_copilot_interaction(audit_data: dict[str, Any], raw_row: dict[str, Any]) -> bool:
-    # v4.2.1 parity: exact match on Operation only (upstream dropped the
+    # v4.2.2 parity: exact match on Operation only (upstream dropped the
     # RecordType=261 fallback that v3.1.0 had).
     operation = to_text(
         safe_get(audit_data, "Operation")
@@ -1626,7 +1640,7 @@ def load_entra_and_write_users(
       only the filler for level slots deeper than a user's own level.
 
     NOTE (pax_fabric port scope): ``profile`` is accepted for call-site parity
-    with the v4.2.1 dual-profile processor but is NOT yet used to select a
+    with the v4.2.2 dual-profile processor but is NOT yet used to select a
     3-file licensing input — that remains deferred (see module docstring).
     The AIO-only header aliasing IS implemented: ``displayName``/``country``
     are RENAMED to ``DisplayName``/``Country`` (case-only rename, dropping the
@@ -2538,11 +2552,14 @@ def _run_processor_with_store(
             try:
                 audit_data = json_loads(audit_raw) if audit_raw.strip() else {}
             except Exception:
-                stats["errors"] += 1
-                reject_manifest.record(
-                    stats["input_records"], "JSON_PARSE_FAILED", reject_row_digest(raw_row)
-                )
-                continue
+                try:
+                    audit_data = json_loads_rescue(audit_raw)
+                except Exception:
+                    stats["errors"] += 1
+                    reject_manifest.record(
+                        stats["input_records"], "JSON_PARSE_FAILED", reject_row_digest(raw_row)
+                    )
+                    continue
 
             if not isinstance(audit_data, dict):
                 stats["errors"] += 1
@@ -2646,9 +2663,9 @@ def _run_processor_with_store(
         print(f"  Elapsed:               {elapsed:.2f}s")
 
     if reject_manifest.count:
-        raise RuntimeError(
+        raise ResidualRejectError(
             f"Copilot processor rejected {reject_manifest.count} input row(s); "
-            f"manifest={reject_manifest.path}"
+            f"candidate outputs preserved; manifest={reject_manifest.path}"
         )
 
     return stats
@@ -2876,18 +2893,22 @@ def main() -> None:
             "licensed_summary": str(out_dir / f"{purview_stem}_LicensedUserSummary_{run_ts}.csv"),
         }
 
-    stats = run_processor(
-        purview_csv=purview_path,
-        entra_csv=entra_path,
-        fact_out_csv=fact_out,
-        users_out_csv=users_out,
-        profile=args.profile,
-        agg_paths=agg_paths,
-        quiet=args.quiet,
-        seed_mid_map_path=args.seed_mid_map,
-        seed_thread_map_path=args.seed_thread_map,
-        seed_userkey_map_path=args.seed_userkey_map,
-    )
+    try:
+        stats = run_processor(
+            purview_csv=purview_path,
+            entra_csv=entra_path,
+            fact_out_csv=fact_out,
+            users_out_csv=users_out,
+            profile=args.profile,
+            agg_paths=agg_paths,
+            quiet=args.quiet,
+            seed_mid_map_path=args.seed_mid_map,
+            seed_thread_map_path=args.seed_thread_map,
+            seed_userkey_map_path=args.seed_userkey_map,
+        )
+    except ResidualRejectError as exc:
+        print(f"ERROR: {exc}; candidate outputs are NOT published.", file=sys.stderr)
+        sys.exit(EXIT_RESIDUAL_REJECTS)
     sys.exit(1 if stats["errors"] > 0 else 0)
 
 

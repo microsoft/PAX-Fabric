@@ -1660,9 +1660,9 @@ def show_checkpoint_exit_message() -> None:
 #   * State file name: ``.pax_watermark_state.json`` inside the output-path
 #     root that the checkpoint would use (target-scoped).
 #   * Bootstrap: when no state file exists, start_date = watermark_start_date
-#     from config; end_date = today UTC minus one day (exclusive-end semantics
-#     match the PS ``[Start .. End)`` window — the partial current UTC day is
-#     never collected).
+#     from config; end_date = today's UTC boundary. The existing ``[Start ..
+#     End)`` filtering therefore includes yesterday while excluding the
+#     partial current UTC day.
 #   * Advance: on success we bump the state to the freshly-covered end date.
 #   * Short-circuit: when start > end (no new full UTC days since last run),
 #     we signal the pipeline to exit cleanly with a "no new days" outcome.
@@ -1758,6 +1758,7 @@ def _write_watermark_state(state_path: str, state: dict[str, Any]) -> None:
 def resolve_watermark_window(
     config: Any,
     running_script_version: str,
+    state_root: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Derive the effective [start_date, end_date] window for a Watermark run.
@@ -1784,12 +1785,16 @@ def resolve_watermark_window(
     """
     append_file = getattr(config, "append_file", None)
     output_path = getattr(config, "output_path", None)
-    state_path = _watermark_state_path(output_path, append_file)
+    state_path = (
+        str(Path(state_root) / _WATERMARK_STATE_FILENAME)
+        if state_root
+        else _watermark_state_path(output_path, append_file)
+    )
 
-    # End of window = yesterday UTC (exclusive-end / partial-day semantics —
-    # matches PS ``[Start .. End)`` convention).
+    # End of window = today's UTC boundary. EndDate is exclusive throughout
+    # the query/trim pipeline, so this includes the most recent complete day.
     now_utc = datetime.now(timezone.utc).date()
-    end_of_window = now_utc - timedelta(days=1)
+    end_of_window = now_utc
     end_str = end_of_window.strftime("%Y-%m-%d")
 
     prior = _read_watermark_state(state_path) if state_path else None
@@ -1812,10 +1817,11 @@ def resolve_watermark_window(
         opening_revision = int(prior.get("revision") or 0)
         opening_digest = declared_digest
     if prior and isinstance(prior.get("last_covered_end"), str):
-        # Advance: start = last_covered_end + 1 day.
+        # The persisted boundary is exclusive, so the next window starts at
+        # that exact boundary rather than skipping a day.
         try:
             prior_end = datetime.strptime(prior["last_covered_end"], "%Y-%m-%d").date()
-            start_of_window = prior_end + timedelta(days=1)
+            start_of_window = prior_end
         except ValueError:
             # Corrupted state → bootstrap from config.
             prior_end = None
@@ -1841,7 +1847,7 @@ def resolve_watermark_window(
             ) from ex
 
     start_str = start_of_window.strftime("%Y-%m-%d")
-    short_circuit = start_of_window > end_of_window
+    short_circuit = start_of_window >= end_of_window
 
     if short_circuit:
         reason = (
@@ -1852,13 +1858,13 @@ def resolve_watermark_window(
     elif bootstrap:
         reason = (
             f"Watermark bootstrap: no prior state; collecting "
-            f"{start_str} .. {end_str} (UTC-inclusive)."
+            f"[{start_str} .. {end_str}) UTC."
         )
     else:
         reason = (
             f"Watermark advance: prior covered end = "
             f"{prior['last_covered_end']}; collecting "
-            f"{start_str} .. {end_str} (UTC-inclusive)."
+            f"[{start_str} .. {end_str}) UTC."
         )
 
     # Rewrite the effective window on config so downstream unchanged.

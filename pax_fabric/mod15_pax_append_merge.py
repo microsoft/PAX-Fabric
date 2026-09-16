@@ -172,6 +172,9 @@ def merge_users_csv(
     current_csv: str,
     output_path: str,
     run_date: Optional[str] = None,
+    *,
+    user_history: bool = False,
+    history_effective_date: str = "",
 ) -> dict:
     """Union-merge a target Users CSV with the current run's Users CSV.
 
@@ -199,6 +202,35 @@ def merge_users_csv(
     if not os.path.isfile(current_csv):
         raise FileNotFoundError(
             f"Merge-UsersCsv: current Users CSV not found: '{current_csv}'"
+        )
+
+    if user_history:
+        if not history_effective_date:
+            raise ValueError(
+                "Merge-UsersCsv: UserHistory On requires a deterministic "
+                "HistoryEffectiveDate."
+            )
+        target_shape = _classify_users_temporal_csv(target_csv)
+        current_shape = _classify_users_temporal_csv(current_csv)
+        if target_shape not in {"missing", "empty", "history"}:
+            raise ValueError(
+                f"UserHistory shape mismatch: UserHistory On requires a history "
+                f"Users target, but '{target_csv}' is {target_shape}. The target "
+                "was left unchanged."
+            )
+        if current_shape != "history":
+            raise ValueError(
+                f"UserHistory shape mismatch: current Users data is {current_shape}."
+            )
+        return merge_fact_csv(
+            target_csv=target_csv,
+            current_csv=current_csv,
+            output_path=output_path,
+            key_column=[
+                "PersonId_Normalized", "Has license", "License Status",
+            ],
+            run_date=run_date,
+            preserve_on_match_columns=["EffectiveDate", "UserKey"],
         )
 
     # Load both files with BOM/dup-header tolerance
@@ -341,6 +373,7 @@ def merge_fact_csv(
     output_path: str,
     key_column: "str | list[str]" = "Message_Id_Raw",
     run_date: Optional[str] = None,
+    preserve_on_match_columns: Optional[list[str]] = None,
 ) -> dict:
     """Union-merge a target Fact CSV with the current run's Fact CSV.
 
@@ -385,6 +418,7 @@ def merge_fact_csv(
     # exact prior behavior (composite key of length 1 == plain single-column key).
     key_columns = [key_column] if isinstance(key_column, str) else list(key_column)
     uses_message_id_raw = "Message_Id_Raw" in key_columns
+    preserve_columns = list(preserve_on_match_columns or [])
     _KEY_SEP = "\x1f"  # unit separator: won't collide with real column values
 
     def _row_key(row: dict) -> str:
@@ -454,6 +488,10 @@ def merge_fact_csv(
                 tr_mid = tr.get("Message_Id", "").strip()
                 if tr_mid:
                     obj["Message_Id"] = tr_mid
+            for column in preserve_columns:
+                target_value = str(tr.get(column, "") or "").strip()
+                if target_value:
+                    obj[column] = target_value
             # Preserve target's Date_Added
             tda = tr.get("Date_Added", "").strip()
             obj["Date_Added"] = tda if tda else run_date
@@ -507,6 +545,198 @@ def merge_fact_csv(
         "Departed": departed_count,
         "Union": union_count,
     }
+
+
+def _classify_users_temporal_csv(path: str) -> str:
+    if not path or not os.path.isfile(path):
+        return "missing"
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            return "empty"
+        effective_column = next(
+            (
+                column for column in reader.fieldnames
+                if str(column).strip().lower() == "effectivedate"
+            ),
+            None,
+        )
+        rows = blank = dated = 0
+        for row in reader:
+            rows += 1
+            value = str(row.get(effective_column, "") if effective_column else "").strip()
+            if not value:
+                blank += 1
+                continue
+            if value != "Unknown":
+                try:
+                    datetime.strptime(value, "%Y-%m-%d")
+                except ValueError:
+                    return "ambiguous"
+            dated += 1
+    if rows == 0:
+        return "empty"
+    if dated and not blank:
+        return "history"
+    if blank and not dated:
+        return "legacy"
+    return "ambiguous"
+
+
+_M365_ROLLUP_HEADER = [
+    "UserId", "CreationDate", "Operation", "Workload", "SourceFileExtension",
+    "AppHost", "EventCount", "ItemsAccessedCount", "CreationTime", "MaxCreationTime",
+    "AgentId", "AgentName", "ContextType", "IsAgentInteraction",
+]
+_M365_SESSION_STATS_HEADER = [
+    "UserId", "CreationDate", "AppHost", "SessionCount", "PromptCount",
+    "AgentPromptCount", "ResponseCount", "AgentSessionCount",
+]
+
+
+def _merge_m365_additive_csv(
+    target_csv: str,
+    current_csv: str,
+    output_path: str,
+    *,
+    header: list[str],
+    key_columns: list[str],
+    folded_columns: set[str],
+    sum_columns: list[str],
+    min_columns: list[str],
+    max_columns: list[str],
+    or_columns: list[str],
+    defaults: dict[str, str],
+) -> dict:
+    if not os.path.isfile(current_csv):
+        raise FileNotFoundError(f"Current M365 CSV not found: '{current_csv}'")
+
+    target_rows = import_csv_deduped(target_csv) if os.path.isfile(target_csv) else []
+    current_rows = import_csv_deduped(current_csv)
+
+    def canonical(row: dict) -> dict:
+        item = {column: str(row.get(column, defaults.get(column, "")) or "") for column in header}
+        for column, value in defaults.items():
+            if not item.get(column):
+                item[column] = value
+        return item
+
+    def key_for(row: dict) -> tuple[str, ...]:
+        return tuple(
+            str(row.get(column, "") or "").strip().lower()
+            if column in folded_columns
+            else str(row.get(column, "") or "").strip()
+            for column in key_columns
+        )
+
+    def add_count(left: str, right: str) -> str:
+        def parse(value: str) -> int:
+            try:
+                return int(value or 0)
+            except ValueError:
+                return int(float(value or 0))
+        return str(parse(left) + parse(right))
+
+    def combine(existing: dict, incoming: dict) -> None:
+        for column in sum_columns:
+            existing[column] = add_count(existing.get(column, ""), incoming.get(column, ""))
+        for column in min_columns:
+            left = existing.get(column, "")
+            right = incoming.get(column, "")
+            existing[column] = min(value for value in (left, right) if value) if left or right else ""
+        for column in max_columns:
+            left = existing.get(column, "")
+            right = incoming.get(column, "")
+            existing[column] = max(value for value in (left, right) if value) if left or right else ""
+        for column in or_columns:
+            existing[column] = (
+                "TRUE" if str(existing.get(column, "")).upper() == "TRUE"
+                or str(incoming.get(column, "")).upper() == "TRUE" else "FALSE"
+            )
+
+    merged: dict[tuple[str, ...], dict] = {}
+    target_keys: set[tuple[str, ...]] = set()
+    current_keys: set[tuple[str, ...]] = set()
+    for raw_row in target_rows:
+        row = canonical(raw_row)
+        key = key_for(row)
+        if key in merged:
+            combine(merged[key], row)
+        else:
+            merged[key] = row
+        target_keys.add(key)
+    for raw_row in current_rows:
+        row = canonical(raw_row)
+        key = key_for(row)
+        if key in merged:
+            combine(merged[key], row)
+        else:
+            merged[key] = row
+        current_keys.add(key)
+
+    tmp_path = output_path + ".merging"
+    try:
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=header, extrasaction="ignore")
+            writer.writeheader()
+            for key in sorted(merged):
+                writer.writerow(merged[key])
+        shutil.move(tmp_path, output_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+    retained = len(target_keys & current_keys)
+    return {
+        "Retained": retained,
+        "New": len(current_keys - target_keys),
+        "Updated": retained,
+        "Union": len(merged),
+    }
+
+
+def merge_m365_rollup_csv(
+    target_csv: str,
+    current_csv: str,
+    output_path: str,
+) -> dict:
+    return _merge_m365_additive_csv(
+        target_csv, current_csv, output_path,
+        header=_M365_ROLLUP_HEADER,
+        key_columns=[
+            "UserId", "CreationDate", "Operation", "Workload",
+            "SourceFileExtension", "AppHost", "AgentId", "AgentName", "ContextType",
+        ],
+        folded_columns={"UserId", "SourceFileExtension"},
+        sum_columns=["EventCount", "ItemsAccessedCount"],
+        min_columns=["CreationTime"],
+        max_columns=["MaxCreationTime"],
+        or_columns=["IsAgentInteraction"],
+        defaults={"IsAgentInteraction": "FALSE"},
+    )
+
+
+def merge_m365_session_stats_csv(
+    target_csv: str,
+    current_csv: str,
+    output_path: str,
+) -> dict:
+    return _merge_m365_additive_csv(
+        target_csv, current_csv, output_path,
+        header=_M365_SESSION_STATS_HEADER,
+        key_columns=["UserId", "CreationDate", "AppHost"],
+        folded_columns={"UserId"},
+        sum_columns=[
+            "SessionCount", "PromptCount", "AgentPromptCount",
+            "ResponseCount", "AgentSessionCount",
+        ],
+        min_columns=[],
+        max_columns=[],
+        or_columns=[],
+        defaults={},
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

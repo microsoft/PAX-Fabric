@@ -1940,9 +1940,16 @@ def config_from_params(params: dict) -> "PAXConfig":
 
     # --- Output (legacy local + new lakehouse) -----------------------
     op = pick("outputpath", "output_path")
-    if op is not None:
+    if op is not None and str(op).strip():
         cfg.output_path = str(op)
         cfg._output_path_explicit = True
+    for src, dst in (
+        ("outputpathuserinfo", "output_path_user_info"),
+        ("outputpathagent365info", "output_path_agent365_info"),
+    ):
+        value = pick(src, dst)
+        if value is not None and str(value).strip():
+            setattr(cfg, dst, str(value))
     cro = pick("csvoutputroot", "csv_output_root")
     if cro is not None:
         cfg.csv_output_root = str(cro)
@@ -2056,6 +2063,8 @@ def config_from_params(params: dict) -> "PAXConfig":
     for src, dst in (
         ("parallelmode", "parallel_mode"),
         ("appendfile", "append_file"),
+        ("appenduserinfo", "append_user_info"),
+        ("appendagent365info", "append_agent365_info"),
         ("metricspath", "metrics_path"),
         ("rawinputcsv", "raw_input_csv"),
         ("resume", "resume"),
@@ -2075,6 +2084,10 @@ def config_from_params(params: dict) -> "PAXConfig":
     ):
         v = pick(src, dst)
         if v is None:
+            continue
+        if dst in {
+            "append_file", "append_user_info", "append_agent365_info",
+        } and not str(v).strip():
             continue
         # Fabric pipeline blank parameters arrive as '' — treat as "not supplied"
         # so we match PS's $PSBoundParameters.ContainsKey('Dashboard') semantics

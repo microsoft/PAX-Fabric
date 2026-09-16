@@ -88,6 +88,7 @@ from .mod13_pax_dual_mode import disconnect_purview_audit
 from .__main__ import (
     _assert_deidentify_append_consistency,
     _deidentify_non_rollup_outputs,
+    _run_append_merge,
     _run_query_phase,
     _run_rollup_processors,
     _export_entra_users,
@@ -270,8 +271,9 @@ def _resolve_csv_output_root(cfg: PAXConfig, run_id: str, *,
         target = files_io.csv_root(run_id)
     Path(target).mkdir(parents=True, exist_ok=True)
     cfg.csv_output_root = target
-    cfg.output_path = target  # Force mod10/mod6/mod12 to use the lakehouse dir.
-    cfg._output_path_explicit = True
+    if not getattr(cfg, "append_file", None):
+        cfg.output_path = target
+        cfg._output_path_explicit = True
 
     # v1.11.3 validator (mod1_pax_config.validate_config) requires EXACTLY ONE
     # of (OutputPath* | Append*) PER STREAM, but only when that stream is in
@@ -282,23 +284,50 @@ def _resolve_csv_output_root(cfg: PAXConfig, run_id: str, *,
     # actually requested. Defensive setattr / hasattr keeps older v1.11.1-style
     # PAXConfig snapshots (without these fields) working unchanged.
     _stream_bindings = (
-        # (attr to bind, scope predicate)
+        # (output attr, append attr, scope predicate)
         ("output_path_user_info",
+         "append_user_info",
          getattr(cfg, "include_user_info", False)
          or getattr(cfg, "only_user_info", False)),
         ("output_path_agent365_info",
+         "append_agent365_info",
          getattr(cfg, "include_agent365_info", False)
          or getattr(cfg, "only_agent365_info", False)),
     )
-    for attr, in_scope in _stream_bindings:
+    for attr, append_attr, in_scope in _stream_bindings:
         if not in_scope:
             continue
-        if hasattr(cfg, attr) and getattr(cfg, attr, None) is None:
+        if (
+            hasattr(cfg, attr)
+            and getattr(cfg, attr, None) is None
+            and not getattr(cfg, append_attr, None)
+        ):
             try:
                 setattr(cfg, attr, target)
             except AttributeError:
                 pass
     return target
+
+
+def _bind_internal_csv_staging_paths(cfg: PAXConfig, target: str) -> None:
+    """Bind validated append streams to their private notebook staging root."""
+    if getattr(cfg, "output_path", None) is None:
+        cfg.output_path = target
+    stream_bindings = (
+        (
+            "output_path_user_info",
+            getattr(cfg, "include_user_info", False)
+            or getattr(cfg, "only_user_info", False),
+        ),
+        (
+            "output_path_agent365_info",
+            getattr(cfg, "include_agent365_info", False)
+            or getattr(cfg, "only_agent365_info", False),
+        ),
+    )
+    for attr, in_scope in stream_bindings:
+        if in_scope and getattr(cfg, attr, None) is None:
+            setattr(cfg, attr, target)
 
 
 def _build_output_filename(cfg: PAXConfig) -> str:
@@ -1253,7 +1282,11 @@ def run(params: Optional[dict] = None) -> dict:
         # blocked by validate_config, so this branch cannot fire on a resume.
         if getattr(config, "watermark", False) and config.resume is None:
             try:
-                wm_info = resolve_watermark_window(config, SCRIPT_VERSION)
+                wm_info = resolve_watermark_window(
+                    config,
+                    SCRIPT_VERSION,
+                    state_root=files_io.state_root(),
+                )
             except ValueError as ex:
                 write_log(str(ex), level="ERROR")
                 result["error"] = str(ex)
@@ -1642,6 +1675,11 @@ def run(params: Optional[dict] = None) -> dict:
                         write_log(err, level="ERROR")
                     result["error"] = "; ".join(errors)
                     return result
+
+        # All fresh/resume destination validation is complete. Append targets
+        # remain the semantic destinations; these paths are private current-run
+        # staging locations consumed by the unchanged query/processors.
+        _bind_internal_csv_staging_paths(config, csv_root)
 
         # --------------------------------------------------------------
         # 4. Query orchestration.
@@ -2043,6 +2081,23 @@ def run(params: Optional[dict] = None) -> dict:
         else:
             _deidentify_non_rollup_outputs(ctx)
 
+        if output_mode == "csv" and (
+            getattr(config, "append_file", None)
+            or getattr(config, "append_user_info", None)
+        ):
+            append_result = _run_append_merge(ctx)
+            result["append_merge"] = append_result
+            if not append_result.get("success"):
+                raise RuntimeError(
+                    "Requested CSV append/merge failed; existing targets were left unchanged."
+                )
+            fact_merge = append_result.get("fact") or {}
+            users_merge = append_result.get("users") or {}
+            if fact_merge.get("path"):
+                result["output_file"] = fact_merge["path"]
+            if users_merge.get("path"):
+                result["users_output_file"] = users_merge["path"]
+
         # --------------------------------------------------------------
         # 7. Phase B drain: scratch CSVs -> Delta tables (output_mode='delta').
         # --------------------------------------------------------------
@@ -2330,10 +2385,10 @@ def run(params: Optional[dict] = None) -> dict:
                     result["error"] = "Watermark state could not be advanced safely"
                     write_log(result["error"], level="ERROR")
             except Exception as _wm_exc:
-                write_log(
-                    f"Watermark advance failed (non-fatal): {_wm_exc}",
-                    level="WARN",
-                )
+                result["success"] = False
+                result["exit_code"] = EXIT_ERROR
+                result["error"] = f"Watermark advance failed: {_wm_exc}"
+                write_log(result["error"], level="ERROR")
         if ctx.script_completed:
             cp_data_final = get_checkpoint_data() or {}
             cp_parts = (

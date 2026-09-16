@@ -3323,6 +3323,7 @@ def _run_rollup_processors(
 
         if getattr(config, 'include_m365_usage', False):
             from .processors.m365_processor import run_rollup as m365_rollup
+            from .processors.m365_processor import write_output_manifest
             from .processors.m365_processor import write_userstats_files
 
             out_dir = Path(ctx.output_file).parent
@@ -3335,7 +3336,7 @@ def _run_rollup_processors(
             session_path = str(out_dir / f"{input_stem}_SessionCohort.csv")
             session_stats_path = str(out_dir / f"{input_stem}_SessionStats.csv")
 
-            m365_rollup(
+            m365_stats = m365_rollup(
                 input_csv=ctx.output_file,
                 output_csv=rollup_path,
                 prompt_filter=getattr(config, 'prompt_filter', None),
@@ -3347,6 +3348,25 @@ def _run_rollup_processors(
             # PS L2005-2006: UserStats + SessionCohort derived from rollup output
             write_userstats_files(rollup_path, userstats_path, session_path, quiet=False,
                                   session_stats_csv_path=session_stats_path)
+
+            if m365_stats.get("rejected_records", 0):
+                raise RuntimeError(
+                    f"M365 processor rejected {m365_stats['rejected_records']} input row(s); "
+                    f"candidate outputs preserved; manifest={m365_stats['reject_manifest_path']}"
+                )
+
+            manifest_path = str(out_dir / f"{input_stem}_OutputManifest.json")
+            write_output_manifest(
+                manifest_path,
+                "rollup",
+                [
+                    ("Rollup", rollup_path),
+                    ("UserStats", userstats_path),
+                    ("SessionCohort", session_path),
+                    ("SessionStats", session_stats_path),
+                ],
+            )
+            write_log(f"Rollup: verified four-output M365 manifest: {manifest_path}")
 
             raw_csv_list.append(ctx.output_file)
 
@@ -3450,56 +3470,188 @@ def _assert_deidentify_append_consistency(ctx: PAXRunContext) -> None:
     )
 
 
-def _run_append_merge(ctx: PAXRunContext) -> None:
+def _run_append_merge(ctx: PAXRunContext) -> dict:
     """Run append/merge for Users and Fact CSVs when -Append* flags are bound.
 
     Mirrors PS Merge-UsersCsv (L7520) and Merge-FactCsv (L7724).
     """
     config = ctx.config
     run_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    output: dict = {"success": True, "users": None, "fact": None, "m365": None}
+    is_rollup = bool(
+        getattr(config, 'rollup', False)
+        or getattr(config, 'rollup_plus_raw', False)
+    )
+    include_m365 = bool(getattr(config, 'include_m365_usage', False))
+    raw_path = Path(ctx.output_file) if ctx.output_file else None
+    entra_path_text = getattr(ctx, '_entra_csv_path', None)
+    entra_path = Path(entra_path_text) if entra_path_text else None
+
+    current_fact = raw_path
+    current_users = entra_path
+    if is_rollup and raw_path:
+        if include_m365:
+            current_fact = raw_path.with_name(f"{raw_path.stem}_Rollup.csv")
+        else:
+            current_fact = raw_path.with_name(f"{raw_path.stem}_Interactions.csv")
+            if entra_path:
+                current_users = entra_path.with_name(f"{entra_path.stem}_Users.csv")
 
     # Merge Users CSV
     append_user = getattr(config, 'append_user_info', None)
-    entra_csv = getattr(ctx, '_entra_csv_path', None)
-    if append_user and entra_csv and Path(entra_csv).exists():
+    if append_user:
         try:
             from .mod15_pax_append_merge import merge_users_csv
-            merged_path = str(Path(entra_csv).parent / f"{Path(entra_csv).stem}_Merged.csv")
+            if not current_users or not current_users.exists():
+                raise FileNotFoundError(
+                    f"Current Users CSV not found: '{current_users or ''}'"
+                )
+            merged_path = str(
+                current_users.parent / f"{current_users.stem}_Merged.csv"
+            )
             tally = merge_users_csv(
                 target_csv=append_user,
-                current_csv=entra_csv,
+                current_csv=str(current_users),
                 output_path=merged_path,
                 run_date=run_date,
+                user_history=(
+                    str(getattr(config, 'user_history', 'Off')).lower() == 'on'
+                ),
+                history_effective_date=str(
+                    getattr(config, 'history_effective_date', '') or ''
+                ),
             )
+            output["users"] = {"path": merged_path, "tally": tally}
             write_log(
                 f"Users merge: Retained={tally['Retained']}, New={tally['New']}, "
                 f"Departed={tally['Departed']}, Union={tally['Union']}"
             )
         except Exception as ex:
+            output["success"] = False
+            output["users"] = {"error": str(ex)}
             write_log(f"Users merge failed: {ex}", level="ERROR")
 
     # Merge Fact CSV
     append_fact = getattr(config, 'append_file', None)
-    if append_fact and ctx.output_file and Path(ctx.output_file).exists():
+    if append_fact:
         try:
-            from .mod15_pax_append_merge import merge_fact_csv
-            merged_path = str(Path(ctx.output_file).parent / f"{Path(ctx.output_file).stem}_Merged.csv")
-            # Use Message_Id_Raw for rollup CSVs, RecordId for raw
-            is_rollup = getattr(config, 'rollup', False) or getattr(config, 'rollup_plus_raw', False)
-            key_col = "Message_Id_Raw" if is_rollup else "RecordId"
-            tally = merge_fact_csv(
-                target_csv=append_fact,
-                current_csv=ctx.output_file,
-                output_path=merged_path,
-                key_column=key_col,
-                run_date=run_date,
-            )
-            write_log(
-                f"Fact merge: Retained={tally['Retained']}, New={tally['New']}, "
-                f"Departed={tally['Departed']}, Union={tally['Union']}"
-            )
+            if not current_fact or not current_fact.exists():
+                raise FileNotFoundError(
+                    f"Current Fact CSV not found: '{current_fact or ''}'"
+                )
+            if is_rollup and include_m365:
+                from .mod15_pax_append_merge import (
+                    merge_m365_rollup_csv,
+                    merge_m365_session_stats_csv,
+                )
+                from .processors.m365_processor import write_userstats_files
+
+                merged_rollup = str(
+                    current_fact.parent / f"{current_fact.stem}_Merged.csv"
+                )
+                rollup_tally = merge_m365_rollup_csv(
+                    append_fact, str(current_fact), merged_rollup,
+                )
+                current_session_stats = current_fact.with_name(
+                    current_fact.name.replace("_Rollup.csv", "_SessionStats.csv")
+                )
+                target_name = Path(append_fact).name
+                import re as _re
+                anchor_stem = _re.sub(
+                    r'_Rollup(?:_\d{8}_\d{6})?\.csv$', '', target_name,
+                    flags=_re.IGNORECASE,
+                )
+                target_session_stats = str(
+                    Path(append_fact).parent / f"{anchor_stem}_SessionStats.csv"
+                )
+                merged_session_stats = str(
+                    current_fact.parent / f"{current_fact.stem}_SessionStats_Merged.csv"
+                )
+                session_tally = merge_m365_session_stats_csv(
+                    target_session_stats,
+                    str(current_session_stats),
+                    merged_session_stats,
+                )
+                merged_userstats = str(
+                    current_fact.parent / f"{current_fact.stem}_UserStats_Merged.csv"
+                )
+                merged_cohort = str(
+                    current_fact.parent / f"{current_fact.stem}_SessionCohort_Merged.csv"
+                )
+                write_userstats_files(
+                    merged_rollup,
+                    merged_userstats,
+                    merged_cohort,
+                    quiet=True,
+                    session_stats_csv_path=merged_session_stats,
+                )
+                output["fact"] = {
+                    "path": merged_rollup, "tally": rollup_tally,
+                }
+                output["m365"] = {
+                    "session_stats": merged_session_stats,
+                    "user_stats": merged_userstats,
+                    "session_cohort": merged_cohort,
+                    "session_tally": session_tally,
+                }
+                write_log(
+                    f"M365 merge: Retained={rollup_tally['Retained']}, "
+                    f"New={rollup_tally['New']}, Updated={rollup_tally['Updated']}, "
+                    f"Union={rollup_tally['Union']}"
+                )
+            else:
+                import csv as _csv
+                from .mod15_pax_append_merge import merge_fact_csv
+
+                if is_rollup:
+                    with current_fact.open(
+                        "r", encoding="utf-8-sig", newline=""
+                    ) as handle:
+                        header = next(_csv.reader(handle), [])
+                    is_aibv = "Is_Agent_Activity" in header
+                    key_col = [
+                        "Audit_UserId_Normalized" if is_aibv else "User_Id_Normalized",
+                        "InteractionDate", "AgentId", "AgentName", "AppHost",
+                        "Environment", "License Status", "Context_Type",
+                        "Behavior_Category", "Behavior_Enriched", "AI_Model",
+                        "Is_Sensitive", "Autonomy_Pattern", "AppIdentity_AppId",
+                        "AISystemPlugin_Name", "ThreadId_Raw",
+                    ]
+                    if is_aibv:
+                        key_col.extend([
+                            "Is_Agent_Activity", "Web_Grounded_Signal",
+                            "Workflow_Action",
+                        ])
+                    key_col.append("Message_Id_Raw")
+                    missing = [column for column in key_col if column not in header]
+                    if missing:
+                        raise ValueError(
+                            "Current rollup is missing grain-composite append "
+                            f"column(s): {', '.join(missing)}"
+                        )
+                else:
+                    key_col = "RecordId"
+                merged_path = str(
+                    current_fact.parent / f"{current_fact.stem}_Merged.csv"
+                )
+                tally = merge_fact_csv(
+                    target_csv=append_fact,
+                    current_csv=str(current_fact),
+                    output_path=merged_path,
+                    key_column=key_col,
+                    run_date=run_date,
+                )
+                output["fact"] = {"path": merged_path, "tally": tally}
+                write_log(
+                    f"Fact merge: Retained={tally['Retained']}, New={tally['New']}, "
+                    f"Departed={tally['Departed']}, Union={tally['Union']}"
+                )
         except Exception as ex:
+            output["success"] = False
+            output["fact"] = {"error": str(ex)}
             write_log(f"Fact merge failed: {ex}", level="ERROR")
+
+    return output
 
 
 def _run_delta_export(ctx: PAXRunContext) -> None:

@@ -40,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 
 log = logging.getLogger(__name__)
 
@@ -357,17 +358,11 @@ def _get_write_strategy(table_name: str) -> str:
 
     Returns one of:
         'overwrite'           — snapshot/aggregation tables (replace entirely)
-        'm365_additive'       — keyed additive merge for M365 aggregates
         'delete_date_append'  — time-series tables (delete matching date range, then append)
         'append'              — unknown tables (safe fallback, blind append)
     """
     if not table_name:
         return "append"
-
-    if table_name.endswith("_Rollup") and table_name.startswith("M365_"):
-        return "m365_additive"
-    if table_name.endswith("_SessionStats") and table_name.startswith("M365_"):
-        return "m365_additive"
 
     # Snapshot / aggregation tables → overwrite
     if table_name.startswith("Entra_"):
@@ -463,6 +458,75 @@ def _write_arrow_table(target_uri: str, table, storage_options: dict | None) -> 
         "columns": len(table.column_names),
         "target_uri": target_uri,
     }
+
+
+def _classify_effective_date_values(values) -> str:
+    rows = 0
+    blank = 0
+    dated = 0
+    for raw_value in values:
+        rows += 1
+        value = str(raw_value or "").strip()
+        if not value:
+            blank += 1
+            continue
+        if value != "Unknown":
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                return "ambiguous"
+        dated += 1
+    if rows == 0:
+        return "empty"
+    if dated and not blank:
+        return "history"
+    if blank and not dated:
+        return "legacy"
+    return "ambiguous"
+
+
+def _classify_users_csv_shape(input_csv: str) -> str:
+    with open(input_csv, "r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            return "empty"
+        effective_column = next(
+            (
+                column
+                for column in reader.fieldnames
+                if str(column).strip().lower() == "effectivedate"
+            ),
+            None,
+        )
+        return _classify_effective_date_values(
+            row.get(effective_column, "") if effective_column else ""
+            for row in reader
+        )
+
+
+def _classify_users_delta_shape(
+    target_uri: str,
+    *,
+    storage_options: dict | None,
+) -> str:
+    from deltalake import DeltaTable
+
+    delta_table = DeltaTable(target_uri, storage_options=storage_options)
+    fields = [field.name for field in delta_table.schema().fields]
+    effective_column = next(
+        (column for column in fields if column.lower() == "effectivedate"),
+        None,
+    )
+    dataset = delta_table.to_pyarrow_dataset()
+    if effective_column is None:
+        return "empty" if dataset.count_rows() == 0 else "legacy"
+
+    scanner = dataset.scanner(columns=[effective_column], batch_size=100_000)
+    return _classify_effective_date_values(
+        value
+        for batch in scanner.to_batches()
+        for value in batch.column(0).to_pylist()
+    )
 
 
 def _merge_user_history(
@@ -1381,31 +1445,57 @@ def write_delta_append(
         bearer_token=bearer_token,
         storage_options=storage_options,
     )
-
-    # User History is an explicit cumulative dimension mode. Keep its prior
-    # effective-dated states without enabling retained/departed provenance on
-    # ordinary Fabric Users tables.
-    if (
-        strategy == "overwrite"
-        and table_name.endswith("_Users")
-        and "EffectiveDate" in probe.get("new_cols", [])
-    ):
-        strategy = "user_history_union"
-
-    if strategy not in {
-        "overwrite", "user_history_union", "m365_additive",
-        "delete_date_append", "append",
-    }:
-        raise ValueError(f"Unsupported Delta write strategy: {strategy!r}")
-
     # PS L8208: isInit when existing cols are empty (table doesn't exist or empty).
     is_init = not probe.get("existing_cols")
 
-    # The M365 additive merge preserves target-only columns and evolves its
-    # schema in the merge transaction.
-    if strategy == "m365_additive":
-        probe["compatible"] = True
-        probe["missing"] = []
+    # User History is an explicit cumulative dimension mode. Classify actual
+    # values, not just the header: legacy Users CSVs may carry an empty
+    # EffectiveDate column. Refuse shape transitions before schema auto-drop
+    # can mutate the target.
+    if strategy == "overwrite" and table_name.endswith("_Users"):
+        try:
+            source_shape = _classify_users_csv_shape(input_csv)
+            if source_shape == "ambiguous":
+                raise ValueError("incoming Users data has mixed or invalid EffectiveDate values")
+            if not is_init:
+                shape_opts = _build_storage_options(
+                    target_uri, bearer_token, storage_options,
+                )
+                target_shape = _classify_users_delta_shape(
+                    target_uri, storage_options=shape_opts,
+                )
+                if target_shape == "ambiguous" or (
+                    source_shape not in {"empty", target_shape}
+                    and target_shape != "empty"
+                ):
+                    raise ValueError(
+                        f"incoming Users data is {source_shape}, but the existing "
+                        f"target is {target_shape}"
+                    )
+            if source_shape == "history":
+                strategy = "user_history_union"
+        except Exception as shape_exc:
+            error = (
+                f"[USER_HISTORY_SHAPE_MISMATCH] UserHistory shape mismatch for "
+                f"'{table_name}': {shape_exc}. The target was left unchanged."
+            )
+            if log_fn:
+                log_fn(error, "ERROR")
+            return {
+                "success": False,
+                "is_init": is_init,
+                "added_cols": [],
+                "dropped_cols": [],
+                "missing": [],
+                "error": error,
+                "error_category": "USER_HISTORY_SHAPE_MISMATCH",
+                "rows_written": 0,
+            }
+
+    if strategy not in {
+        "overwrite", "user_history_union", "delete_date_append", "append",
+    }:
+        raise ValueError(f"Unsupported Delta write strategy: {strategy!r}")
 
     # Step 2: Auto-reconcile destructive drift. PS L8210-8214 originally rejected;
     # we now drop the missing columns from the existing Delta table so the new
@@ -1530,10 +1620,6 @@ def write_delta_append(
         """
         if strategy == "user_history_union":
             return _merge_user_history(
-                input_csv, target_uri, table_name, storage_options=opts,
-            )
-        if strategy == "m365_additive":
-            return _merge_m365_additive(
                 input_csv, target_uri, table_name, storage_options=opts,
             )
         if is_init:
