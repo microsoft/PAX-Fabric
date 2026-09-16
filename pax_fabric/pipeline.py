@@ -86,6 +86,8 @@ from .mod13_pax_dual_mode import disconnect_purview_audit
 # Fabric pipeline matches the CLI pipeline behaviour 1:1. Importing __main__
 # is side-effect-free (the signal/atexit hooks are inside ``main()``).
 from .__main__ import (
+    _assert_deidentify_append_consistency,
+    _deidentify_non_rollup_outputs,
     _run_query_phase,
     _run_rollup_processors,
     _export_entra_users,
@@ -112,7 +114,9 @@ def _resolve_notebook_source_plan(config: PAXConfig) -> dict[str, Any]:
             "no_work": False,
         }
 
-    byod_supplied = bool(str(getattr(config, "purview_input_file", "") or "").strip())
+    byod_file = str(getattr(config, "purview_input_file", "") or "").strip()
+    byod_table = str(getattr(config, "purview_input_table", "") or "").strip()
+    byod_supplied = bool(byod_file or byod_table)
     rollup_requested = bool(config.rollup or config.rollup_plus_raw)
     source_state = (
         "Live" if not byod_supplied
@@ -125,7 +129,9 @@ def _resolve_notebook_source_plan(config: PAXConfig) -> dict[str, Any]:
         or config.user_info_file
         or config.user_info_supplement
     )
-    live_entra_required = bool(entra_requested and not config.user_info_file)
+    live_entra_required = bool(
+        entra_requested and not config.user_info_file and not byod_table
+    )
     agent_requested = bool(config.include_agent365_info or config.only_agent365_info)
     if source_state == "ByodActive":
         purview_in_scope = True
@@ -147,6 +153,7 @@ def _resolve_notebook_source_plan(config: PAXConfig) -> dict[str, Any]:
 
     return {
         "source_state": source_state,
+        "source_kind": "table" if byod_table else "file" if byod_file else "live",
         "purview_in_scope": purview_in_scope,
         "live_collection": live_collection,
         "checkpoint_permitted": source_state == "Live" and purview_in_scope,
@@ -337,6 +344,121 @@ def _iter_delta_as_dicts(
                 else:
                     row[c] = str(v)
             yield row
+
+
+def _resolve_byod_raw_table(config: PAXConfig) -> str:
+    """Resolve PurviewInputTable=auto to the dashboard's canonical raw table."""
+    import re
+
+    requested = str(getattr(config, "purview_input_table", "") or "").strip()
+    dashboard = str(getattr(config, "dashboard", "") or "").strip().upper()
+    if requested.lower() == "auto":
+        if dashboard in ("AIO", "VALUELENS"):
+            return "CopilotInteractions_Raw"
+        if dashboard == "M365" or getattr(config, "include_m365_usage", False):
+            return "M365_Raw"
+        return "Audit_Raw"
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", requested):
+        raise ValueError(
+            "PurviewInputTable must be 'auto' or a valid table identifier "
+            f"(letters, digits, underscores), got {requested!r}."
+        )
+    return requested
+
+
+def _stage_byod_delta_table(
+    config: PAXConfig,
+    target_schema: str,
+    output_path: str,
+) -> tuple[str, int]:
+    """Stream a raw Delta table to the existing per-run processor boundary."""
+    table_name = _resolve_byod_raw_table(config)
+    row_count = _stage_named_delta_table(
+        table_name,
+        target_schema,
+        output_path,
+        required_columns=("RecordId", "CreationDate"),
+    )
+    return table_name, row_count
+
+
+def _stage_named_delta_table(
+    table_name: str,
+    target_schema: str,
+    output_path: str,
+    *,
+    required_columns: tuple[str, ...],
+    required_any: tuple[str, ...] = (),
+) -> int:
+    """Stream one Delta table to a run-owned CSV consumed by legacy processors."""
+    root = files_io.tables_root_abfss(target_schema)
+    storage_options = files_io.onelake_storage_options() if root else None
+    if not root:
+        root = files_io.tables_root(target_schema)
+    table_uri = (
+        f"{root}/{table_name}"
+        if "://" in root
+        else str(Path(root) / table_name)
+    )
+
+    from deltalake import DeltaTable
+
+    delta_table = DeltaTable(table_uri, storage_options=storage_options)
+    columns = [field.name for field in delta_table.schema().fields]
+    columns_folded = {column.casefold() for column in columns}
+    missing = sorted(
+        column for column in required_columns
+        if column.casefold() not in columns_folded
+    )
+    if missing:
+        raise ValueError(
+            f"BYOD table '{target_schema}.{table_name}' has an incompatible schema; "
+            f"missing required column(s): {', '.join(missing)}"
+        )
+    if required_any and not any(
+        column.casefold() in columns_folded for column in required_any
+    ):
+        raise ValueError(
+            f"BYOD table '{target_schema}.{table_name}' has an incompatible schema; "
+            "expected one identity column from: " + ", ".join(required_any)
+        )
+
+    writer = CsvWriter(path=output_path, columns=columns)
+    pending: list[dict[str, str]] = []
+    row_count = 0
+    try:
+        for row in _iter_delta_as_dicts(table_uri, storage_options, columns=columns):
+            pending.append(row)
+            if len(pending) >= _SPILL_BATCH_SIZE:
+                writer.write_rows(pending)
+                row_count += len(pending)
+                pending.clear()
+        if pending:
+            writer.write_rows(pending)
+            row_count += len(pending)
+    finally:
+        writer.close()
+    return row_count
+
+
+def _stage_byod_entra_table(
+    config: PAXConfig,
+    target_schema: str,
+    csv_root: str,
+) -> tuple[str, int]:
+    timestamp = (
+        config.script_run_timestamp
+        or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    )
+    output_path = str(Path(csv_root) / f"EntraUsers_MAClicensing_{timestamp}.csv")
+    row_count = _stage_named_delta_table(
+        "Entra_Users_Raw",
+        target_schema,
+        output_path,
+        required_columns=(),
+        required_any=("userPrincipalName", "UPN", "PersonId"),
+    )
+    return output_path, row_count
 
 
 _ONELAKE_MOUNT_PREFIXES: tuple[str, ...] = (
@@ -653,6 +775,116 @@ def _recompute_userstats_from_delta(
             except Exception as exc:
                 _log(f"Recompute: Failed to write {table_name}: {exc}", "WARN")
 
+    return results
+
+
+def _recompute_valuelens_aggregates_from_delta(
+    delta_results: list[dict],
+    log_fn=None,
+) -> list[dict]:
+    """Refresh ValueLens aggregate snapshots from the accumulated fact table."""
+    import tempfile as _tempfile
+
+    from . import files_io as _fio
+    from . import mod16_pax_delta as _mod16
+    from .processors.copilot_processor import (
+        compute_and_write_aggregates,
+        schema_for,
+    )
+    from .sqlite_store import SQLiteStateStore
+
+    def _log(msg: str, level: str = "INFO") -> None:
+        if log_fn:
+            log_fn(msg, level)
+
+    fact_info = next(
+        (
+            entry for entry in delta_results
+            if entry.get("table", "").endswith("_CopilotInteractions")
+        ),
+        None,
+    )
+    aggregate_markers = {
+        "active_days": "ActiveDaysSummary",
+        "user_month_metrics": "UserMonthMetrics",
+        "licensed_rankings": "LicensedRankings",
+        "unlicensed_rankings": "UnlicensedRankings",
+        "licensed_summary": "LicensedSummary",
+    }
+    aggregate_info = {
+        key: next(
+            (
+                entry for entry in delta_results
+                if marker in entry.get("table", "")
+            ),
+            None,
+        )
+        for key, marker in aggregate_markers.items()
+    }
+    if not fact_info or not all(aggregate_info.values()):
+        _log(
+            "ValueLens recompute: fact or aggregate Delta table is missing; skipping.",
+            "WARN",
+        )
+        return []
+
+    grain_keys, nongrain_columns, _ = schema_for("aibv")
+    storage_options = _fio.onelake_storage_options()
+    results: list[dict] = []
+    with _tempfile.TemporaryDirectory(prefix="pax_valuelens_recompute_") as tmpdir:
+        state_path = str(Path(tmpdir) / "aggregate_state.sqlite")
+        with SQLiteStateStore(state_path, log_fn=lambda msg: _log(msg)) as store:
+            store.begin_batch()
+            staged = 0
+            for row in _iter_delta_as_dicts(fact_info["path"], storage_options):
+                try:
+                    message_id = int(str(row.get("Message_Id", "")).strip())
+                except ValueError:
+                    continue
+                grain = tuple(row.get(column, "") for column in grain_keys)
+                nongrain = {
+                    column: row.get(column, "") for column in nongrain_columns
+                }
+                store.upsert_rollup(grain, message_id, nongrain)
+                staged += 1
+                if staged % 10_000 == 0:
+                    store.commit_batch()
+                    store.begin_batch()
+            store.commit_batch()
+
+            aggregate_paths = {
+                key: str(Path(tmpdir) / f"{key}.csv")
+                for key in aggregate_markers
+            }
+            counts = compute_and_write_aggregates(
+                store,
+                aggregate_paths,
+                quiet=True,
+            )
+
+        for key, csv_path in aggregate_paths.items():
+            info = aggregate_info[key]
+            table_name = info["table"]
+            target_uri = info["path"]
+            _log(
+                f"ValueLens recompute: overwriting {table_name} from "
+                f"{staged:,} accumulated fact row(s)."
+            )
+            res = _mod16.convert_csv_to_delta(
+                input_csv=csv_path,
+                target_uri=target_uri,
+                mode="overwrite",
+                storage_options=storage_options,
+            )
+            results.append({
+                "csv": Path(csv_path).name,
+                "table": table_name,
+                "path": target_uri,
+                "rows_written": res.get("rows_written", counts.get(key, 0)),
+                "is_init": False,
+                "added_cols": [],
+                "recomputed": True,
+            })
     return results
 
 
@@ -1416,7 +1648,23 @@ def run(params: Optional[dict] = None) -> dict:
         # --------------------------------------------------------------
         only_user_info = getattr(config, "only_user_info", False)
         only_agent365 = getattr(config, "only_agent365_info", False)
-        if source_plan["purview_in_scope"]:
+        if source_plan["purview_in_scope"] and source_plan["source_kind"] == "table":
+            set_progress_phase("Query", status="Raw Delta table BYOD")
+            output_path = str(Path(csv_root) / _build_output_filename(config))
+            table_name, row_count = _stage_byod_delta_table(
+                config,
+                target_schema,
+                output_path,
+            )
+            ctx.output_file = output_path
+            ctx.metrics.total_records_fetched = row_count
+            result["output_file"] = output_path
+            result["byod_source_table"] = f"{target_schema}.{table_name}"
+            write_log(
+                f"BYOD: streamed {row_count:,} row(s) from raw Delta table "
+                f"{target_schema}.{table_name}"
+            )
+        elif source_plan["purview_in_scope"]:
             set_progress_phase("Query")
             ctx.metrics.query_ms = _run_query_phase(ctx)
         result["records_fetched"] = ctx.metrics.total_records_fetched
@@ -1425,13 +1673,17 @@ def run(params: Optional[dict] = None) -> dict:
         # so the notebook run-summary cell / downstream metrics emitter can
         # attribute records to the caller-supplied file rather than a live
         # Purview query. Additive-only — legacy runs leave these absent.
-        if getattr(config, "purview_input_file", None):
-            result["byod_source"] = str(config.purview_input_file)
+        byod_source = (
+            result.get("byod_source_table")
+            or getattr(config, "purview_input_file", None)
+        )
+        if byod_source:
+            result["byod_source"] = str(byod_source)
             result["byod_records_loaded"] = int(
                 getattr(ctx.metrics, "total_records_fetched", 0)
             )
             # v1.11.16 item 7: mirror into metrics for emitter.
-            ctx.metrics.byod_source = str(config.purview_input_file)
+            ctx.metrics.byod_source = str(byod_source)
             ctx.metrics.byod_records_loaded = int(
                 getattr(ctx.metrics, "total_records_fetched", 0)
             )
@@ -1486,10 +1738,7 @@ def run(params: Optional[dict] = None) -> dict:
             )
             enable_deep = getattr(config, "explode_deep", False)
             prompt_filter_value = getattr(config, "prompt_filter", None)
-            deidentifier = None
             if getattr(config, "deidentify", False):
-                from .mod18_pax_deidentify import PaxDeidentifier
-                deidentifier = PaxDeidentifier()
                 write_log("Deidentify: enabled (deterministic one-way CSV transformation)")
 
             out_filename = _build_output_filename(config)
@@ -1608,8 +1857,6 @@ def run(params: Optional[dict] = None) -> dict:
                     continue
 
                 for r in rows:
-                    if deidentifier is not None:
-                        r = deidentifier.deidentify_purview_record(r)
                     pending_rows.append(r)
                     if len(pending_rows) >= _SPILL_BATCH_SIZE:
                         _flush_pending()
@@ -1663,7 +1910,7 @@ def run(params: Optional[dict] = None) -> dict:
                     "(ExportWorkbook is deprecated). Use the CSV output instead.",
                     level="WARN",
                 )
-        elif source_plan["purview_in_scope"]:
+        elif source_plan["purview_in_scope"] and not ctx.output_file:
             output_path = str(Path(csv_root) / _build_output_filename(config))
             ctx.output_file = output_path
             result["output_file"] = output_path
@@ -1747,12 +1994,30 @@ def run(params: Optional[dict] = None) -> dict:
                 or not agent365_result.get('Reconciled', True)
             )
 
-        if only_user_info:
+        if (
+            source_plan["source_kind"] == "table"
+            and getattr(config, "include_user_info", False)
+        ):
+            entra_path, entra_count = _stage_byod_entra_table(
+                config,
+                target_schema,
+                csv_root,
+            )
+            ctx._entra_csv_path = entra_path
+            result["byod_entra_source_table"] = f"{target_schema}.Entra_Users_Raw"
+            result["byod_entra_records_loaded"] = entra_count
+            write_log(
+                f"BYOD: streamed {entra_count:,} row(s) from raw Delta table "
+                f"{target_schema}.Entra_Users_Raw"
+            )
+        elif only_user_info:
             set_progress_phase("Export")
             _export_entra_users_only(ctx)
             result["output_file"] = ctx.output_file
         elif getattr(config, "include_user_info", False):
             _export_entra_users(ctx)
+
+        _assert_deidentify_append_consistency(ctx)
 
         if getattr(config, "rollup", False) or getattr(config, "rollup_plus_raw", False):
             rollup_seed_paths: dict[str, str | None] = {}
@@ -1775,6 +2040,8 @@ def run(params: Optional[dict] = None) -> dict:
                 raise RuntimeError(
                     "Rollup post-processor failed; canonical output was not published."
                 )
+        else:
+            _deidentify_non_rollup_outputs(ctx)
 
         # --------------------------------------------------------------
         # 7. Phase B drain: scratch CSVs -> Delta tables (output_mode='delta').
@@ -1798,6 +2065,15 @@ def run(params: Optional[dict] = None) -> dict:
             # CSVs remain on disk under csv_root for re-drain.
             delta_results: list = []
             try:
+                strategy_overrides = {}
+                if (
+                    source_plan["source_kind"] == "table"
+                    and getattr(config, "include_m365_usage", False)
+                ):
+                    strategy_overrides = {
+                        f"{drain_prefix}_Rollup": "overwrite",
+                        f"{drain_prefix}_SessionStats": "overwrite",
+                    }
                 delta_results = delta_writer.csv_dir_to_delta(
                     csv_dir=csv_root,
                     schema=target_schema,
@@ -1806,6 +2082,7 @@ def run(params: Optional[dict] = None) -> dict:
                     name_overrides=name_overrides,
                     log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
                     dashboard_prefix=drain_prefix,
+                    strategy_overrides=strategy_overrides,
                 )
             except Exception as ex:
                 write_log(
@@ -1860,6 +2137,29 @@ def run(params: Optional[dict] = None) -> dict:
                     ] + recomputed
                     write_log(
                         f"Recompute complete: {len(recomputed)} table(s) refreshed."
+                    )
+            elif (
+                getattr(config, "with_aggregates", False)
+                and str(getattr(config, "dashboard", "") or "").upper()
+                == "VALUELENS"
+            ):
+                set_progress_phase("Export", status="Recompute ValueLens aggregates")
+                write_log(
+                    "Recomputing ValueLens aggregates from accumulated fact Delta..."
+                )
+                recomputed = _recompute_valuelens_aggregates_from_delta(
+                    delta_results,
+                    log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
+                )
+                if recomputed:
+                    recomputed_tables = {entry["table"] for entry in recomputed}
+                    result["delta_tables"] = [
+                        entry for entry in result["delta_tables"]
+                        if entry["table"] not in recomputed_tables
+                    ] + recomputed
+                    write_log(
+                        f"ValueLens recompute complete: {len(recomputed)} "
+                        "table(s) refreshed."
                     )
 
         # --- Cleanup OOM-spill JSONL shards on successful completion ---

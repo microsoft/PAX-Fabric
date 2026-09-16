@@ -357,11 +357,24 @@ def _get_write_strategy(table_name: str) -> str:
 
     Returns one of:
         'overwrite'           — snapshot/aggregation tables (replace entirely)
+        'keyed_union'         — PowerShell-style retained/new/departed union
+        'm365_additive'       — keyed additive merge for M365 aggregates
         'delete_date_append'  — time-series tables (delete matching date range, then append)
         'append'              — unknown tables (safe fallback, blind append)
     """
     if not table_name:
         return "append"
+
+    if table_name.endswith("_Rollup") and table_name.startswith("M365_"):
+        return "m365_additive"
+    if table_name.endswith("_SessionStats") and table_name.startswith("M365_"):
+        return "m365_additive"
+    if table_name.endswith("_Users") and not table_name.startswith("Entra_"):
+        return "keyed_union"
+    if table_name.endswith("_CopilotInteractions"):
+        return "keyed_union"
+    if table_name.endswith("_Raw") and not table_name.startswith("Entra_"):
+        return "keyed_union"
 
     # Snapshot / aggregation tables → overwrite
     if table_name.startswith("Entra_"):
@@ -387,8 +400,6 @@ def _get_write_strategy(table_name: str) -> str:
         return "overwrite"
 
     # Time-series tables → delete date range + append
-    if table_name.endswith("_Raw"):
-        return "delete_date_append"
     if "_Rollup" in table_name:
         return "delete_date_append"
 
@@ -396,6 +407,318 @@ def _get_write_strategy(table_name: str) -> str:
     # _delete_date_range_and_append auto-falls back to plain append when
     # the column is absent.
     return "delete_date_append"
+
+
+_PROVENANCE_COLUMNS: tuple[str, ...] = (
+    "Date_Added",
+    "Latest_Append_Date",
+    "In_Latest_Append",
+)
+
+_M365_ROLLUP_KEYS: tuple[str, ...] = (
+    "UserId", "CreationDate", "Operation", "Workload",
+    "SourceFileExtension", "AppHost", "AgentId", "AgentName", "ContextType",
+)
+_M365_SESSION_KEYS: tuple[str, ...] = ("UserId", "CreationDate", "AppHost")
+
+
+def _quote_delta_identifier(name: str) -> str:
+    return f"`{name.replace('`', '``')}`"
+
+
+def _delta_value(alias: str, name: str) -> str:
+    return f"{alias}.{_quote_delta_identifier(name)}"
+
+
+def _delta_key_predicate(
+    key_columns: tuple[str, ...],
+    *,
+    folded_columns: tuple[str, ...] = (),
+) -> str:
+    folded = set(folded_columns)
+    comparisons: list[str] = []
+    for column in key_columns:
+        source = f"coalesce({_delta_value('source', column)}, '')"
+        target = f"coalesce({_delta_value('target', column)}, '')"
+        if column in folded:
+            source = f"lower({source})"
+            target = f"lower({target})"
+        comparisons.append(f"{target} = {source}")
+    return " AND ".join(comparisons)
+
+
+def _set_string_column(table, name: str, value: str):
+    import pyarrow as pa
+
+    values = pa.array([value] * table.num_rows, type=pa.string())
+    if name in table.column_names:
+        return table.set_column(table.column_names.index(name), name, values)
+    return table.append_column(name, values)
+
+
+def _align_source_to_target(table, target_columns: list[str]):
+    import pyarrow as pa
+
+    for column in target_columns:
+        if column not in table.column_names:
+            table = table.append_column(
+                column,
+                pa.array([""] * table.num_rows, type=pa.string()),
+            )
+    return table
+
+
+def _fact_merge_key(source_columns: list[str]) -> tuple[str, ...]:
+    is_value_lens = "Is_Agent_Activity" in source_columns
+    user_column = (
+        "Audit_UserId_Normalized" if is_value_lens else "User_Id_Normalized"
+    )
+    columns = [
+        user_column,
+        "InteractionDate",
+        "AgentId",
+        "AgentName",
+        "AppHost",
+        "Environment",
+        "License_Status",
+        "Context_Type",
+        "Behavior_Category",
+        "Behavior_Enriched",
+        "AI_Model",
+        "Is_Sensitive",
+        "Autonomy_Pattern",
+        "AppIdentity_AppId",
+        "AISystemPlugin_Name",
+        "ThreadId_Raw",
+    ]
+    if is_value_lens:
+        columns.extend(("Is_Agent_Activity", "Web_Grounded_Signal", "Workflow_Action"))
+    columns.append("Message_Id_Raw")
+    return tuple(columns)
+
+
+def _keyed_union_contract(
+    table_name: str,
+    source_columns: list[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if table_name.endswith("_Raw"):
+        return ("RecordId",), ()
+    if table_name.endswith("_CopilotInteractions"):
+        return _fact_merge_key(source_columns), ("Message_Id",)
+    if table_name.endswith("_Users"):
+        if "EffectiveDate" in source_columns:
+            return (
+                "PersonId_Normalized", "Has_license", "License_Status",
+            ), ("UserKey", "EffectiveDate")
+        return ("PersonId_Normalized",), ("UserKey",)
+    raise ValueError(f"No keyed-union contract is defined for '{table_name}'.")
+
+
+def _write_arrow_table(target_uri: str, table, storage_options: dict | None) -> dict:
+    from deltalake import write_deltalake
+
+    write_deltalake(
+        target_uri,
+        table,
+        mode="append",
+        schema_mode="merge",
+        storage_options=storage_options,
+    )
+    return {
+        "rows_written": table.num_rows,
+        "columns": len(table.column_names),
+        "target_uri": target_uri,
+    }
+
+
+def _merge_keyed_union(
+    input_csv: str,
+    target_uri: str,
+    table_name: str,
+    *,
+    storage_options: dict | None,
+) -> dict:
+    from datetime import datetime, timezone
+    from deltalake import DeltaTable
+
+    table, source_columns = _read_csv_as_arrow(input_csv)
+    key_columns, preserved_columns = _keyed_union_contract(table_name, source_columns)
+    missing = [column for column in key_columns if column not in source_columns]
+    if missing:
+        raise ValueError(
+            f"Delta keyed merge for '{table_name}' is missing key column(s): "
+            + ", ".join(missing)
+        )
+
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for column, value in (
+        ("Date_Added", run_date),
+        ("Latest_Append_Date", run_date),
+        ("In_Latest_Append", "TRUE"),
+    ):
+        table = _set_string_column(table, column, value)
+
+    try:
+        delta_table = DeltaTable(target_uri, storage_options=storage_options)
+    except Exception:
+        return _write_arrow_table(target_uri, table, storage_options)
+
+    target_columns = [field.name for field in delta_table.schema().fields]
+    table = _align_source_to_target(table, target_columns)
+    update_columns = [
+        column
+        for column in source_columns
+        if column not in preserved_columns and column not in _PROVENANCE_COLUMNS
+    ]
+    updates = {
+        column: _delta_value("source", column)
+        for column in update_columns
+    }
+    updates.update({
+        "Date_Added": (
+            f"CASE WHEN coalesce({_delta_value('target', 'Date_Added')}, '') = '' "
+            f"THEN {_delta_value('source', 'Date_Added')} "
+            f"ELSE {_delta_value('target', 'Date_Added')} END"
+        ),
+        "Latest_Append_Date": _delta_value("source", "Latest_Append_Date"),
+        "In_Latest_Append": "'TRUE'",
+    })
+    departed_updates = {
+        "Latest_Append_Date": f"'{run_date}'",
+        "In_Latest_Append": "'FALSE'",
+    }
+    metrics = (
+        delta_table.merge(
+            source=table,
+            predicate=_delta_key_predicate(
+                key_columns,
+                folded_columns=key_columns,
+            ),
+            source_alias="source",
+            target_alias="target",
+            merge_schema=True,
+        )
+        .when_matched_update(updates)
+        .when_not_matched_insert_all()
+        .when_not_matched_by_source_update(departed_updates)
+        .execute()
+    )
+    if (
+        table_name.endswith("_Users")
+        and "EffectiveDate" not in source_columns
+        and "TotalEmployees" in table.column_names
+    ):
+        delta_table = DeltaTable(target_uri, storage_options=storage_options)
+        total_employees = delta_table.to_pyarrow_dataset().count_rows()
+        delta_table.update(
+            new_values={"TotalEmployees": str(total_employees)}
+        )
+    return {
+        "rows_written": table.num_rows,
+        "columns": len(table.column_names),
+        "target_uri": target_uri,
+        "merge_metrics": metrics,
+    }
+
+
+def _string_sum(target_column: str, source_column: str) -> str:
+    return (
+        "CAST(CAST(coalesce(" + target_column + ", '0') AS BIGINT) + "
+        "CAST(coalesce(" + source_column + ", '0') AS BIGINT) AS STRING)"
+    )
+
+
+def _merge_m365_additive(
+    input_csv: str,
+    target_uri: str,
+    table_name: str,
+    *,
+    storage_options: dict | None,
+) -> dict:
+    from deltalake import DeltaTable
+
+    table, source_columns = _read_csv_as_arrow(input_csv)
+    is_session_stats = table_name.endswith("_SessionStats")
+    key_columns = _M365_SESSION_KEYS if is_session_stats else _M365_ROLLUP_KEYS
+    missing = [column for column in key_columns if column not in source_columns]
+    if missing:
+        raise ValueError(
+            f"Delta additive merge for '{table_name}' is missing key column(s): "
+            + ", ".join(missing)
+        )
+
+    try:
+        delta_table = DeltaTable(target_uri, storage_options=storage_options)
+    except Exception:
+        return _write_arrow_table(target_uri, table, storage_options)
+
+    target_columns = [field.name for field in delta_table.schema().fields]
+    table = _align_source_to_target(table, target_columns)
+    sum_columns = (
+        ("SessionCount", "PromptCount", "AgentPromptCount", "ResponseCount", "AgentSessionCount")
+        if is_session_stats
+        else ("EventCount", "ItemsAccessedCount")
+    )
+    updates = {
+        column: _string_sum(
+            _delta_value("target", column),
+            _delta_value("source", column),
+        )
+        for column in sum_columns
+    }
+    if not is_session_stats:
+        target_creation = _delta_value("target", "CreationTime")
+        source_creation = _delta_value("source", "CreationTime")
+        target_max = _delta_value("target", "MaxCreationTime")
+        source_max = _delta_value("source", "MaxCreationTime")
+        updates.update({
+            "CreationTime": (
+                f"CASE WHEN coalesce({target_creation}, '') = '' THEN {source_creation} "
+                f"WHEN coalesce({source_creation}, '') = '' THEN {target_creation} "
+                f"WHEN {source_creation} < {target_creation} THEN {source_creation} "
+                f"ELSE {target_creation} END"
+            ),
+            "MaxCreationTime": (
+                f"CASE WHEN coalesce({target_max}, '') = '' THEN {source_max} "
+                f"WHEN coalesce({source_max}, '') = '' THEN {target_max} "
+                f"WHEN {source_max} > {target_max} THEN {source_max} "
+                f"ELSE {target_max} END"
+            ),
+            "IsAgentInteraction": (
+                "CASE WHEN lower(coalesce("
+                f"{_delta_value('target', 'IsAgentInteraction')}, 'false')) = 'true' "
+                "OR lower(coalesce("
+                f"{_delta_value('source', 'IsAgentInteraction')}, 'false')) = 'true' "
+                "THEN 'TRUE' ELSE 'FALSE' END"
+            ),
+        })
+
+    folded_columns = (
+        ("UserId",)
+        if is_session_stats
+        else ("UserId", "SourceFileExtension")
+    )
+    metrics = (
+        delta_table.merge(
+            source=table,
+            predicate=_delta_key_predicate(
+                key_columns,
+                folded_columns=folded_columns,
+            ),
+            source_alias="source",
+            target_alias="target",
+            merge_schema=True,
+        )
+        .when_matched_update(updates)
+        .when_not_matched_insert_all()
+        .execute()
+    )
+    return {
+        "rows_written": table.num_rows,
+        "columns": len(table.column_names),
+        "target_uri": target_uri,
+        "merge_metrics": metrics,
+    }
 
 
 def _read_csv_as_arrow(input_csv: str):
@@ -1083,6 +1406,7 @@ def write_delta_append(
     target_uri: str,
     *,
     table_name: str = "",
+    strategy_override: str | None = None,
     bearer_token: str | None = None,
     storage_options: dict | None = None,
     max_attempts: int = _DEFAULT_DELTA_MAX_ATTEMPTS,
@@ -1145,6 +1469,13 @@ def write_delta_append(
             "rows_written": 0,
         }
 
+    strategy = strategy_override or _get_write_strategy(table_name)
+    if strategy not in {
+        "overwrite", "keyed_union", "m365_additive",
+        "delete_date_append", "append",
+    }:
+        raise ValueError(f"Unsupported Delta write strategy: {strategy!r}")
+
     # Step 1: Probe schema. PS L8207.
     probe = test_delta_table_schema_compat(
         target_uri, input_csv,
@@ -1154,6 +1485,18 @@ def write_delta_append(
 
     # PS L8208: isInit when existing cols are empty (table doesn't exist or empty).
     is_init = not probe.get("existing_cols")
+
+    # Native merges preserve target-only columns and evolve their schemas in the
+    # merge transaction. They must not pass through the legacy destructive
+    # auto-drop path merely because provenance or a prior additive column is not
+    # present in the incoming CSV.
+    if strategy in ("keyed_union", "m365_additive"):
+        probe["compatible"] = True
+        probe["missing"] = []
+        if strategy == "keyed_union":
+            for column in _PROVENANCE_COLUMNS:
+                if column not in probe["new_cols"]:
+                    probe["new_cols"].append(column)
 
     # Step 2: Auto-reconcile destructive drift. PS L8210-8214 originally rejected;
     # we now drop the missing columns from the existing Delta table so the new
@@ -1230,7 +1573,6 @@ def write_delta_append(
     ]
 
     # Step 4: Write using strategy determined by table name pattern.
-    strategy = _get_write_strategy(table_name)
     log.info(
         "Write-DeltaAppend: table='%s' strategy='%s' is_init=%s",
         table_name, strategy, is_init,
@@ -1277,6 +1619,14 @@ def write_delta_append(
         up a refreshed ``storage_options`` (e.g. a new OneLake bearer
         token) without re-running the schema pre-flight.
         """
+        if strategy == "keyed_union":
+            return _merge_keyed_union(
+                input_csv, target_uri, table_name, storage_options=opts,
+            )
+        if strategy == "m365_additive":
+            return _merge_m365_additive(
+                input_csv, target_uri, table_name, storage_options=opts,
+            )
         if is_init:
             return convert_csv_to_delta(
                 input_csv, target_uri, mode='append',

@@ -491,6 +491,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("-MetricsPath", "--metrics-path", default=None)
     p.add_argument("-AutoCompleteness", "--auto-completeness",
                    action="store_true", default=None)
+    p.add_argument("-Deidentify", "--deidentify",
+                   action="store_true", default=None)
 
     # --- Resume ---
     p.add_argument("-Resume", "--resume", nargs="?", const="", default=None,
@@ -568,6 +570,7 @@ def _apply_cli_args(config: 'PAXConfig', args: argparse.Namespace) -> None:
         "emit_metrics_json": "emit_metrics_json",
         "metrics_path": "metrics_path",
         "auto_completeness": "auto_completeness",
+        "deidentify": "deidentify",
         "resume": "resume",
         "circuit_breaker_threshold": "circuit_breaker_threshold",
         "backoff_base_seconds": "backoff_base_seconds",
@@ -1119,6 +1122,8 @@ def main() -> int:
         elif include_user_info:
             _export_entra_users(ctx)
 
+        _assert_deidentify_append_consistency(ctx)
+
         # --- Rollup Seed Map Integration (PS L7273, L7318) ---
         # When -AppendFile + -Rollup, pre-seed surrogate keys from append target
         seed_mid_map_path = None
@@ -1165,6 +1170,8 @@ def main() -> int:
                 seed_thread_map_path=seed_thread_map_path,
                 seed_userkey_map_path=seed_userkey_map_path,
             )
+        else:
+            _deidentify_non_rollup_outputs(ctx)
 
         # --- Append/Merge Integration (PS L7520, L7724) ---
         _run_append_merge(ctx)
@@ -3334,6 +3341,7 @@ def _run_rollup_processors(
                 prompt_filter=getattr(config, 'prompt_filter', None),
                 quiet=False,
                 session_stats_csv=session_stats_path,
+                deidentify=bool(getattr(config, 'deidentify', False)),
             )
 
             # PS L2005-2006: UserStats + SessionCohort derived from rollup output
@@ -3375,9 +3383,71 @@ def _run_rollup_processors(
                 retention_success = False
                 write_log(f"Rollup: failed to delete '{extra_path}': {e}", level="ERROR")
     elif rollup_success and getattr(config, 'rollup_plus_raw', False):
+        if getattr(config, 'deidentify', False):
+            from .mod18_pax_deidentify import PaxDeidentifier
+
+            deidentifier = PaxDeidentifier()
+            retained_paths = list(dict.fromkeys(
+                raw_csv_list
+                + ([getattr(ctx, '_entra_csv_path', '')]
+                   if getattr(ctx, '_entra_csv_path', '') else [])
+            ))
+            for raw_path in retained_paths:
+                deidentifier.deidentify_csv(raw_path)
+                write_log(f"Deidentify: scrubbed retained raw CSV: {raw_path}")
         write_log("Rollup: raw CSV(s) retained (per -RollupPlusRaw).")
 
     return rollup_success and retention_success
+
+
+def _deidentify_non_rollup_outputs(ctx: PAXRunContext) -> None:
+    """Scrub final raw CSV outputs once, matching the PowerShell post-write pass."""
+    config = ctx.config
+    if (
+        not getattr(config, 'deidentify', False)
+        or getattr(config, 'rollup', False)
+        or getattr(config, 'rollup_plus_raw', False)
+    ):
+        return
+
+    from .mod18_pax_deidentify import PaxDeidentifier
+
+    paths = list(getattr(ctx, 'csv_split_files', []) or [])
+    if not paths and ctx.output_file:
+        paths.append(ctx.output_file)
+    entra_csv = getattr(ctx, '_entra_csv_path', '') or ''
+    if entra_csv:
+        paths.append(entra_csv)
+
+    deidentifier = PaxDeidentifier()
+    for path in dict.fromkeys(paths):
+        deidentifier.deidentify_csv(path)
+        write_log(f"Deidentify: scrubbed raw CSV: {path}")
+
+
+def _assert_deidentify_append_consistency(ctx: PAXRunContext) -> None:
+    """Apply the PowerShell deidentify/append compatibility gate."""
+    config = ctx.config
+    targets = []
+    append_fact = getattr(config, 'append_file', None)
+    append_user = getattr(config, 'append_user_info', None)
+    if append_fact and not str(append_fact).lower().startswith(('http://', 'https://')):
+        targets.append((str(append_fact), 'AppendFile'))
+    if append_user and not str(append_user).lower().startswith(('http://', 'https://')):
+        targets.append((str(append_user), 'AppendUserInfo'))
+    if not targets:
+        return
+
+    from .mod18_pax_deidentify import assert_append_deidentify_consistency
+
+    assert_append_deidentify_consistency(
+        targets,
+        run_deidentified=bool(getattr(config, 'deidentify', False)),
+        is_rollup=bool(
+            getattr(config, 'rollup', False)
+            or getattr(config, 'rollup_plus_raw', False)
+        ),
+    )
 
 
 def _run_append_merge(ctx: PAXRunContext) -> None:
@@ -3768,9 +3838,6 @@ def _export_entra_users_only(ctx: PAXRunContext) -> None:
         entra_data = []
     entra_data = _scope_entra_users(ctx, entra_data, entra_session)
     if entra_data:
-        if getattr(config, 'deidentify', False):
-            from .mod18_pax_deidentify import PaxDeidentifier
-            entra_data = PaxDeidentifier().deidentify_rows("EntraUsers", entra_data)
         entra_columns = list(entra_data[0].keys()) if entra_data else []
         writer = CsvWriter(path=entra_csv, columns=entra_columns)
         writer.write_rows(entra_data)
@@ -3836,9 +3903,6 @@ def _export_entra_users(ctx: PAXRunContext) -> None:
         ctx.metrics.entra_directory_fetch_failed = True
     entra_data = _scope_entra_users(ctx, entra_data, entra_session)
     if entra_data:
-        if getattr(config, 'deidentify', False):
-            from .mod18_pax_deidentify import PaxDeidentifier
-            entra_data = PaxDeidentifier().deidentify_rows("EntraUsers", entra_data)
         entra_columns = list(entra_data[0].keys()) if entra_data else []
         writer = CsvWriter(path=entra_csv, columns=entra_columns)
         writer.write_rows(entra_data)

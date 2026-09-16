@@ -190,6 +190,7 @@ def csv_dir_to_delta(
     max_attempts: int = 4,
     token_refresh_fn=None,
     dashboard_prefix: str = "",
+    strategy_overrides: Optional[dict[str, str]] = None,
 ) -> list[dict]:
     """Drain every ``*.csv`` in ``csv_dir`` into a Delta table (append mode).
 
@@ -271,6 +272,7 @@ def csv_dir_to_delta(
             level="WARN",
         )
 
+    strategy_overrides = strategy_overrides or {}
     results: list[dict] = []
     for csv_path in csv_files:
         stem = os.path.splitext(os.path.basename(csv_path))[0]
@@ -316,6 +318,7 @@ def csv_dir_to_delta(
             input_csv=csv_path,
             target_uri=target_path,
             table_name=table,
+            strategy_override=strategy_overrides.get(table),
             storage_options=storage_options,
             max_attempts=max_attempts,
             log_fn=log_fn,

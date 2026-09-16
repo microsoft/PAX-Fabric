@@ -318,6 +318,9 @@ class PAXConfig:
     # skipped and records are read from this file. Mirrors PS
     # `[string]$PurviewInputFile`.
     purview_input_file: Optional[str] = None
+    # Fabric-native BYOD source. ``auto`` resolves the dashboard's canonical
+    # raw Delta table; an explicit value selects a table in TargetSchema.
+    purview_input_table: Optional[str] = None
     # User temporal history mode: 'Off' (legacy — current-state Users.csv)
     # or 'On' (append-only history shape with dated effective rows).
     # Mirrors PS `[ValidateSet('Off','On')][string]$UserHistory = 'Off'`.
@@ -1334,9 +1337,32 @@ def validate_config(config: PAXConfig) -> list[str]:
             f"Provide all Local, all SharePoint, or all Fabric destinations."
         )
 
-    # AppRegistration credential check: client_id + client_secret are required
-    # (only auth path supported in v1.11.4+).
-    if not (config.client_id and config.client_secret):
+    # AppRegistration credentials are required only when this run actually
+    # calls Purview/Graph. A Fabric-native table BYOD run reads both audit and
+    # Entra inputs from Delta and therefore has no live authentication step.
+    table_byod = bool(
+        str(getattr(config, "purview_input_table", "") or "").strip()
+    )
+    supplied_audit = bool(
+        config.raw_input_csv or config.purview_input_file or table_byod
+    )
+    purview_live = bool(
+        not supplied_audit
+        and not config.only_user_info
+        and not config.only_agent365_info
+    )
+    entra_live = bool(
+        (config.include_user_info or config.only_user_info)
+        and not config.user_info_file
+        and not table_byod
+    )
+    graph_auth_required = bool(
+        purview_live
+        or entra_live
+        or config.include_agent365_info
+        or config.only_agent365_info
+    )
+    if graph_auth_required and not (config.client_id and config.client_secret):
         errors.append(
             "AppRegistration auth requires both client_id and client_secret. "
             "Supply them via CLI (-ClientId / -ClientSecret) or environment variables."
@@ -1426,6 +1452,10 @@ def validate_config(config: PAXConfig) -> list[str]:
             wm_blockers.append(
                 "PurviewInputFile (supplied-input mode does not collect new days)"
             )
+        if config.purview_input_table:
+            wm_blockers.append(
+                "PurviewInputTable (supplied-table mode does not collect new days)"
+            )
         if config.use_eom:
             wm_blockers.append("UseEOM")
         if config.only_user_info:
@@ -1453,6 +1483,12 @@ def validate_config(config: PAXConfig) -> list[str]:
     if uh_raw not in ("Off", "On"):
         errors.append(
             f"UserHistory='{uh_raw}' is not a valid value. Use one of: Off, On."
+        )
+
+    if config.purview_input_file and config.purview_input_table:
+        errors.append(
+            "PurviewInputFile and PurviewInputTable cannot both be supplied. "
+            "Choose one authoritative BYOD source."
         )
     elif uh_raw == "On":
         if not (config.rollup or config.rollup_plus_raw):
@@ -2033,6 +2069,7 @@ def config_from_params(params: dict) -> "PAXConfig":
         # v1.11.16 additions
         ("watermarkstartdate", "watermark_start_date"),
         ("purviewinputfile", "purview_input_file"),
+        ("purviewinputtable", "purview_input_table"),
         ("userhistory", "user_history"),
         ("historyeffectivedate", "history_effective_date"),
     ):
