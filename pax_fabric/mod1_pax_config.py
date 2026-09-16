@@ -1454,6 +1454,19 @@ def validate_config(config: PAXConfig) -> list[str]:
         errors.append(
             f"UserHistory='{uh_raw}' is not a valid value. Use one of: Off, On."
         )
+    elif uh_raw == "On":
+        if not (config.rollup or config.rollup_plus_raw):
+            errors.append("UserHistory On requires Rollup or RollupPlusRaw.")
+        if not config.include_user_info:
+            errors.append(
+                "UserHistory On requires IncludeUserInfo so the effective-dated "
+                "Users dimension can be produced."
+            )
+        if config.include_m365_usage:
+            errors.append(
+                "UserHistory On is not available for the M365 usage rollup because "
+                "that processor does not produce a Users dimension."
+            )
 
     # PS L24016: Merge-UsersCsv throws on UserHistory=On + blank
     # HistoryEffectiveDate. PS derives an implicit value from TrimStartDateUTC

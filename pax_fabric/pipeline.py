@@ -92,10 +92,131 @@ from .__main__ import (
     _export_entra_users_only,
     _iter_jsonl_shards,
     _cleanup_spilled_shards,
+    _record_matches_agent_filter,
     _SPILL_BATCH_SIZE,
     EXIT_SUCCESS,
     EXIT_ERROR,
 )
+
+
+def _resolve_notebook_source_plan(config: PAXConfig) -> dict[str, Any]:
+    """Resolve one authoritative source/authentication plan for the notebook run."""
+    if getattr(config, "raw_input_csv", None):
+        return {
+            "source_state": "Replay",
+            "purview_in_scope": True,
+            "live_collection": False,
+            "checkpoint_permitted": False,
+            "authentication_required": False,
+            "authentication_reasons": [],
+            "no_work": False,
+        }
+
+    byod_supplied = bool(str(getattr(config, "purview_input_file", "") or "").strip())
+    rollup_requested = bool(config.rollup or config.rollup_plus_raw)
+    source_state = (
+        "Live" if not byod_supplied
+        else "ByodActive" if rollup_requested
+        else "ByodIgnored"
+    )
+    entra_requested = bool(
+        config.include_user_info
+        or config.only_user_info
+        or config.user_info_file
+        or config.user_info_supplement
+    )
+    live_entra_required = bool(entra_requested and not config.user_info_file)
+    agent_requested = bool(config.include_agent365_info or config.only_agent365_info)
+    if source_state == "ByodActive":
+        purview_in_scope = True
+    elif source_state == "ByodIgnored":
+        purview_in_scope = False
+    else:
+        purview_in_scope = not config.only_user_info and not config.only_agent365_info
+    live_collection = source_state == "Live" and purview_in_scope
+
+    reasons: list[str] = []
+    if live_collection:
+        reasons.append("live Purview audit collection")
+    if live_entra_required:
+        reasons.append("live Entra directory export")
+    if config.user_info_supplement:
+        reasons.append("hybrid directory enrichment")
+    if agent_requested:
+        reasons.append("Agent 365 catalog export")
+
+    return {
+        "source_state": source_state,
+        "purview_in_scope": purview_in_scope,
+        "live_collection": live_collection,
+        "checkpoint_permitted": source_state == "Live" and purview_in_scope,
+        "authentication_required": bool(reasons),
+        "authentication_reasons": reasons,
+        "no_work": source_state == "ByodIgnored" and not entra_requested and not agent_requested,
+    }
+
+
+def _write_zero_record_purview_csv(config: PAXConfig, output_path: str) -> None:
+    """Write the canonical header-only Purview artifact for an empty result."""
+    if config.include_m365_usage:
+        from .mod10_pax_csv_export import M365_USAGE_BASE_HEADER
+
+        columns = M365_USAGE_BASE_HEADER
+    else:
+        from .mod9_pax_data_transform import PURVIEW_EXPLODED_HEADER
+
+        columns = PURVIEW_EXPLODED_HEADER
+    writer = CsvWriter(path=output_path, columns=columns)
+    writer.close()
+
+
+def _assert_delta_publication_complete(results: list[dict[str, Any]]) -> None:
+    """Reject a Delta publication containing any failed table outcome."""
+    failures = [
+        result for result in results
+        if result.get("success") is False
+        or result.get("readback_verified") is False
+    ]
+    if not failures:
+        return
+    detail = "; ".join(
+        f"{item.get('table', '<unknown>')}: "
+        f"{'readback: ' if item.get('readback_verified') is False else ''}"
+        f"{item.get('readback_error') or item.get('error', 'write failed')}"
+        for item in failures
+    )
+    raise RuntimeError(f"Delta publication incomplete: {detail}")
+
+
+def _write_delta_completion_manifest(
+    output_dir: str,
+    run_id: str,
+    results: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "schema": "pax-delta-completion/1",
+        "runId": run_id,
+        "completedAtUtc": datetime.now(timezone.utc).isoformat(),
+        "tables": [
+            {
+                "table": item.get("table"),
+                "path": item.get("path"),
+                "rowsWritten": int(item.get("rows_written", 0) or 0),
+                "deltaVersion": item.get("delta_version"),
+                "readbackRows": item.get("readback_rows"),
+                "readbackVerified": item.get("readback_verified") is True,
+            }
+            for item in results
+        ],
+    }
+    final_path = Path(output_dir) / f"PAX_Delta_Completion_{run_id}.json"
+    temporary_path = final_path.with_suffix(final_path.suffix + ".tmp")
+    temporary_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(final_path)
+    return str(final_path)
 
 
 def _resolve_run_id(cfg: PAXConfig) -> str:
@@ -302,6 +423,10 @@ def _prepare_copilot_delta_seeds(
     tmp_root = tempfile.gettempdir()
     state_dir = Path(tempfile.mkdtemp(prefix="pax_copilot_state_"))
     state_path = state_dir / "copilot_state.sqlite"
+    user_history_enabled = (
+        str(getattr(ctx.config, "user_history", "Off") or "Off").lower() == "on"
+    )
+    user_history_csv: str | None = None
     locality = _classify_state_path(str(state_path))
     try:
         free_mib = shutil.disk_usage(str(state_dir)).free / (1024 * 1024)
@@ -357,9 +482,46 @@ def _prepare_copilot_delta_seeds(
                 return 0
             raise
 
+    if user_history_enabled:
+        import csv
+
+        history_path = state_dir / "user_history.csv"
+        history_columns = [
+            "PersonId_Normalized", "Has license", "License Status",
+            "EffectiveDate", "UserKey",
+        ]
+        try:
+            rows_written = 0
+            with history_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=history_columns, lineterminator="\n")
+                writer.writeheader()
+                for row in _iter_delta_as_dicts(
+                    users_uri, storage_options, columns=history_columns
+                ):
+                    writer.writerow({column: row.get(column, "") for column in history_columns})
+                    rows_written += 1
+            user_history_csv = str(history_path)
+            write_log(
+                f"[SQLITE] Staged {rows_written:,} prior UserHistory rows from {users_uri}"
+            )
+        except Exception as ex:
+            message = str(ex).lower()
+            if any(
+                marker in message
+                for marker in (
+                    "not a delta table", "no such file", "does not exist",
+                    "no files in log segment",
+                )
+            ):
+                history_path.unlink(missing_ok=True)
+                write_log(f"[SQLITE] No prior UserHistory Delta table at {users_uri}")
+            else:
+                raise
+
     with SQLiteStateStore(str(state_path), log_fn=write_log) as store:
-        _seed(store, "user", users_uri, "PersonId_Normalized", "UserKey")
-        _seed(store, "user", fact_uri, user_raw_column, "UserKey")
+        if not user_history_enabled:
+            _seed(store, "user", users_uri, "PersonId_Normalized", "UserKey")
+            _seed(store, "user", fact_uri, user_raw_column, "UserKey")
         _seed(store, "thread", fact_uri, "ThreadId_Raw", "ThreadId")
         _seed(store, "message", fact_uri, "Message_Id_Raw", "Message_Id")
 
@@ -369,6 +531,7 @@ def _prepare_copilot_delta_seeds(
         "seed_thread_map_path": None,
         "seed_userkey_map_path": None,
         "state_db_path": str(state_path),
+        "user_history_csv": user_history_csv,
     }
 
 
@@ -809,6 +972,7 @@ def run(params: Optional[dict] = None) -> dict:
     _initial_csv_root = csv_root
     result["run_id"] = run_id
     result["csv_output_root"] = csv_root
+    ctx._csv_output_root = csv_root
 
     # ------------------------------------------------------------------
     # 1. Logging — redirect to Files/pax/logs/<run_id>.log.
@@ -830,6 +994,9 @@ def run(params: Optional[dict] = None) -> dict:
     # Predeclared here so a pre-try exception never NameError's the finally.
     watermark_state_path: Optional[str] = None
     watermark_covered_end: Optional[str] = None
+    watermark_contract_fingerprint = ""
+    watermark_opening_revision = 0
+    watermark_opening_digest = ""
 
     try:
         # --------------------------------------------------------------
@@ -862,6 +1029,11 @@ def run(params: Optional[dict] = None) -> dict:
 
             watermark_state_path = wm_info.get("state_path")
             watermark_covered_end = wm_info.get("end_date")
+            watermark_contract_fingerprint = str(
+                wm_info.get("contract_fingerprint") or ""
+            )
+            watermark_opening_revision = int(wm_info.get("opening_revision") or 0)
+            watermark_opening_digest = str(wm_info.get("opening_digest") or "")
             result["watermark_enabled"] = True
             result["watermark_bootstrap"] = bool(wm_info.get("bootstrap"))
             result["watermark_previous_end"] = wm_info.get("previous_end")
@@ -940,23 +1112,22 @@ def run(params: Optional[dict] = None) -> dict:
             result["user_history"] = "Off"
             ctx.metrics.user_history = "Off"
 
-        # --- Checkpoint self-gate (PS L17575) ---
-        # Checkpointing disabled for replay-from-CSV and OnlyUserInfo modes.
-        # v1.11.16: BYOD (PurviewInputFile) is a single-shot local load with
-        # no fetch/paging state to preserve, so checkpointing is off too.
-        set_checkpoint_enabled(
-            not getattr(config, "raw_input_csv", None)
-            and not getattr(config, "purview_input_file", None)
-            and not getattr(config, "only_user_info", False)
+        source_plan = _resolve_notebook_source_plan(config)
+        result["purview_source_state"] = source_plan["source_state"]
+        result["authentication_reasons"] = list(
+            source_plan["authentication_reasons"]
         )
 
+        # --- Checkpoint self-gate (PS L17575) ---
+        set_checkpoint_enabled(bool(source_plan["checkpoint_permitted"]))
+
         # --------------------------------------------------------------
-        # 3. Authentication (skip in replay-from-CSV and BYOD modes).
+        # 3. Authenticate only when an active phase requires an online service.
         # --------------------------------------------------------------
         # v1.11.16 BYOD parity (PS L10266): supplying -PurviewInputFile means
         # the caller owns the raw Purview audit dump — no Search-UnifiedAuditLog
         # call is made, so we must NOT open a live Purview auth session either.
-        if not config.raw_input_csv and not getattr(config, "purview_input_file", None):
+        if source_plan["authentication_required"]:
             auth_result = connect_purview_audit(
                 auth_method=config.auth,
                 tenant_id=config.tenant_id,
@@ -1245,7 +1416,7 @@ def run(params: Optional[dict] = None) -> dict:
         # --------------------------------------------------------------
         only_user_info = getattr(config, "only_user_info", False)
         only_agent365 = getattr(config, "only_agent365_info", False)
-        if not only_user_info and not only_agent365:
+        if source_plan["purview_in_scope"]:
             set_progress_phase("Query")
             ctx.metrics.query_ms = _run_query_phase(ctx)
         result["records_fetched"] = ctx.metrics.total_records_fetched
@@ -1302,11 +1473,17 @@ def run(params: Optional[dict] = None) -> dict:
 
             trim_start = config.trim_start_date_utc
             trim_end = config.trim_end_date_utc
+            if getattr(ctx, "bypass_date_trim", False):
+                trim_start = None
+                trim_end = None
             do_trim = trim_start is not None or trim_end is not None
             if do_trim:
                 from .mod2_pax_data_helpers import parse_date_safe
 
-            enable_explosion = getattr(config, "explode_arrays", False)
+            enable_explosion = bool(
+                getattr(config, "explode_arrays", False)
+                or getattr(config, "raw_input_csv", None)
+            )
             enable_deep = getattr(config, "explode_deep", False)
             prompt_filter_value = getattr(config, "prompt_filter", None)
             deidentifier = None
@@ -1323,6 +1500,13 @@ def run(params: Optional[dict] = None) -> dict:
             seen_ids: set[str] = set()
             dup_skipped = 0
             trim_skipped = 0
+            agent_filtered = 0
+            exclude_agents_active = bool(getattr(config, "exclude_agents", False))
+            agent_filter_active = bool(
+                getattr(config, "agent_id", None)
+                or getattr(config, "agents_only", False)
+            )
+            agent_filter_started = time.perf_counter()
             rows_written = 0
             writer: CsvWriter | None = None
             csv_columns: list[str] = []
@@ -1388,6 +1572,23 @@ def run(params: Optional[dict] = None) -> dict:
                             trim_skipped += 1
                             continue
 
+                if exclude_agents_active:
+                    ctx.metrics.exclude_agents_pre_count += 1
+                elif agent_filter_active:
+                    ctx.metrics.agent_filter_pre_count += 1
+                if not _record_matches_agent_filter(
+                    record,
+                    getattr(config, "agent_id", None),
+                    bool(getattr(config, "agents_only", False)),
+                    exclude_agents_active,
+                ):
+                    agent_filtered += 1
+                    continue
+                if exclude_agents_active:
+                    ctx.metrics.exclude_agents_post_count += 1
+                elif agent_filter_active:
+                    ctx.metrics.agent_filter_post_count += 1
+
                 try:
                     if enable_explosion or enable_deep:
                         rows = convert_to_purview_exploded_records(
@@ -1416,6 +1617,8 @@ def run(params: Optional[dict] = None) -> dict:
             _flush_pending()
             if writer is not None:
                 writer.close()
+            else:
+                _write_zero_record_purview_csv(config, output_path)
 
             if dup_skipped:
                 ctx.metrics.total_records_fetched -= dup_skipped
@@ -1424,6 +1627,25 @@ def run(params: Optional[dict] = None) -> dict:
                 write_log(
                     f"Date-range trim: removed {trim_skipped} record(s) "
                     f"outside requested date boundaries"
+                )
+            if agent_filtered:
+                ctx.metrics.filtering_skipped_records += agent_filtered
+                if exclude_agents_active:
+                    ctx.metrics.filtering_exclude_agents += agent_filtered
+                else:
+                    ctx.metrics.filtering_agent_filtered += agent_filtered
+                write_log(f"Agent filter: removed {agent_filtered} record(s)")
+            if exclude_agents_active:
+                ctx.metrics.exclude_agents_applied = True
+                ctx.metrics.exclude_agents_removed = agent_filtered
+                ctx.metrics.exclude_agents_elapsed_sec = (
+                    time.perf_counter() - agent_filter_started
+                )
+            elif agent_filter_active:
+                ctx.metrics.agent_filter_applied = True
+                ctx.metrics.agent_filter_removed_count = agent_filtered
+                ctx.metrics.agent_filter_elapsed_sec = (
+                    time.perf_counter() - agent_filter_started
                 )
 
             ctx.metrics.explosion_ms = (
@@ -1441,6 +1663,13 @@ def run(params: Optional[dict] = None) -> dict:
                     "(ExportWorkbook is deprecated). Use the CSV output instead.",
                     level="WARN",
                 )
+        elif source_plan["purview_in_scope"]:
+            output_path = str(Path(csv_root) / _build_output_filename(config))
+            ctx.output_file = output_path
+            result["output_file"] = output_path
+            _write_zero_record_purview_csv(config, output_path)
+            result["output_rows"] = 0
+            write_log(f"Exported authoritative zero-record CSV to {output_path}")
 
         # --------------------------------------------------------------
         # 6. Post-processing: Agent 365, Entra users + rollup.
@@ -1462,15 +1691,19 @@ def run(params: Optional[dict] = None) -> dict:
                 invoke_graph_audit_query,
             )
 
-            def _agent365_graph_get(method: str, url: str) -> dict:
-                """Local HTTP GET adapter for Agent 365 -> Graph."""
+            def _agent365_graph_get(
+                method: str, url: str, payload: dict | None = None
+            ) -> dict:
+                """Local HTTP adapter for Agent 365 Graph GET and batch POST."""
                 import requests  # lazy
-                if method.upper() != 'GET':
+                if method.upper() not in {'GET', 'POST'}:
                     raise RuntimeError(
-                        f"Agent 365 adapter only supports GET (got {method})"
+                        f"Agent 365 adapter does not support {method}"
                     )
                 headers = get_current_headers(get_graph_access_token())
-                resp = requests.get(url, headers=headers, timeout=60)
+                resp = requests.request(
+                    method.upper(), url, headers=headers, json=payload, timeout=60
+                )
                 if not (200 <= resp.status_code < 300):
                     err = RuntimeError(
                         f"HTTP {resp.status_code} from {url}: "
@@ -1491,7 +1724,7 @@ def run(params: Optional[dict] = None) -> dict:
                 include_agent365_info=getattr(config, "include_agent365_info", False),
                 only_agent365_info=only_agent365,
                 auth_mode=config.auth,
-                output_path=(getattr(config, "output_path_agent365_info", None) or config.output_path),
+                output_path=csv_root,
                 run_timestamp=config.script_run_timestamp,
                 graph_connected=is_connected(),
                 start_date=config.trim_start_date_utc,
@@ -1504,6 +1737,9 @@ def run(params: Optional[dict] = None) -> dict:
                 sleep_fn=time.sleep,
                 now_fn=lambda: datetime.now(timezone.utc),
                 append_agent365_info=getattr(config, "append_agent365_info", None),
+                reuse_store_path=str(
+                    Path(files_io.state_root()) / ".pax_agent365_reuse.json"
+                ),
             )
             ctx.metrics.agent365_had_gaps = bool(
                 agent365_state.had_gaps
@@ -1535,7 +1771,10 @@ def run(params: Optional[dict] = None) -> dict:
                     name_overrides,
                     dashboard_prefix,
                 )
-            _run_rollup_processors(ctx, **rollup_seed_paths)
+            if not _run_rollup_processors(ctx, **rollup_seed_paths):
+                raise RuntimeError(
+                    "Rollup post-processor failed; canonical output was not published."
+                )
 
         # --------------------------------------------------------------
         # 7. Phase B drain: scratch CSVs -> Delta tables (output_mode='delta').
@@ -1579,8 +1818,13 @@ def run(params: Optional[dict] = None) -> dict:
                     f"err={type(ex).__name__}: {ex}"
                 )
                 ctx.metrics.partitions_with_data_loss += 1
+                raise RuntimeError("Delta drain failed; publication is incomplete") from ex
 
             result["delta_tables"] = delta_results
+            _assert_delta_publication_complete(delta_results)
+            result["delta_completion_manifest"] = _write_delta_completion_manifest(
+                csv_root, run_id, delta_results
+            )
             write_log(
                 f"Delta drain complete: {len(delta_results)} table(s) written."
             )
@@ -1769,6 +2013,9 @@ def run(params: Optional[dict] = None) -> dict:
                     watermark_state_path,
                     watermark_covered_end,
                     SCRIPT_VERSION,
+                    contract_fingerprint=watermark_contract_fingerprint,
+                    expected_revision=watermark_opening_revision,
+                    expected_digest=watermark_opening_digest,
                 ):
                     result["watermark_advanced_to"] = watermark_covered_end
                     # v1.11.16 item 7: mirror into metrics for emitter.
@@ -1777,6 +2024,11 @@ def run(params: Optional[dict] = None) -> dict:
                         f"Watermark advanced: last_covered_end = {watermark_covered_end} "
                         f"(state: {watermark_state_path})"
                     )
+                else:
+                    result["success"] = False
+                    result["exit_code"] = EXIT_ERROR
+                    result["error"] = "Watermark state could not be advanced safely"
+                    write_log(result["error"], level="ERROR")
             except Exception as _wm_exc:
                 write_log(
                     f"Watermark advance failed (non-fatal): {_wm_exc}",

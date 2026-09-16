@@ -153,6 +153,33 @@ def _resolve_target_root(schema: str) -> tuple[str, Optional[dict]]:
     return files_io.tables_root(schema), None
 
 
+def _verify_delta_readback(
+    target_path: str,
+    storage_options: Optional[dict],
+    minimum_rows: int,
+) -> dict:
+    """Reopen the committed table independently and verify observable state."""
+    try:
+        from deltalake import DeltaTable
+
+        table = DeltaTable(target_path, storage_options=storage_options)
+        total_rows = int(table.to_pyarrow_dataset().count_rows())
+        if total_rows < minimum_rows:
+            raise RuntimeError(
+                f"readback row count {total_rows} is below written rows {minimum_rows}"
+            )
+        return {
+            "readback_verified": True,
+            "delta_version": int(table.version()),
+            "readback_rows": total_rows,
+        }
+    except Exception as ex:
+        return {
+            "readback_verified": False,
+            "readback_error": f"Delta readback failed: {type(ex).__name__}: {ex}",
+        }
+
+
 def csv_dir_to_delta(
     csv_dir: str,
     schema: str = "dbo",
@@ -305,6 +332,17 @@ def csv_dir_to_delta(
                 f"Delta append SKIPPED for {table} [{category}]: {err}",
                 level="WARN",
             )
+            results.append(
+                {
+                    "csv": os.path.basename(csv_path),
+                    "table": table,
+                    "path": target_path,
+                    "rows_written": 0,
+                    "success": False,
+                    "error_category": category,
+                    "error": err,
+                }
+            )
             continue
 
         rows = int(result.get("rows_written", 0) or 0)
@@ -314,14 +352,23 @@ def csv_dir_to_delta(
         extra = f" +new_cols={added_cols}" if added_cols else ""
         _log(f"Delta append OK {banner}: {table}  rows={rows}  path={target_path}{extra}")
 
+        readback = _verify_delta_readback(target_path, storage_options, rows)
+        if not readback["readback_verified"]:
+            _log(
+                f"Delta append readback FAILED for {table}: "
+                f"{readback['readback_error']}",
+                level="ERROR",
+            )
         results.append(
             {
                 "csv": os.path.basename(csv_path),
                 "table": table,
                 "path": target_path,
                 "rows_written": rows,
+                "success": bool(readback["readback_verified"]),
                 "is_init": is_init,
                 "added_cols": added_cols,
+                **readback,
             }
         )
 
@@ -350,16 +397,44 @@ def csv_dir_to_delta(
             "Delta table initialized [empty]: Agent365  "
             f"rows=0  path={agent365_path}"
         )
+        readback = _verify_delta_readback(agent365_path, storage_options, 0)
         results.append(
             {
                 "csv": None,
                 "table": "Agent365",
                 "path": agent365_path,
                 "rows_written": 0,
+                "success": bool(readback["readback_verified"]),
                 "is_init": True,
                 "added_cols": list(AGENT365_COLUMNS),
                 "ensured_empty": True,
+                **readback,
             }
         )
+    elif not ensure_result.get("success", True):
+        results.append(
+            {
+                "csv": None,
+                "table": "Agent365",
+                "path": agent365_path,
+                "rows_written": 0,
+                "success": False,
+                "error_category": ensure_result.get("error_category", "UNKNOWN"),
+                "error": ensure_result.get("error", "failed to ensure table"),
+            }
+        )
+    else:
+        readback = _verify_delta_readback(agent365_path, storage_options, 0)
+        results.append({
+            "csv": None,
+            "table": "Agent365",
+            "path": agent365_path,
+            "rows_written": 0,
+            "success": bool(readback["readback_verified"]),
+            "is_init": False,
+            "added_cols": [],
+            "ensured_empty": True,
+            **readback,
+        })
 
     return results

@@ -57,6 +57,11 @@ def logs_root() -> str:
     return _ensure(os.path.join(_root(), "logs"))
 
 
+def state_root() -> str:
+    """Return stable Lakehouse Files storage for cross-run processor state."""
+    return _ensure(os.path.join(_root(), "state"))
+
+
 def scratch_root(run_id: str) -> str:
     """Return ``<root>/_scratch/<run_id>`` and create it.
 

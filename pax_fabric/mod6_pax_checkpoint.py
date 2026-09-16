@@ -1671,6 +1671,29 @@ def show_checkpoint_exit_message() -> None:
 _WATERMARK_STATE_FILENAME = ".pax_watermark_state.json"
 
 
+def _watermark_contract_fingerprint(config: Any) -> str:
+    """Hash the query/output semantics that must remain stable across advances."""
+    fields = (
+        "activity_types", "record_types", "service_types", "user_ids",
+        "group_names", "agent_id", "agents_only", "exclude_agents",
+        "prompt_filter", "include_m365_usage", "explode_arrays", "explode_deep",
+        "deidentify", "dashboard", "user_history",
+    )
+    contract = {name: getattr(config, name, None) for name in fields}
+    payload = json.dumps(
+        contract, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest().upper()
+
+
+def _watermark_state_digest(state: dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in state.items() if key != "integrity_digest"}
+    payload = json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest().upper()
+
+
 def _watermark_state_dir(output_path: Optional[str], append_file: Optional[str]) -> Optional[str]:
     """
     Resolve the directory that owns the watermark state file for this run.
@@ -1770,6 +1793,24 @@ def resolve_watermark_window(
     end_str = end_of_window.strftime("%Y-%m-%d")
 
     prior = _read_watermark_state(state_path) if state_path else None
+    if state_path and os.path.isfile(state_path) and prior is None:
+        raise ValueError("Watermark state is unreadable or malformed; refusing to advance")
+
+    contract_fingerprint = _watermark_contract_fingerprint(config)
+    opening_revision = 0
+    opening_digest = ""
+    if prior:
+        declared_digest = str(prior.get("integrity_digest") or "")
+        if not declared_digest or declared_digest != _watermark_state_digest(prior):
+            raise ValueError("Watermark state integrity validation failed")
+        prior_contract = str(prior.get("contract_fingerprint") or "")
+        if prior_contract != contract_fingerprint:
+            raise ValueError(
+                "Watermark query contract changed; start a new watermark target or "
+                "restore the original query settings"
+            )
+        opening_revision = int(prior.get("revision") or 0)
+        opening_digest = declared_digest
     if prior and isinstance(prior.get("last_covered_end"), str):
         # Advance: start = last_covered_end + 1 day.
         try:
@@ -1832,6 +1873,9 @@ def resolve_watermark_window(
         "end_date": end_str,
         "short_circuit": short_circuit,
         "reason": reason,
+        "contract_fingerprint": contract_fingerprint,
+        "opening_revision": opening_revision,
+        "opening_digest": opening_digest,
     }
 
 
@@ -1840,6 +1884,10 @@ def save_watermark_state(
     covered_end: str,
     running_script_version: str,
     extra: Optional[dict[str, Any]] = None,
+    *,
+    contract_fingerprint: str = "",
+    expected_revision: int = 0,
+    expected_digest: str = "",
 ) -> bool:
     """
     Persist the watermark advance after a successful pipeline run.
@@ -1850,17 +1898,42 @@ def save_watermark_state(
     if not state_path:
         return False
     try:
+        current = _read_watermark_state(state_path)
+        if expected_revision == 0:
+            if current is not None:
+                logger.warning("Watermark state appeared after run start; refusing overwrite")
+                return False
+        else:
+            if current is None:
+                logger.warning("Watermark state disappeared after run start")
+                return False
+            if (
+                int(current.get("revision") or 0) != expected_revision
+                or str(current.get("integrity_digest") or "") != expected_digest
+                or _watermark_state_digest(current) != expected_digest
+            ):
+                logger.warning("Watermark state changed after run start; refusing overwrite")
+                return False
         state: dict[str, Any] = {
+            "schema_version": 1,
+            "revision": expected_revision + 1,
             "last_covered_end": str(covered_end),
             "script_version": str(running_script_version),
+            "contract_fingerprint": str(contract_fingerprint),
             "advanced_at_utc": datetime.now(timezone.utc).isoformat(),
         }
         if extra:
             for k, v in extra.items():
                 if k not in state:
                     state[k] = v
+        state["integrity_digest"] = _watermark_state_digest(state)
         _write_watermark_state(state_path, state)
-        return True
+        verified = _read_watermark_state(state_path)
+        return bool(
+            verified
+            and verified == state
+            and verified.get("integrity_digest") == _watermark_state_digest(verified)
+        )
     except OSError:
         logger.warning("Failed to persist watermark state at %s", state_path)
         return False

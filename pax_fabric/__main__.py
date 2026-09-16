@@ -165,6 +165,39 @@ class _NeedsSubdivision:
 _SPILL_BATCH_SIZE = 5000
 
 
+def _record_matches_agent_filter(
+    record: dict[str, Any],
+    agent_ids: list[str] | None,
+    agents_only: bool,
+    exclude_agents: bool,
+) -> bool:
+    """Apply the PowerShell Test-AgentFilter contract to one audit record."""
+    if not agent_ids and not agents_only and not exclude_agents:
+        return True
+
+    audit_data = record.get("AuditData")
+    if isinstance(audit_data, str):
+        try:
+            audit_data = json.loads(audit_data)
+        except (TypeError, json.JSONDecodeError):
+            audit_data = None
+    record_agent_id = ""
+    if isinstance(audit_data, dict):
+        record_agent_id = str(audit_data.get("AgentId") or "").strip()
+
+    if exclude_agents:
+        return not record_agent_id
+    if not record_agent_id:
+        return False
+    if agent_ids:
+        normalized_agent_id = record_agent_id.casefold()
+        return any(
+            normalized_agent_id == str(agent_id).strip().casefold()
+            for agent_id in agent_ids
+        )
+    return agents_only
+
+
 def _spill_records_to_jsonl(
     records: list[dict[str, Any]],
     *,
@@ -823,6 +856,13 @@ def main() -> int:
             seen_ids: set[str] = set()
             dup_skipped = 0
             trim_skipped = 0
+            agent_filtered = 0
+            exclude_agents_active = bool(getattr(config, 'exclude_agents', False))
+            agent_filter_active = bool(
+                getattr(config, 'agent_id', None)
+                or getattr(config, 'agents_only', False)
+            )
+            agent_filter_started = time.perf_counter()
             rows_written = 0
             writer: CsvWriter | None = None
             csv_columns: list[str] = []
@@ -872,6 +912,23 @@ def main() -> int:
                             trim_skipped += 1
                             continue
 
+                if exclude_agents_active:
+                    ctx.metrics.exclude_agents_pre_count += 1
+                elif agent_filter_active:
+                    ctx.metrics.agent_filter_pre_count += 1
+                if not _record_matches_agent_filter(
+                    record,
+                    getattr(config, 'agent_id', None),
+                    bool(getattr(config, 'agents_only', False)),
+                    exclude_agents_active,
+                ):
+                    agent_filtered += 1
+                    continue
+                if exclude_agents_active:
+                    ctx.metrics.exclude_agents_post_count += 1
+                elif agent_filter_active:
+                    ctx.metrics.agent_filter_post_count += 1
+
                 # Structuring (8-column) or explosion (1:N flattening)
                 try:
                     if enable_explosion or enable_deep:
@@ -907,6 +964,25 @@ def main() -> int:
                 write_log(
                     f"Date-range trim: Removed {trim_skipped} record(s) "
                     f"outside requested date boundaries"
+                )
+            if agent_filtered:
+                ctx.metrics.filtering_skipped_records += agent_filtered
+                if exclude_agents_active:
+                    ctx.metrics.filtering_exclude_agents += agent_filtered
+                else:
+                    ctx.metrics.filtering_agent_filtered += agent_filtered
+                write_log(f"Agent filter: removed {agent_filtered} record(s)")
+            if exclude_agents_active:
+                ctx.metrics.exclude_agents_applied = True
+                ctx.metrics.exclude_agents_removed = agent_filtered
+                ctx.metrics.exclude_agents_elapsed_sec = (
+                    time.perf_counter() - agent_filter_started
+                )
+            elif agent_filter_active:
+                ctx.metrics.agent_filter_applied = True
+                ctx.metrics.agent_filter_removed_count = agent_filtered
+                ctx.metrics.agent_filter_elapsed_sec = (
+                    time.perf_counter() - agent_filter_started
                 )
 
             ctx.metrics.explosion_ms = (
@@ -1145,47 +1221,34 @@ def main() -> int:
 # ---------------------------------------------------------------------------
 
 
-# v1.11.16 BYOD — required Purview export columns.
-# A vanilla Purview UI CSV export always carries these; missing any means the
-# supplied file is not a Purview audit dump and downstream transform would
-# silently produce zero-row output. Mirror PS `Test-PaxPurviewInputCsv`.
-_BYOD_REQUIRED_HEADERS = ('CreationDate', 'AuditData')
+# v1.11.16 BYOD required columns from Test-PaxPurviewInputCsv.
+_BYOD_REQUIRED_HEADERS = (
+    'RecordId', 'CreationDate', 'RecordType', 'Operation', 'UserId', 'AuditData'
+)
 
 
-def _load_byod_purview_csv(ctx: 'PAXRunContext', start_ns: int) -> int:
-    """v1.11.16 BYOD load path — read a customer-supplied Purview audit CSV
-    and spill each row as a JSONL record into ``.pax_incremental/`` so Phase 6
-    can drain it through the standard dedup/trim/structure pipeline exactly
-    as it drains live-fetch shards. Returns elapsed ms.
-
-    Parity notes (PS `Invoke-PaxByodSourcePreparation` L10991):
-    - Local FS read only for the notebook run path. Remote source staging
-      (HTTPS/SharePoint) is the pipeline activity's job — the notebook is
-      handed a lakehouse-local path.
-    - The supplied file is READ-ONLY: nothing is rewritten in place. All
-      downstream mutations happen against the spilled JSONL shards.
-    - Structural validation is header-based; row content is passed through
-      as-is so the transform layer surfaces any semantic issues via its
-      existing FilteringSkippedRecords / FilteringMissingAuditData metrics.
-    """
+def _load_csv_to_shards(
+    ctx: 'PAXRunContext',
+    src: str,
+    start_ns: int,
+    *,
+    source_label: str,
+    bypass_date_trim: bool,
+) -> int:
+    """Validate and stream a Purview CSV into the normal JSONL shard path."""
     import csv
 
     config = ctx.config
-    src = str(config.purview_input_file)
     src_path = Path(src)
 
-    write_log(f"BYOD mode: reading Purview audit records from '{src}'")
+    write_log(f"{source_label} mode: reading Purview audit records from '{src}'")
 
     if not src_path.exists():
-        write_log(
-            f"BYOD source not found or unreadable: {src}", level="ERROR"
-        )
-        raise FileNotFoundError(f"PurviewInputFile not found: {src}")
+        raise FileNotFoundError(f"{source_label} source not found: {src}")
     if not src_path.is_file():
-        write_log(
-            f"BYOD source is not a file: {src}", level="ERROR"
-        )
-        raise ValueError(f"PurviewInputFile is not a file: {src}")
+        raise ValueError(f"{source_label} source is not a file: {src}")
+    if src_path.suffix.lower() != '.csv':
+        raise ValueError(f"{source_label} source must be a .csv file: {src}")
 
     # Prepare the same spill layout the live-fetch path uses so Phase 6's
     # shard iterator sees no difference between BYOD and live sources.
@@ -1222,51 +1285,97 @@ def _load_byod_purview_csv(ctx: 'PAXRunContext', start_ns: int) -> int:
                 f"written to {Path(path).name}"
             )
 
-    # Read CSV with UTF-8-SIG so a Purview UI export's BOM is tolerated.
-    # newline='' is required by csv per stdlib docs.
     with open(src_path, 'r', encoding='utf-8-sig', newline='') as fh:
-        reader = csv.DictReader(fh)
-        if reader.fieldnames is None:
-            raise ValueError(
-                f"PurviewInputFile has no header row: {src}"
-            )
-        headers = {h.strip() for h in reader.fieldnames if h}
-        missing = [h for h in _BYOD_REQUIRED_HEADERS if h not in headers]
+        reader = csv.reader(fh, strict=True)
+        try:
+            raw_headers = next(reader)
+        except StopIteration as ex:
+            raise ValueError(f"{source_label} source has no header row: {src}") from ex
+        headers = [header.strip() for header in raw_headers]
+        if not headers or any(not header for header in headers):
+            raise ValueError(f"{source_label} source contains a blank column name")
+        lowered = [header.casefold() for header in headers]
+        if len(set(lowered)) != len(lowered):
+            raise ValueError(f"{source_label} source contains duplicate column names")
+        header_map = {header.casefold(): index for index, header in enumerate(headers)}
+        missing = [
+            required for required in _BYOD_REQUIRED_HEADERS
+            if required.casefold() not in header_map
+        ]
         if missing:
-            write_log(
-                f"BYOD source missing required column(s): {', '.join(missing)}. "
-                f"Purview audit exports must include: "
-                f"{', '.join(_BYOD_REQUIRED_HEADERS)}.",
-                level="ERROR",
-            )
             raise ValueError(
-                f"PurviewInputFile missing columns: {', '.join(missing)}"
+                f"{source_label} source missing required column(s): {', '.join(missing)}"
             )
 
-        for row in reader:
-            # csv.DictReader yields OrderedDict of strings; JSONL-safe as-is.
-            # The transform layer parses AuditData JSON lazily from the string
-            # value so no pre-parse is required here.
-            batch.append(dict(row))
+        audit_index = header_map['auditdata']
+        for row_number, values in enumerate(reader, 1):
+            if len(values) != len(headers):
+                raise ValueError(
+                    f"Row {row_number} of the {source_label} source has "
+                    f"{len(values)} values where the header declares {len(headers)}"
+                )
+            audit_text = values[audit_index].strip()
+            if not audit_text:
+                raise ValueError(
+                    f"Row {row_number} of the {source_label} source has no AuditData value"
+                )
+            try:
+                audit_object = json.loads(audit_text)
+            except (TypeError, json.JSONDecodeError) as ex:
+                raise ValueError(
+                    f"Row {row_number} of the {source_label} source has AuditData "
+                    "that is not valid JSON"
+                ) from ex
+            if not isinstance(audit_object, dict):
+                raise ValueError(
+                    f"Row {row_number} of the {source_label} source has AuditData "
+                    "that is not a single JSON object"
+                )
+            batch.append(dict(zip(headers, values)))
             records_total += 1
             if len(batch) >= _SPILL_BATCH_SIZE:
                 _flush(batch)
                 batch = []
         _flush(batch)
-        batch = []
+
+    if records_total == 0:
+        raise ValueError(f"{source_label} source contains a header but no data rows")
 
     # Hand the shard manifest to Phase 6 exactly as the live path does.
     ctx.spilled_shards = spilled_shards  # type: ignore[attr-defined]
     ctx.incremental_dir = str(incremental_dir)  # type: ignore[attr-defined]
+    ctx.bypass_date_trim = bypass_date_trim  # type: ignore[attr-defined]
     ctx.all_logs = []
     ctx.metrics.total_records_fetched = records_total
     write_log(
-        f"  [BYOD] Loaded {records_total} record(s) across "
+        f"  [{source_label}] Loaded {records_total} record(s) across "
         f"{len(spilled_shards)} JSONL shard(s) in {incremental_dir}"
     )
 
     elapsed = (time.perf_counter_ns() - start_ns) // 1_000_000
     return elapsed
+
+
+def _load_byod_purview_csv(ctx: 'PAXRunContext', start_ns: int) -> int:
+    """Load a strictly validated, read-only Purview BYOD source."""
+    return _load_csv_to_shards(
+        ctx,
+        str(ctx.config.purview_input_file),
+        start_ns,
+        source_label="BYOD",
+        bypass_date_trim=True,
+    )
+
+
+def _load_replay_csv(ctx: 'PAXRunContext', start_ns: int) -> int:
+    """Load an offline RAWInputCSV source into the notebook transform path."""
+    return _load_csv_to_shards(
+        ctx,
+        str(ctx.config.raw_input_csv),
+        start_ns,
+        source_label="Replay",
+        bypass_date_trim=False,
+    )
 
 
 def _run_query_phase(ctx: PAXRunContext) -> int:
@@ -1276,14 +1385,9 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     config = ctx.config
     start = time.perf_counter_ns()
 
-    # RAW CSV replay mode — skip for now; replay requires reading CSV as log records
     if config.raw_input_csv:
         write_log(f"Replay mode from: {config.raw_input_csv}")
-        # TODO: Implement CSV-to-records reader + invoke_replay_inline_export
-        # with correct signature (logs, output_file, header, convert_fn, ...)
-        write_log("Replay inline export not yet wired — skipping.", level="WARN")
-        elapsed = (time.perf_counter_ns() - start) // 1_000_000
-        return elapsed
+        return _load_replay_csv(ctx, start)
 
     # v1.11.16 BYOD (Bring-Your-Own-Data) mode — parity with PS
     # `Invoke-PaxByodSourcePreparation` (L10991) + `Get-PaxByodBootstrap` (L10266).
@@ -3057,7 +3161,8 @@ def _run_rollup_processors(
     seed_thread_map_path: str | None = None,
     seed_userkey_map_path: str | None = None,
     state_db_path: str | None = None,
-) -> None:
+    user_history_csv: str | None = None,
+) -> bool:
     """Invoke rollup post-processors (replaces Invoke-EmbeddedProcessor).
 
     Instead of writing embedded Python to a temp file and calling subprocess,
@@ -3095,9 +3200,9 @@ def _run_rollup_processors(
             # -Deidentify sets the processor's module-level flag before the run.
             dashboard = str(getattr(config, 'dashboard', 'AIO') or 'AIO').upper()
             copilot_profile = 'aibv' if dashboard == 'VALUELENS' else 'aio'
-            if getattr(config, 'deidentify', False):
-                import pax_fabric.processors.copilot_processor as _copilot_mod
-                _copilot_mod._DEIDENTIFY = True
+            import pax_fabric.processors.copilot_processor as _copilot_mod
+            _copilot_mod._DEIDENTIFY = bool(getattr(config, 'deidentify', False))
+            _copilot_mod._deid_cache.clear()
 
             # v1.11.15 parity: -FillerLabel controls what appears in org-hierarchy
             # level slots deeper than a user's own level in the rolled-up Users
@@ -3138,15 +3243,6 @@ def _run_rollup_processors(
                 _rollup_aggregates_note = (
                     ' + pre-aggregated tables' if agg_paths else ' (aggregates off)'
                 )
-            # v1.11.16 item 10: surface UserHistory + HistoryEffectiveDate on
-            # the rollup banner so notebook operators have evidence the flags
-            # were received. The vendored copilot_processor (v4.2.1) does
-            # NOT currently accept --user-history / --history-effective-date
-            # (those args land in PS-parity v4.3+); when UserHistory=On we
-            # emit a WARN so the operator knows HED isn't yet honored at the
-            # rollup stage. HED is still stamped on the pipeline result +
-            # metrics (item 6) and persisted on the checkpoint (item 9), so
-            # a future processor upgrade is a drop-in.
             _rollup_user_history = str(
                 getattr(config, 'user_history', None) or 'Off'
             )
@@ -3166,17 +3262,6 @@ def _run_rollup_processors(
                 f"{_rollup_aggregates_note}{_rollup_history_note}; "
                 f"inputs: Purview CSV + Entra users CSV)"
             )
-            if _rollup_user_history.lower() == 'on':
-                write_log(
-                    f"UserHistory=On requested but vendored copilot_processor "
-                    f"v4.2.1 does not accept --user-history / "
-                    f"--history-effective-date. HED='{_rollup_hed}' is "
-                    f"stamped on the run result and checkpoint but is NOT "
-                    f"threaded into the rollup fact/dim outputs yet — future "
-                    f"processor upgrade required for full PS L66661 parity.",
-                    level="WARNING",
-                )
-
             try:
                 copilot_run(
                     purview_csv=ctx.output_file,
@@ -3191,6 +3276,9 @@ def _run_rollup_processors(
                     seed_userkey_map_path=seed_userkey_map_path,
                     state_db_path=state_db_path,
                     state_log_fn=write_log,
+                    user_history=_rollup_user_history.lower() == 'on',
+                    history_effective_date=_rollup_hed,
+                    user_history_csv=user_history_csv,
                 )
             finally:
                 if state_db_path:
@@ -3265,6 +3353,7 @@ def _run_rollup_processors(
 
     # Retention: -Rollup deletes raw CSV(s) on success; -RollupPlusRaw always
     # keeps them; any failure ALWAYS preserves them (regardless of switch).
+    retention_success = True
     if rollup_success and getattr(config, 'rollup', False) and not getattr(config, 'rollup_plus_raw', False):
         for raw_path in raw_csv_list:
             try:
@@ -3273,7 +3362,8 @@ def _run_rollup_processors(
                     p.unlink()
                     write_log(f"Rollup: deleted raw CSV (per -Rollup): {raw_path}")
             except OSError as e:
-                write_log(f"Rollup: failed to delete raw CSV '{raw_path}': {e}", level="WARN")
+                retention_success = False
+                write_log(f"Rollup: failed to delete raw CSV '{raw_path}': {e}", level="ERROR")
 
         for extra_path in always_delete_list:
             try:
@@ -3282,9 +3372,12 @@ def _run_rollup_processors(
                     p.unlink()
                     write_log(f"Rollup: deleted internal input CSV (per -Rollup): {extra_path}")
             except OSError as e:
-                write_log(f"Rollup: failed to delete '{extra_path}': {e}", level="WARN")
+                retention_success = False
+                write_log(f"Rollup: failed to delete '{extra_path}': {e}", level="ERROR")
     elif rollup_success and getattr(config, 'rollup_plus_raw', False):
         write_log("Rollup: raw CSV(s) retained (per -RollupPlusRaw).")
+
+    return rollup_success and retention_success
 
 
 def _run_append_merge(ctx: PAXRunContext) -> None:
@@ -3599,6 +3692,28 @@ def _scope_entra_users(
     return scoped_data
 
 
+def _resolve_stream_staging_dir(
+    ctx: PAXRunContext, configured_output: str | None
+) -> Path:
+    notebook_root = getattr(ctx, '_csv_output_root', None)
+    if notebook_root:
+        output_dir = Path(notebook_root)
+    else:
+        remote_scratch = getattr(ctx.config, 'remote_scratch_dir', None)
+        effective_output = remote_scratch or configured_output
+        if effective_output:
+            candidate = Path(effective_output)
+            output_dir = (
+                candidate
+                if candidate.is_dir() or str(effective_output).endswith(('/', '\\'))
+                else candidate.parent
+            )
+        else:
+            output_dir = Path.cwd()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
 def _export_entra_users_only(ctx: PAXRunContext) -> None:
     """Export Entra user/license data as the sole output (-OnlyUserInfo mode).
 
@@ -3617,15 +3732,7 @@ def _export_entra_users_only(ctx: PAXRunContext) -> None:
     # OnlyUserInfo uses OutputPathUserInfo as the destination (PS Resolve-DataTypePaths
     # resolves 'UserInfo' key first, then falls back to Purview/OutputPath).
     effective_output = config.output_path_user_info or config.output_path
-    if effective_output:
-        candidate = Path(effective_output)
-        if candidate.is_dir() or effective_output.endswith(('/', '\\')):
-            output_dir = candidate
-        else:
-            output_dir = candidate.parent
-        output_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        output_dir = Path.cwd()
+    output_dir = _resolve_stream_staging_dir(ctx, effective_output)
 
     entra_csv = str(output_dir / filename)
 
