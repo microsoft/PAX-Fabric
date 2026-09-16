@@ -1633,9 +1633,9 @@ def load_entra_and_write_users(
     lowercase duplicate), while ``mail`` -> ``Email`` is an ADDITIVE alias
     (``mail`` is retained unchanged; ``Email`` is a separate column populated
     from it). Both mirror the PowerShell embedded processor exactly.
-    Deidentification of Entra identity columns is likewise deferred here;
-    only the fact-row values produced by explode_record are deidentified in
-    this port.
+    When deidentification is enabled, Entra identity columns are transformed
+    before normalized join keys and hierarchy links are derived, matching the
+    embedded PowerShell processor.
     """
     with open(entra_csv, "r", encoding="utf-8-sig", newline="") as fin:
         # Sniff via a generous quote-aware reader; encoding="utf-8-sig" eats BOM if present.
@@ -1727,6 +1727,8 @@ def load_entra_and_write_users(
     for src_row in rows:
         pid = src_row.get(upn_col, "") if (upn_col and upn_col != "PersonId") else src_row.get("PersonId", "")
         pid = "" if pid is None else str(pid)
+        if _DEIDENTIFY:
+            pid = deid_upn(pid)
         pid_norm = pid.strip().lower()
         if not pid_norm:
             continue
@@ -1741,16 +1743,24 @@ def load_entra_and_write_users(
         uk_by_upn[pid_norm] = uk
         rid = src_row.get("id", "")
         rid = "" if rid is None else str(rid)
+        if _DEIDENTIFY:
+            rid = deid_guid(rid)
         rid_norm = rid.strip().lower()
         if rid_norm:
             uk_by_id[rid_norm] = uk
         mid = src_row.get("manager_id", "")
         mid = "" if mid is None else str(mid)
+        if _DEIDENTIFY:
+            mid = deid_guid(mid)
         mupn = src_row.get("manager_userPrincipalName", "")
         mupn = "" if mupn is None else str(mupn)
+        if _DEIDENTIFY:
+            mupn = deid_upn(mupn)
         mgr_ptr[uk] = (mid.strip().lower(), mupn.strip().lower())
         dn = src_row.get("displayName", "")
         dn = "" if dn is None else str(dn)
+        if _DEIDENTIFY:
+            dn = deid_name(dn)
         name_by_uk[uk] = dn
     hier_by_uk = _build_org_hierarchy(uk_by_id, uk_by_upn, mgr_ptr, name_by_uk)
 
@@ -1783,6 +1793,46 @@ def load_entra_and_write_users(
                     if not out_row.get(_canon, ""):
                         _fb = src_row.get(_srcname, "")
                         out_row[_canon] = "" if _fb is None else str(_fb)
+
+            # Transform Entra identities before deriving PersonId_Normalized
+            # so the Users lookup uses the same tokens as deidentified facts.
+            if _DEIDENTIFY:
+                if "PersonId" in out_row:
+                    out_row["PersonId"] = deid_upn(out_row["PersonId"])
+                if "displayName" in out_row:
+                    out_row["displayName"] = deid_name(out_row["displayName"])
+                if "DisplayName" in out_row:
+                    out_row["DisplayName"] = deid_name(out_row["DisplayName"])
+                if "Email" in out_row:
+                    out_row["Email"] = deid_upn(out_row["Email"])
+                if "mail" in out_row:
+                    out_row["mail"] = deid_upn(out_row["mail"])
+                if "givenName" in out_row:
+                    out_row["givenName"] = deid_name(out_row["givenName"])
+                if "surname" in out_row:
+                    out_row["surname"] = deid_name(out_row["surname"])
+                if "UserName" in out_row:
+                    out_row["UserName"] = deid_upn(out_row["UserName"])
+                if "employeeId" in out_row:
+                    out_row["employeeId"] = deid_token(out_row["employeeId"])
+                if "onPremisesImmutableId" in out_row:
+                    out_row["onPremisesImmutableId"] = deid_token(out_row["onPremisesImmutableId"])
+                if "proxyAddresses_Primary" in out_row:
+                    out_row["proxyAddresses_Primary"] = deid_proxy(out_row["proxyAddresses_Primary"])
+                if "proxyAddresses_All" in out_row:
+                    out_row["proxyAddresses_All"] = deid_proxy(out_row["proxyAddresses_All"])
+                if "id" in out_row:
+                    out_row["id"] = deid_guid(out_row["id"])
+                if "manager_id" in out_row:
+                    out_row["manager_id"] = deid_guid(out_row["manager_id"])
+                if "manager_userPrincipalName" in out_row:
+                    out_row["manager_userPrincipalName"] = deid_upn(out_row["manager_userPrincipalName"])
+                if "manager_displayName" in out_row:
+                    out_row["manager_displayName"] = deid_name(out_row["manager_displayName"])
+                if "manager_mail" in out_row:
+                    out_row["manager_mail"] = deid_upn(out_row["manager_mail"])
+                if "ManagerID" in out_row:
+                    out_row["ManagerID"] = deid_guid(out_row["ManagerID"])
 
             # PersonId_Normalized
             person_id = out_row.get("PersonId", "")

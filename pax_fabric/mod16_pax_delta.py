@@ -564,6 +564,7 @@ def _merge_keyed_union(
         return _write_arrow_table(target_uri, table, storage_options)
 
     target_columns = [field.name for field in delta_table.schema().fields]
+    target_has_date_added = "Date_Added" in target_columns
     table = _align_source_to_target(table, target_columns)
     update_columns = [
         column
@@ -574,16 +575,25 @@ def _merge_keyed_union(
         column: _delta_value("source", column)
         for column in update_columns
     }
+    date_added_update = (
+        f"CASE WHEN coalesce({_delta_value('target', 'Date_Added')}, '') = '' "
+        f"THEN {_delta_value('source', 'Date_Added')} "
+        f"ELSE {_delta_value('target', 'Date_Added')} END"
+        if target_has_date_added
+        else _delta_value("source", "Date_Added")
+    )
     updates.update({
-        "Date_Added": (
-            f"CASE WHEN coalesce({_delta_value('target', 'Date_Added')}, '') = '' "
-            f"THEN {_delta_value('source', 'Date_Added')} "
-            f"ELSE {_delta_value('target', 'Date_Added')} END"
-        ),
+        "Date_Added": date_added_update,
         "Latest_Append_Date": _delta_value("source", "Latest_Append_Date"),
         "In_Latest_Append": "'TRUE'",
     })
     departed_updates = {
+        "Date_Added": (
+            f"CASE WHEN coalesce({_delta_value('target', 'Date_Added')}, '') = '' "
+            f"THEN '{run_date}' ELSE {_delta_value('target', 'Date_Added')} END"
+            if target_has_date_added
+            else f"'{run_date}'"
+        ),
         "Latest_Append_Date": f"'{run_date}'",
         "In_Latest_Append": "'FALSE'",
     }
