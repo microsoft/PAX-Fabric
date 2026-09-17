@@ -2261,6 +2261,18 @@ def run(params: Optional[dict] = None) -> dict:
                     shared_input_prefix = (
                         "M365" if "M365" in config.requested_dashboards else ""
                     )
+                    excluded_shared_csvs: set[str] = set()
+                    if not getattr(config, "rollup_plus_raw", False):
+                        if ctx.output_file:
+                            excluded_shared_csvs.add(str(ctx.output_file))
+                        publish_m365_entra = bool(
+                            "M365" in config.requested_dashboards
+                            and getattr(config, "include_user_info", False)
+                            and getattr(config, "_include_user_info_explicit", False)
+                        )
+                        entra_csv = getattr(ctx, "_entra_csv_path", "") or ""
+                        if entra_csv and not publish_m365_entra:
+                            excluded_shared_csvs.add(str(entra_csv))
                     delta_results = delta_writer.csv_dir_to_delta(
                         csv_dir=csv_root,
                         schema=target_schema,
@@ -2270,6 +2282,7 @@ def run(params: Optional[dict] = None) -> dict:
                         log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
                         dashboard_prefix=shared_input_prefix,
                         run_deidentified=bool(getattr(config, "deidentify", False)),
+                        excluded_csv_paths=excluded_shared_csvs,
                     )
                     for drain in multi_dashboard_drains:
                         per_dashboard_strategy = {}

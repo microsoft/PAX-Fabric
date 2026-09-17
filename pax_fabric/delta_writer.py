@@ -193,6 +193,7 @@ def csv_dir_to_delta(
     dashboard_prefix: str = "",
     strategy_overrides: Optional[dict[str, str]] = None,
     run_deidentified: Optional[bool] = None,
+    excluded_csv_paths: Optional[set[str]] = None,
 ) -> list[dict]:
     """Drain every ``*.csv`` in ``csv_dir`` into a Delta table (append mode).
 
@@ -230,6 +231,8 @@ def csv_dir_to_delta(
             drains automatically pick up rotated tokens.
         run_deidentified: Identity state of this run. When provided, cumulative
             Delta writes reject an existing table with the opposite state.
+        excluded_csv_paths: Exact CSV paths to leave in scratch without
+            publishing during this drain.
 
     Returns:
         List of dicts, one per written CSV, plus an initialization entry when
@@ -269,7 +272,15 @@ def csv_dir_to_delta(
     ):
         token_refresh_fn = files_io.onelake_storage_options
 
-    csv_files = sorted(glob(os.path.join(csv_dir, "*.csv")))
+    excluded_paths = {
+        os.path.normcase(os.path.abspath(path))
+        for path in (excluded_csv_paths or set())
+    }
+    csv_files = [
+        path
+        for path in sorted(glob(os.path.join(csv_dir, "*.csv")))
+        if os.path.normcase(os.path.abspath(path)) not in excluded_paths
+    ]
     if not csv_files:
         _log(
             f"No CSV files in {csv_dir} — ensuring mandatory tables only.",

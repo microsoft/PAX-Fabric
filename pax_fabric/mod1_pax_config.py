@@ -2086,6 +2086,8 @@ def config_from_params(params: dict) -> "PAXConfig":
         v = pick(src, dst)
         if v is not None:
             setattr(cfg, dst, bool(v))
+            if dst == "include_user_info":
+                cfg._include_user_info_explicit = bool(v)
 
     numeric_fields = (
         ("blockhours", "block_hours", float),
