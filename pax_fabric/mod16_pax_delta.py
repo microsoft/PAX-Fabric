@@ -1381,6 +1381,7 @@ def write_delta_append(
     base_delay: float = _DEFAULT_DELTA_BASE_DELAY_SEC,
     log_fn=None,
     token_refresh_fn=None,
+    run_deidentified: bool | None = None,
 ) -> dict:
     """Append CSV to Delta table, creating if needed. Rejects destructive schema drift.
 
@@ -1438,6 +1439,33 @@ def write_delta_append(
         }
 
     strategy = strategy_override or _get_write_strategy(table_name)
+
+    if run_deidentified is not None and strategy != "overwrite":
+        from .mod18_pax_deidentify import assert_delta_deidentify_consistency
+
+        try:
+            assert_delta_deidentify_consistency(
+                target_uri,
+                run_deidentified=run_deidentified,
+                storage_options=storage_options,
+                label=f"Delta table {table_name!r}",
+            )
+        except ValueError as exc:
+            if log_fn:
+                log_fn(
+                    f"Delta write '{table_name}' FAILED "
+                    f"[DEIDENTIFY_MISMATCH]: {exc}",
+                    "ERROR",
+                )
+            return {
+                "success": False,
+                "is_init": False,
+                "added_cols": [],
+                "missing": [],
+                "error": f"[DEIDENTIFY_MISMATCH] {exc}",
+                "error_category": "DEIDENTIFY_MISMATCH",
+                "rows_written": 0,
+            }
 
     # Step 1: Probe schema. PS L8207.
     probe = test_delta_table_schema_compat(

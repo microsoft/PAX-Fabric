@@ -148,6 +148,82 @@ def classify_csv_deidentification(path: str | Path) -> str:
         return "unknown"
 
 
+def classify_delta_deidentification(
+    target_uri: str,
+    *,
+    storage_options: dict | None = None,
+) -> str:
+    """Classify an existing Delta target as deid, raw, or unknown."""
+    try:
+        from deltalake import DeltaTable
+
+        table = DeltaTable(target_uri, storage_options=storage_options)
+        columns_by_casefold = {
+            field.name.casefold(): field.name for field in table.schema().fields
+        }
+        identity_column = next(
+            (
+                columns_by_casefold[column.casefold()]
+                for column in IDENTITY_COLUMNS
+                if column.casefold() in columns_by_casefold
+            ),
+            None,
+        )
+        if identity_column is None:
+            return "unknown"
+
+        saw_value = False
+        rows_seen = 0
+        scanner = table.to_pyarrow_dataset().scanner(
+            columns=[identity_column],
+            batch_size=200,
+        )
+        for batch in scanner.to_batches():
+            for value in batch.column(0).to_pylist():
+                rows_seen += 1
+                text = str(value or "")
+                if text:
+                    saw_value = True
+                    if text.rstrip().lower().endswith(DEIDENTIFIED_DOMAIN_SUFFIX):
+                        return "deid"
+                if rows_seen >= 200:
+                    return "raw" if saw_value else "unknown"
+        return "raw" if saw_value else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def assert_delta_deidentify_consistency(
+    target_uri: str,
+    *,
+    run_deidentified: bool,
+    storage_options: dict | None = None,
+    label: str = "Delta",
+) -> None:
+    """Reject an accumulating Delta write that would mix identity states."""
+    state = classify_delta_deidentification(
+        target_uri,
+        storage_options=storage_options,
+    )
+    if state == "unknown":
+        return
+    target_deidentified = state == "deid"
+    if target_deidentified == run_deidentified:
+        return
+    description = (
+        "is already DEIDENTIFIED but this run is NOT deidentified"
+        if target_deidentified
+        else "is NOT deidentified but this run IS deidentified"
+    )
+    raise ValueError(
+        f"Deidentify/append mismatch: the {label} target {description}. "
+        "Mixing deidentified and raw identities in one table corrupts "
+        "user joins and distinct counts. Use a separate target for "
+        "deidentified output, or use a matching deidentify state. "
+        f"Target: {target_uri}"
+    )
+
+
 def assert_append_deidentify_consistency(
     targets: Iterable[tuple[str, str]],
     *,

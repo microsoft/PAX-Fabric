@@ -192,6 +192,7 @@ def csv_dir_to_delta(
     token_refresh_fn=None,
     dashboard_prefix: str = "",
     strategy_overrides: Optional[dict[str, str]] = None,
+    run_deidentified: Optional[bool] = None,
 ) -> list[dict]:
     """Drain every ``*.csv`` in ``csv_dir`` into a Delta table (append mode).
 
@@ -227,6 +228,8 @@ def csv_dir_to_delta(
             token error. When omitted on ABFSS targets, defaults to
             :func:`files_io.onelake_storage_options` so long-running
             drains automatically pick up rotated tokens.
+        run_deidentified: Identity state of this run. When provided, cumulative
+            Delta writes reject an existing table with the opposite state.
 
     Returns:
         List of dicts, one per written CSV, plus an initialization entry when
@@ -324,6 +327,7 @@ def csv_dir_to_delta(
             max_attempts=max_attempts,
             log_fn=log_fn,
             token_refresh_fn=token_refresh_fn,
+            run_deidentified=run_deidentified,
         )
 
         if not result.get("success"):

@@ -604,7 +604,10 @@ def _run_multi_dashboard_rollups(
         config.dashboard = original_dashboard
         config.include_m365_usage = original_include_m365
 
-    _finalize_multi_dashboard_inputs(ctx)
+    # Delta mode still needs the shared raw Purview and Entra CSVs for the
+    # root drain. Cleanup is deferred until every Delta publication succeeds.
+    if output_mode != "delta":
+        _finalize_multi_dashboard_inputs(ctx)
     return drains
 
 
@@ -2266,6 +2269,7 @@ def run(params: Optional[dict] = None) -> dict:
                         name_overrides=name_overrides,
                         log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
                         dashboard_prefix=shared_input_prefix,
+                        run_deidentified=bool(getattr(config, "deidentify", False)),
                     )
                     for drain in multi_dashboard_drains:
                         per_dashboard_strategy = {}
@@ -2283,6 +2287,7 @@ def run(params: Optional[dict] = None) -> dict:
                             log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
                             dashboard_prefix=drain["prefix"],
                             strategy_overrides=per_dashboard_strategy,
+                            run_deidentified=bool(getattr(config, "deidentify", False)),
                         )
                         delta_results.extend(
                             entry for entry in dashboard_results
@@ -2298,6 +2303,7 @@ def run(params: Optional[dict] = None) -> dict:
                         log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
                         dashboard_prefix=drain_prefix,
                         strategy_overrides=strategy_overrides,
+                        run_deidentified=bool(getattr(config, "deidentify", False)),
                     )
             except Exception as ex:
                 write_log(
@@ -2378,6 +2384,9 @@ def run(params: Optional[dict] = None) -> dict:
                         f"ValueLens recompute complete: {len(recomputed)} "
                         "table(s) refreshed."
                     )
+
+            if multi_dashboard_drains:
+                _finalize_multi_dashboard_inputs(ctx)
 
         # --- Cleanup OOM-spill JSONL shards on successful completion ---
         _spilled = getattr(ctx, "spilled_shards", [])
