@@ -79,6 +79,8 @@ _BASE_ALIASES: dict[str, str] = {
     "CombinedActivityTypes_UserStats_Rollup": "UserStats",
     "CombinedActivityTypes_SessionCohort_Rollup": "SessionCohort",
     "CombinedActivityTypes_SessionStats_Rollup": "SessionStats",
+    # AIO/ValueLens rollup off a multi-dash M365 wide raw → same fact as single-dash.
+    "CombinedActivityTypes_Interactions_Rollup": "CopilotInteractions",
     "Entra_Users": "Users",
 }
 
