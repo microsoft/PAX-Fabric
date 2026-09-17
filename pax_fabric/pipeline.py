@@ -382,10 +382,10 @@ def _resolve_byod_raw_table(config: PAXConfig) -> str:
     requested = str(getattr(config, "purview_input_table", "") or "").strip()
     dashboard = str(getattr(config, "dashboard", "") or "").strip().upper()
     if requested.lower() == "auto":
-        if dashboard in ("AIO", "VALUELENS"):
-            return "CopilotInteractions_Raw"
         if dashboard == "M365" or getattr(config, "include_m365_usage", False):
             return "M365_Raw"
+        if dashboard in ("AIO", "VALUELENS"):
+            return "CopilotInteractions_Raw"
         return "Audit_Raw"
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", requested):
         raise ValueError(
@@ -520,6 +520,92 @@ def _resolve_dashboard_prefix(config: PAXConfig) -> str:
         return "M365"
     dash = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
     return _DASHBOARD_PREFIX_MAP.get(dash, "AIO")
+
+
+def _dashboard_prefix_for_name(dashboard: str) -> str:
+    """Resolve the Delta prefix for one canonical dashboard name."""
+    return _DASHBOARD_PREFIX_MAP[dashboard.upper()]
+
+
+def _finalize_multi_dashboard_inputs(ctx: PAXRunContext) -> None:
+    """Apply shared-input retention only after every dashboard pass succeeds."""
+    config = ctx.config
+    paths = [ctx.output_file, getattr(ctx, "_entra_csv_path", "") or ""]
+    paths = list(dict.fromkeys(path for path in paths if path))
+    if getattr(config, "rollup", False) and not getattr(
+        config, "rollup_plus_raw", False
+    ):
+        for path in paths:
+            candidate = Path(path)
+            if candidate.exists():
+                candidate.unlink()
+                write_log(
+                    f"Multi-dashboard: deleted shared input (per Rollup): {path}"
+                )
+    elif getattr(config, "rollup_plus_raw", False) and getattr(
+        config, "deidentify", False
+    ):
+        from .mod18_pax_deidentify import PaxDeidentifier
+
+        deidentifier = PaxDeidentifier()
+        for path in paths:
+            deidentifier.deidentify_csv(path)
+            write_log(f"Multi-dashboard: deidentified retained shared input: {path}")
+
+
+def _run_multi_dashboard_rollups(
+    ctx: PAXRunContext,
+    *,
+    output_mode: str,
+    target_schema: str,
+    name_overrides: dict[str, str],
+) -> list[dict[str, str]]:
+    """Run one isolated processor pass per dashboard over shared inputs."""
+    config = ctx.config
+    root = Path(ctx.output_file).parent
+    original_dashboard = config.dashboard
+    original_include_m365 = config.include_m365_usage
+    drains: list[dict[str, str]] = []
+    try:
+        for dashboard in config.requested_dashboards:
+            if dashboard == "AISID":
+                raise RuntimeError(
+                    "Dashboard=AISID is gated and cannot enter multi-dashboard processing."
+                )
+            config.dashboard = dashboard
+            config.include_m365_usage = dashboard == "M365"
+            output_dir = root / dashboard
+            output_dir.mkdir(parents=True, exist_ok=True)
+            prefix = _dashboard_prefix_for_name(dashboard)
+            seed_paths: dict[str, str | None] = {}
+            if output_mode == "delta" and dashboard != "M365":
+                seed_paths = _prepare_copilot_delta_seeds(
+                    ctx,
+                    target_schema,
+                    name_overrides,
+                    prefix,
+                )
+            write_log(
+                f"Multi-dashboard: starting {dashboard} pass "
+                f"(prefix={prefix}, output={output_dir})"
+            )
+            if not _run_rollup_processors(
+                ctx,
+                output_dir=str(output_dir),
+                retain_inputs=True,
+                **seed_paths,
+            ):
+                raise RuntimeError(f"{dashboard} rollup processor failed")
+            drains.append(
+                {"dashboard": dashboard, "directory": str(output_dir), "prefix": prefix}
+            )
+            write_log(f"Multi-dashboard: completed {dashboard} pass")
+    finally:
+        config.dashboard = original_dashboard
+        config.include_m365_usage = original_include_m365
+
+    _finalize_multi_dashboard_inputs(ctx)
+    return drains
 
 
 def _classify_state_path(path: str) -> str:
@@ -1089,6 +1175,10 @@ def _emit_metrics_json(
                 params_dict[_lk] = ",".join(str(x) for x in _v)
             elif _v is None:
                 params_dict[_lk] = ""
+        params_dict["dashboard"] = ",".join(
+            getattr(config, "requested_dashboards", None)
+            or [getattr(config, "dashboard", "AIO")]
+        )
         # 4. PS emits "" for optional string knobs when unset.
         for _sk in ("agent_id", "user_ids", "prompt_filter", "filler_label_text"):
             if params_dict.get(_sk) is None:
@@ -2082,27 +2172,37 @@ def run(params: Optional[dict] = None) -> dict:
 
         _assert_deidentify_append_consistency(ctx)
 
+        multi_dashboard_drains: list[dict[str, str]] = []
         if getattr(config, "rollup", False) or getattr(config, "rollup_plus_raw", False):
-            rollup_seed_paths: dict[str, str | None] = {}
-            copilot_only = (
-                "CopilotInteraction" in (getattr(config, "activity_types", None) or [])
-                and not getattr(config, "include_m365_usage", False)
-            )
-            dashboard_prefix = (
-                str(prefix_override) if prefix_override is not None
-                else _resolve_dashboard_prefix(config)
-            )
-            if output_mode == "delta" and copilot_only:
-                rollup_seed_paths = _prepare_copilot_delta_seeds(
+            if getattr(config, "_multi_dashboard_enabled", False):
+                multi_dashboard_drains = _run_multi_dashboard_rollups(
                     ctx,
-                    target_schema,
-                    name_overrides,
-                    dashboard_prefix,
+                    output_mode=output_mode,
+                    target_schema=target_schema,
+                    name_overrides=name_overrides,
                 )
-            if not _run_rollup_processors(ctx, **rollup_seed_paths):
-                raise RuntimeError(
-                    "Rollup post-processor failed; canonical output was not published."
+                result["dashboards"] = list(config.requested_dashboards)
+            else:
+                rollup_seed_paths: dict[str, str | None] = {}
+                copilot_only = (
+                    "CopilotInteraction" in (getattr(config, "activity_types", None) or [])
+                    and not getattr(config, "include_m365_usage", False)
                 )
+                dashboard_prefix = (
+                    str(prefix_override) if prefix_override is not None
+                    else _resolve_dashboard_prefix(config)
+                )
+                if output_mode == "delta" and copilot_only:
+                    rollup_seed_paths = _prepare_copilot_delta_seeds(
+                        ctx,
+                        target_schema,
+                        name_overrides,
+                        dashboard_prefix,
+                    )
+                if not _run_rollup_processors(ctx, **rollup_seed_paths):
+                    raise RuntimeError(
+                        "Rollup post-processor failed; canonical output was not published."
+                    )
         else:
             _deidentify_non_rollup_outputs(ctx)
 
@@ -2154,16 +2254,51 @@ def run(params: Optional[dict] = None) -> dict:
                         f"{drain_prefix}_Rollup": "overwrite",
                         f"{drain_prefix}_SessionStats": "overwrite",
                     }
-                delta_results = delta_writer.csv_dir_to_delta(
-                    csv_dir=csv_root,
-                    schema=target_schema,
-                    run_id=run_id,
-                    write_mode="append",
-                    name_overrides=name_overrides,
-                    log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
-                    dashboard_prefix=drain_prefix,
-                    strategy_overrides=strategy_overrides,
-                )
+                if multi_dashboard_drains:
+                    shared_input_prefix = (
+                        "M365" if "M365" in config.requested_dashboards else ""
+                    )
+                    delta_results = delta_writer.csv_dir_to_delta(
+                        csv_dir=csv_root,
+                        schema=target_schema,
+                        run_id=run_id,
+                        write_mode="append",
+                        name_overrides=name_overrides,
+                        log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
+                        dashboard_prefix=shared_input_prefix,
+                    )
+                    for drain in multi_dashboard_drains:
+                        per_dashboard_strategy = {}
+                        if source_plan["source_kind"] == "table" and drain["dashboard"] == "M365":
+                            per_dashboard_strategy = {
+                                f"{drain['prefix']}_Rollup": "overwrite",
+                                f"{drain['prefix']}_SessionStats": "overwrite",
+                            }
+                        dashboard_results = delta_writer.csv_dir_to_delta(
+                            csv_dir=drain["directory"],
+                            schema=target_schema,
+                            run_id=run_id,
+                            write_mode="append",
+                            name_overrides=name_overrides,
+                            log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
+                            dashboard_prefix=drain["prefix"],
+                            strategy_overrides=per_dashboard_strategy,
+                        )
+                        delta_results.extend(
+                            entry for entry in dashboard_results
+                            if entry.get("table") != "Agent365"
+                        )
+                else:
+                    delta_results = delta_writer.csv_dir_to_delta(
+                        csv_dir=csv_root,
+                        schema=target_schema,
+                        run_id=run_id,
+                        write_mode="append",
+                        name_overrides=name_overrides,
+                        log_fn=lambda msg, lvl="INFO": write_log(msg, level=lvl),
+                        dashboard_prefix=drain_prefix,
+                        strategy_overrides=strategy_overrides,
+                    )
             except Exception as ex:
                 write_log(
                     f"Delta drain FAILED with exception \u2014 CSVs preserved at "
@@ -2218,10 +2353,12 @@ def run(params: Optional[dict] = None) -> dict:
                     write_log(
                         f"Recompute complete: {len(recomputed)} table(s) refreshed."
                     )
-            elif (
+            if (
                 getattr(config, "with_aggregates", False)
-                and str(getattr(config, "dashboard", "") or "").upper()
-                == "VALUELENS"
+                and (
+                    str(getattr(config, "dashboard", "") or "").upper() == "VALUELENS"
+                    or "ValueLens" in getattr(config, "requested_dashboards", [])
+                )
             ):
                 set_progress_phase("Export", status="Recompute ValueLens aggregates")
                 write_log(

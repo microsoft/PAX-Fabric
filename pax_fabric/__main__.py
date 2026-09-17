@@ -1481,7 +1481,10 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             "AutoCompleteness": getattr(config, 'auto_completeness', False),
             "IncludeTelemetry": getattr(config, 'include_telemetry', False),
             "AppendFile": getattr(config, 'append_file', None),
-            "Dashboard": getattr(config, 'dashboard', 'AIO'),
+            "Dashboard": ",".join(
+                getattr(config, 'requested_dashboards', None)
+                or [getattr(config, 'dashboard', 'AIO')]
+            ),
             # PS L34094 parity: checkpoint stores the CANONICAL HierarchyFillMode
             # (none|self|manager|fixed), NOT the raw user string. The checkpoint
             # is authoritative on resume, so canonicalize once here.
@@ -3169,6 +3172,8 @@ def _run_rollup_processors(
     seed_userkey_map_path: str | None = None,
     state_db_path: str | None = None,
     user_history_csv: str | None = None,
+    output_dir: str | None = None,
+    retain_inputs: bool = False,
 ) -> bool:
     """Invoke rollup post-processors (replaces Invoke-EmbeddedProcessor).
 
@@ -3193,7 +3198,8 @@ def _run_rollup_processors(
         if copilot_in_types and not getattr(config, 'include_m365_usage', False):
             from .processors.copilot_processor import run_processor as copilot_run
 
-            out_dir = Path(ctx.output_file).parent
+            out_dir = Path(output_dir) if output_dir else Path(ctx.output_file).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
             entra_csv = getattr(ctx, '_entra_csv_path', '') or ''
 
             # PS L4303-4304: Output names derived from input stems.
@@ -3326,7 +3332,8 @@ def _run_rollup_processors(
             from .processors.m365_processor import write_output_manifest
             from .processors.m365_processor import write_userstats_files
 
-            out_dir = Path(ctx.output_file).parent
+            out_dir = Path(output_dir) if output_dir else Path(ctx.output_file).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
             # PS L1989-1993: Output filenames derived from input stem
             # (Purview_Audit_UsageActivity_CombinedActivityTypes_<ts>_Rollup.csv)
             # The input stem already contains the run timestamp, so no duplication.
@@ -3382,6 +3389,8 @@ def _run_rollup_processors(
     # Retention: -Rollup deletes raw CSV(s) on success; -RollupPlusRaw always
     # keeps them; any failure ALWAYS preserves them (regardless of switch).
     retention_success = True
+    if retain_inputs:
+        return rollup_success
     if rollup_success and getattr(config, 'rollup', False) and not getattr(config, 'rollup_plus_raw', False):
         for raw_path in raw_csv_list:
             try:

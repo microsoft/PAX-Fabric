@@ -296,6 +296,7 @@ class PAXConfig:
     auto_completeness: bool = False
     # v1.11.15 additions
     dashboard: str = "AIO"
+    requested_dashboards: list[str] = field(default_factory=lambda: ["AIO"])
     deidentify: bool = False 
     filler_label: Optional[str] = None
     filler_label_text: Optional[str] = None
@@ -363,6 +364,8 @@ class PAXConfig:
     # supplied Dashboard (including 'AIO'), so apply_dashboard_side_effects can
     # auto-enable Rollup for an explicit AIO the same way it does for ValueLens/M365/AISID.
     _dashboard_explicit: bool = False
+    _multi_dashboard_enabled: bool = False
+    _dashboard_parse_errors: list[str] = field(default_factory=list)
 
     # --- ExcludeCopilotInteraction/IncludeCopilotInteraction conflict flag ---
     # Set by initialize_config() (via _detect_copilot_exclude_conflict) BEFORE
@@ -761,18 +764,14 @@ def validate_config(config: PAXConfig) -> list[str]:
     # PS L1881 [ValidateSet('AIO','ValueLens','M365','AISID')] parity — reject
     # anything outside the four accepted values before any downstream comparison
     # (all uppercase-based) silently no-ops on an unknown dashboard.
+    errors.extend(getattr(config, "_dashboard_parse_errors", []))
     _dash_raw = str(getattr(config, "dashboard", "AIO") or "AIO")
     _dash_uc = _dash_raw.upper()
-    if _dash_uc not in {"AIO", "VALUELENS", "M365", "AISID"}:
-        errors.append(
-            f"Dashboard='{_dash_raw}' is not a valid value. "
-            "Use one of: AIO, ValueLens, M365, AISID."
-        )
 
     # v1.11.15 intentionally ships AISID as a gated preview. Keep Fabric in
     # lockstep with the source script: fail early rather than claim success
     # while omitting Defender/AISID datasets.
-    if _dash_uc == "AISID":
+    if "AISID" in config.requested_dashboards:
         errors.append(
             "Dashboard=AISID is temporarily gated in PAX v1.11.15 and is not "
             "available for customer use."
@@ -782,6 +781,15 @@ def validate_config(config: PAXConfig) -> list[str]:
 
     if getattr(config, "deidentify", False) and config.export_workbook:
         errors.append("Deidentify cannot be combined with ExportWorkbook; use CSV output to avoid identifiable Excel data.")
+
+    if config._multi_dashboard_enabled and (
+        config.append_file or config.append_user_info or config.append_agent365_info
+    ):
+        errors.append(
+            "Adding to an existing data set is not available when more than one "
+            "Dashboard is selected. Run each dashboard separately for append, or "
+            "remove AppendFile, AppendUserInfo, and AppendAgent365Info."
+        )
 
     # --- ExcludeCopilotInteraction conflict (v1.11.15 parity, PS L7845-7916) ---
     # PS prompts INCLUDE/EXCLUDE interactively, or hard-errors on a
@@ -904,7 +912,7 @@ def validate_config(config: PAXConfig) -> list[str]:
     # -IncludeM365Usage (no explicit -Dashboard) is a legal M365-only run.
     # Mirror that here via _dashboard_explicit — otherwise Fabric users who
     # leave Dashboard blank + toggle IncludeM365Usage hit a spurious error.
-    if getattr(config, "_dashboard_explicit", False):
+    if getattr(config, "_dashboard_explicit", False) and not config._multi_dashboard_enabled:
         dashboard_uc = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
         if dashboard_uc in ("AIO", "VALUELENS") and config.include_m365_usage:
             errors.append(
@@ -1579,6 +1587,55 @@ def compute_trim_boundaries(config: PAXConfig) -> None:
 # DASHBOARD SIDE-EFFECTS  (PS L8082-8114 parity)
 # ===========================================================================
 
+_DASHBOARD_CANONICAL_ORDER = ("AIO", "M365", "ValueLens", "AISID")
+_DASHBOARD_CANONICAL = {
+    dashboard.casefold(): dashboard for dashboard in _DASHBOARD_CANONICAL_ORDER
+}
+
+
+def resolve_dashboards(value: object) -> tuple[list[str], list[str]]:
+    """Parse repeated/list or comma-separated dashboard values like PowerShell."""
+    raw_values = value if isinstance(value, (list, tuple)) else [value]
+    requested: set[str] = set()
+    errors: list[str] = []
+    for raw_value in raw_values:
+        for token in str(raw_value or "").split(","):
+            trimmed = token.strip()
+            if not trimmed:
+                errors.append(
+                    "Dashboard contains a blank value. Use one or more of: "
+                    "AIO, ValueLens, M365, AISID."
+                )
+                continue
+            canonical = _DASHBOARD_CANONICAL.get(trimmed.casefold())
+            if canonical is None:
+                errors.append(
+                    f"Dashboard='{trimmed}' is not a valid value. "
+                    "Use one or more of: AIO, ValueLens, M365, AISID."
+                )
+                continue
+            requested.add(canonical)
+    return (
+        [name for name in _DASHBOARD_CANONICAL_ORDER if name in requested],
+        errors,
+    )
+
+
+def normalize_dashboard_selection(config: PAXConfig) -> None:
+    """Populate the canonical dashboard list and retain the primary scalar."""
+    selection: object = config.dashboard
+    if (
+        config._multi_dashboard_enabled
+        and config.requested_dashboards
+        and config.dashboard == config.requested_dashboards[0]
+    ):
+        selection = config.requested_dashboards
+    dashboards, errors = resolve_dashboards(selection)
+    config._dashboard_parse_errors = errors
+    config.requested_dashboards = dashboards or ["AIO"]
+    config._multi_dashboard_enabled = len(config.requested_dashboards) > 1
+    config.dashboard = config.requested_dashboards[0]
+
 def apply_dashboard_side_effects(config: PAXConfig) -> None:
     """Apply auto-enables implied by ``Dashboard`` before other side-effects run.
 
@@ -1605,10 +1662,10 @@ def apply_dashboard_side_effects(config: PAXConfig) -> None:
 
     dashboard_raw = str(getattr(config, "dashboard", "AIO") or "AIO")
     dashboard = dashboard_raw.upper()
-    if dashboard == "M365" and not config.include_m365_usage:
+    if "M365" in config.requested_dashboards and not config.include_m365_usage:
         config.include_m365_usage = True
         _info(
-            "INFO: -Dashboard M365 auto-enabled -IncludeM365Usage "
+            "INFO: Requesting M365 auto-enabled -IncludeM365Usage "
             "(the M365 dashboard consumes the M365 usage bundle)."
         )
     # PS L8087-8115: only an EXPLICITLY supplied -Dashboard implies Rollup. The
@@ -1789,6 +1846,9 @@ def initialize_config(config: PAXConfig) -> list[str]:
     
     Returns list of validation errors (empty = success).
     """
+    # 0. Normalize Dashboard before any dashboard-implied side effects.
+    normalize_dashboard_selection(config)
+
     # 1. Date defaults
     apply_date_defaults(config)
 
@@ -2096,6 +2156,9 @@ def config_from_params(params: dict) -> "PAXConfig":
             if not str(v).strip():
                 continue
             cfg._dashboard_explicit = True
+            if isinstance(v, (list, tuple)):
+                setattr(cfg, dst, ",".join(str(item) for item in v))
+                continue
         setattr(cfg, dst, str(v))
 
     for src, dst, caster in (
