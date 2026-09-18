@@ -293,6 +293,17 @@ def schema_for(profile: str) -> tuple[tuple[str, ...], tuple[str, ...], list[str
 # same renaming so the dim CSV is drop-in compatible with all downstream DAX.
 UPN_VARIANTS_NORMALIZED = {"userprincipalname", "upn", "personid"}
 DEPARTMENT_VARIANT_NORMALIZED = "department"
+# Organization source precedence (most meaningful first). `department` carries the
+# human-readable org name in a directory export; a column literally named
+# Organization/Organisation is accepted only when no readable department exists,
+# because in real exports it is frequently a numeric department identifier.
+_DEPARTMENT_SOURCE_PREFERENCE: tuple[str, ...] = (
+    DEPARTMENT_VARIANT_NORMALIZED,
+    "organisation",
+    "organization",
+)
+# Name used to retain a displaced Organization-named identifier column.
+_DISPLACED_ORG_COLUMN = "Organization_Id"
 JOBTITLE_RAW_NAME = "jobTitle"  # exact-match rename to "JobTitle"
 
 # Exact-case Users columns the AIO semantic model expects as source columns. `displayName` and
@@ -1518,10 +1529,33 @@ def detect_upn_column(headers: list[str]) -> str | None:
 
 
 def detect_department_column(headers: list[str]) -> str | None:
-    for h in headers:
-        if _normalize_col_name(h) == DEPARTMENT_VARIANT_NORMALIZED:
-            return h
+    # Selection is by meaning, not by source-column position: the readable department
+    # name owns `Organization` whenever one is present, because the dashboards bind
+    # their Organization slicers to that value.
+    for wanted in _DEPARTMENT_SOURCE_PREFERENCE:
+        for h in headers:
+            if _normalize_col_name(h) == wanted:
+                return h
     return None
+
+
+def detect_displaced_org_columns(headers: list[str], chosen: str | None) -> list[str]:
+    """Organization-named source columns displaced by the chosen department column.
+
+    When a readable `department` column is promoted to `Organization`, any
+    pre-existing column already named Organization/Organisation would collide.
+    Those are preserved under a separate truthful name rather than dropped,
+    because a numeric department identifier is legitimate data in its own right.
+    """
+    if not chosen:
+        return []
+    displaced: list[str] = []
+    for h in headers:
+        if h == chosen:
+            continue
+        if _normalize_col_name(h) in {"organization", "organisation"}:
+            displaced.append(h)
+    return displaced
 
 
 _UNKNOWN_EFFECTIVE_DATE = "Unknown"
@@ -1674,8 +1708,18 @@ def load_entra_and_write_users(
         rename_map: dict[str, str | None] = {}
         if upn_col and upn_col != "PersonId" and "PersonId" not in original_headers:
             rename_map[upn_col] = "PersonId"
-        if dept_col and dept_col != "Organization" and "Organization" not in original_headers:
+        if dept_col and dept_col != "Organization":
             rename_map[dept_col] = "Organization"
+            # Retain any other Organization-named source column (typically a numeric
+            # department identifier) under a separate name so promoting the readable
+            # department neither collides with it nor discards it.
+            for displaced in detect_displaced_org_columns(original_headers, dept_col):
+                alt = _DISPLACED_ORG_COLUMN
+                suffix = 2
+                while alt in original_headers or alt in rename_map.values():
+                    alt = f"{_DISPLACED_ORG_COLUMN}_{suffix}"
+                    suffix += 1
+                rename_map[displaced] = alt
         if has_jobtitle_raw and "JobTitle" not in original_headers:
             rename_map[JOBTITLE_RAW_NAME] = "JobTitle"
         if has_license_col and has_license_col != "Has license" and "Has license" not in original_headers:
