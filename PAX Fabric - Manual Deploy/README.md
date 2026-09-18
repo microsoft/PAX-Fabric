@@ -3,6 +3,12 @@
 Deploy the **PAX Fabric** solution (Microsoft 365 Copilot & Entra activity analytics
 pipeline) into your own Microsoft Fabric workspace.
 
+> **Pipeline script version: v1.11.16.** This release is a **strict superset**
+> of v1.11.15. All six new knobs (`Watermark`, `PurviewInputFile`,
+> `UserHistory`, `HistoryEffectiveDate`, `EmitMetricsJson`, `MetricsPath`)
+> default to *off* / empty, so an existing v1.11.15 deployment continues to
+> behave byte-identically after upgrade until you opt in. See Section 4.5.
+
 The deployment provisions four Fabric items:
 
 | Item              | Purpose                                                            |
@@ -262,6 +268,60 @@ The pipeline calls the notebook with parameters from `<VarLibName>`. Change
 date ranges by editing **`<VarLibName>` → StartDate / EndDate** in the Fabric
 UI and saving — no redeploy required.
 
+### 4.5 v1.11.16 optional features (all default-off)
+
+Fresh deployments already ship these six parameters wired into
+`<PipelineName>` with the safe defaults shown. **You do not need to enable
+any of them** — with the defaults, the pipeline behaves exactly as v1.11.15.
+Enable a knob only when you need the feature it unlocks. To edit, open
+`<PipelineName>` → **Parameters** (canvas level) or **RunPaxNotebook → Base
+parameters** (activity level) and change the value.
+
+| Pipeline parameter     | Type   | Default | Purpose                                                       |
+| ---------------------- | ------ | ------- | ------------------------------------------------------------- |
+| `Watermark`            | bool   | `false` | Incremental runs. Persists the last completed window so re-runs skip already-processed data. |
+| `PurviewInputFile`     | string | `""`    | "Bring your own data" (BYOD). Bypass Graph API and read an already-exported Purview CSV from the Lakehouse `Files/` area. |
+| `UserHistory`          | string | `"Off"` | Retain a rolling per-user history slice. Set to `"On"` to keep the audit history for compliance / forensic reasons. |
+| `HistoryEffectiveDate` | string | `""`    | Protective floor for retention. Rows on or after this date are never dropped, even if `RetentionDays` would otherwise evict them. Format `YYYY-MM-DD`. |
+| `EmitMetricsJson`      | bool   | `false` | Write a compact run-telemetry sidecar (script version, timestamps, per-stage counters). |
+| `MetricsPath`          | string | `""`    | Output path for the metrics sidecar when `EmitMetricsJson=true`. Typical value: `Files/pax_metrics.json`. Ignored when `EmitMetricsJson=false`. |
+
+**How the four features compose:**
+
+- **Incremental (Watermark).** Set `Watermark=true`. First run bootstraps a
+  state file under the Lakehouse (`.pax_watermark_state.json`); subsequent
+  runs advance the window automatically. If a run covers a window already
+  processed, it short-circuits with `WATERMARK: covered through …` — no
+  Graph calls, no Delta writes.
+- **BYOD (`PurviewInputFile`).** Point at an exported Purview audit CSV
+  in your Lakehouse (`PurviewInputFile="Files/purview_export.csv"`). The
+  pipeline skips Graph authentication entirely and normalises the CSV
+  through the same downstream path.
+- **User history + protective floor.** Set `UserHistory="On"` and
+  `HistoryEffectiveDate="YYYY-MM-DD"` (e.g. the start of your
+  compliance window). Rows on/after HED will not be evicted by
+  `RetentionDays`.
+- **Metrics sidecar.** Set `EmitMetricsJson=true` and
+  `MetricsPath="Files/pax_metrics.json"`. The pipeline writes a JSON file
+  with four top-level keys — `version`, `timestampUtc`, `parameters`,
+  `metrics` — after each successful run.
+
+**Backport for deployments created before v1.11.16.** Rerunning
+`Deploy-PaxFabric.ps1` reuses the existing pipeline and does **not**
+replace its saved definition. To surface the six new knobs on an older
+deployment, open `<PipelineName>` and add them under **Parameters**:
+
+- `Watermark` (Boolean, default `false`)
+- `PurviewInputFile` (String, default empty)
+- `UserHistory` (String, default `Off`)
+- `HistoryEffectiveDate` (String, default empty)
+- `EmitMetricsJson` (Boolean, default `false`)
+- `MetricsPath` (String, default empty)
+
+Then add matching **Base parameters** on the `RunPaxNotebook` activity
+with values `@pipeline().parameters.<name>`. Fresh deployments include all
+six automatically.
+
 ---
 
 ## 5. Troubleshooting
@@ -278,6 +338,9 @@ UI and saving — no redeploy required.
 | `Variable Library` values wrong                                      | Edit them in the Fabric UI. The deployment script only *initialises* them at create time.                              |
 | `[SQLITE]` followed by `unable to open database file`                | The notebook driver cannot create local temporary files. Restart the session and confirm Python `tempfile` points to a writable local path. Do not redirect the SQLite file to OneLake or ABFS. |
 | `[SQLITE]` followed by `database or disk is full`                    | Driver-local scratch space was exhausted. Reduce the processing window or use a larger Fabric Spark resource profile; the log's `freeMiB` value shows space available when processing started. |
+| Run log: `WATERMARK: covered through <date>`                         | Expected when `Watermark=true` and the requested window has already been processed. The pipeline short-circuits — no Graph calls, no Delta writes. Advance `EndDate` or wait for the next scheduled run. |
+| `EmitMetricsJson=true` but no file appears                           | Confirm `MetricsPath` is set (default empty) and points at a writable Lakehouse `Files/…` path. Empty `MetricsPath` is treated as "don't emit" even when the flag is on. |
+| BYOD run: rows missing / schema mismatch                             | `PurviewInputFile` expects a Purview audit-export CSV. Verify the file exists at the Lakehouse-relative path and that the header row matches the exporter's schema. |
 
 ---
 
@@ -313,6 +376,10 @@ canvas level) for run-tunable knobs:
 - `RetentionDays` — how long processed data is kept.
 - `MaxConcurrency` — default `10`. Reduce when pulling large audit-log
   windows or if the run log shows Graph `HTTP 429` throttling.
+- **v1.11.16 optional knobs (all default-off):** `Watermark`,
+  `PurviewInputFile`, `UserHistory`, `HistoryEffectiveDate`,
+  `EmitMetricsJson`, `MetricsPath`. See Section 4.5 for what each one does
+  and how the features compose.
 
 Save the pipeline; the next run (manual or scheduled) picks up the new
 values.

@@ -61,6 +61,7 @@ class PAXRunContext:
     # instantiated by mod11 and attached here.
     orchestrator_state: Any = None   # mod11.OrchestratorState once initialized
     progress_state: Any = None       # mod11.ProgressState once initialized
+    resolved_user_scope: Any = None  # mod13.UserScopeResult once resolved
 
     # --- Checkpoint / resume ---
     checkpoint_path: Optional[str] = None

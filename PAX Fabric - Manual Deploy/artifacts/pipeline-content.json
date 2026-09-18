@@ -6,7 +6,7 @@
         "type": "TridentNotebook",
         "dependsOn": [],
         "policy": {
-          "timeout": "7.00:00:00",
+          "timeout": "12:00:00",
           "retry": 0,
           "retryIntervalInSeconds": 30,
           "secureOutput": false,
@@ -25,7 +25,14 @@
             "OnlyUserInfo":     { "value": "@pipeline().parameters.OnlyUserInfo",     "type": "bool"   },
             "IncludeAgent365Info": { "value": "@pipeline().parameters.IncludeAgent365Info", "type": "bool"   },
             "OnlyAgent365Info":    { "value": "@pipeline().parameters.OnlyAgent365Info",    "type": "bool"   },
-            "GroupNames":          { "value": "@pipeline().parameters.GroupNames",          "type": "string" }
+            "GroupNames":          { "value": "@pipeline().parameters.GroupNames",          "type": "string" },
+            "Dashboard":           { "value": "@pipeline().parameters.Dashboard",           "type": "string" },
+            "Watermark":            { "value": "@pipeline().parameters.Watermark",            "type": "bool"   },
+            "PurviewInputFile":     { "value": "@pipeline().parameters.PurviewInputFile",     "type": "string" },
+            "UserHistory":          { "value": "@pipeline().parameters.UserHistory",          "type": "string" },
+            "HistoryEffectiveDate": { "value": "@pipeline().parameters.HistoryEffectiveDate", "type": "string" },
+            "EmitMetricsJson":      { "value": "@pipeline().parameters.EmitMetricsJson",      "type": "bool"   },
+            "MetricsPath":          { "value": "@pipeline().parameters.MetricsPath",          "type": "string" }
           }
         }
       }
@@ -40,7 +47,14 @@
       "OnlyUserInfo":     { "type": "bool",   "defaultValue": false },
       "IncludeAgent365Info": { "type": "bool",   "defaultValue": false },
       "OnlyAgent365Info":    { "type": "bool",   "defaultValue": false },
-      "GroupNames":          { "type": "string", "defaultValue": ""    }
+      "GroupNames":          { "type": "string", "defaultValue": ""    },
+      "Dashboard":           { "type": "string", "defaultValue": ""    },
+      "Watermark":            { "type": "bool",   "defaultValue": false },
+      "PurviewInputFile":     { "type": "string", "defaultValue": ""    },
+      "UserHistory":          { "type": "string", "defaultValue": "Off" },
+      "HistoryEffectiveDate": { "type": "string", "defaultValue": ""    },
+      "EmitMetricsJson":      { "type": "bool",   "defaultValue": false },
+      "MetricsPath":          { "type": "string", "defaultValue": ""    }
     },
     "annotations": []
   }

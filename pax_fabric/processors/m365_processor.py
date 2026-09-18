@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Purview M365 Usage Bundle Explosion Processor v2.6.2
+Purview M365 Usage Bundle Explosion Processor v2.6.3
 =====================================================
 Two-mode processor for Purview audit log CSV exports:
 
@@ -111,6 +111,7 @@ import bisect
 import csv
 import hashlib
 import hmac
+import json
 import os
 import random
 import re
@@ -120,7 +121,7 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Iterator
 
 # ─── Fast JSON: prefer orjson, fall back to stdlib ───────────────────────────
 try:
@@ -148,11 +149,78 @@ except ImportError:
 
     _JSON_ENGINE = "json (stdlib)"
 
+
+def json_loads_rescue(value: str | bytes) -> Any:
+    """Retry optimized-parser failures with the standard library parser."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    return json.loads(value)
+
+
+REJECT_MANIFEST_SCHEMA = "pax-reject-manifest/1"
+EXIT_RESIDUAL_REJECTS = 40
+
+
+def reject_row_digest(row: dict[str, Any]) -> str:
+    digest = hashlib.sha256()
+    for key in sorted(row.keys(), key=lambda item: "" if item is None else str(item)):
+        digest.update(str(key).encode("utf-8", "replace"))
+        digest.update(b"\x1e")
+        value = row.get(key)
+        digest.update(("" if value is None else str(value)).encode("utf-8", "replace"))
+        digest.update(b"\x1f")
+    return digest.hexdigest().upper()
+
+
+def reject_manifest_path_for(output_path: str) -> str:
+    target = Path(output_path)
+    return str(target.with_name(target.stem + "_Rejects.jsonl"))
+
+
+class RejectManifest:
+    """Stream every rejected row's ordinal, reason, and digest to disk."""
+
+    def __init__(self, path: str, processor: str, processor_version: str) -> None:
+        self.path = path
+        self.count = 0
+        self._processor = processor
+        self._processor_version = processor_version
+        self._handle: Any = None
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def record(self, ordinal: int, reason: str, digest: str) -> None:
+        if self._handle is None:
+            self._handle = open(self.path, "w", encoding="utf-8", newline="\n")
+            self._write({
+                "schema": REJECT_MANIFEST_SCHEMA,
+                "processor": self._processor,
+                "processorVersion": self._processor_version,
+            })
+        self.count += 1
+        self._write({
+            "ordinal": int(ordinal),
+            "reason": reason,
+            "sourceRowDigest": digest,
+        })
+
+    def _write(self, payload: dict[str, Any]) -> None:
+        self._handle.write(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        self._handle.write("\n")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
 # ═════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-SCRIPT_VERSION = "2.6.2"
+SCRIPT_VERSION = "2.6.3"
 
 EXPLOSION_PER_RECORD_ROW_CAP = 1000
 STREAMING_CHUNK_SIZE = 5000
@@ -1777,10 +1845,18 @@ def run_rollup(
         "virtual_exploded_event_count": 0,
         "output_rows": 0,
         "parse_errors": 0,
+        "rejected_records": 0,
+        "empty_auditdata_records": 0,
+        "reject_manifest_path": None,
         "session_rows": 0,
         "session_threads": 0,
         "session_prompts": 0,
     }
+    reject_manifest = RejectManifest(
+        reject_manifest_path_for(output_csv),
+        "M365_Usage_Bundle_Explosion",
+        SCRIPT_VERSION,
+    )
 
     if not quiet:
         print(f"Purview M365 Usage Bundle Explosion Processor v{SCRIPT_VERSION} [ROLLUP MODE]")
@@ -1814,14 +1890,26 @@ def run_rollup(
                 audit_data_raw = record.get("AuditData", "")
                 if not audit_data_raw or not isinstance(audit_data_raw, str) or not audit_data_raw.strip():
                     stats["parse_errors"] += 1
+                    stats["empty_auditdata_records"] += 1
                     continue
                 try:
                     audit_data = json_loads(audit_data_raw)
                 except Exception:
-                    stats["parse_errors"] += 1
-                    continue
+                    try:
+                        audit_data = json_loads_rescue(audit_data_raw)
+                    except Exception:
+                        stats["parse_errors"] += 1
+                        stats["rejected_records"] += 1
+                        reject_manifest.record(
+                            stats["input_records"], "JSON_PARSE_FAILED", reject_row_digest(record)
+                        )
+                        continue
                 if not isinstance(audit_data, dict):
                     stats["parse_errors"] += 1
+                    stats["rejected_records"] += 1
+                    reject_manifest.record(
+                        stats["input_records"], "AUDITDATA_NOT_OBJECT", reject_row_digest(record)
+                    )
                     continue
 
                 ced = safe_get(audit_data, "CopilotEventData")
@@ -1893,6 +1981,9 @@ def run_rollup(
 
     # ── Write rollup output CSV ──────────────────────────────────────────
     stats["output_rows"] = len(rollup)
+    reject_manifest.close()
+    if reject_manifest.count > 0:
+        stats["reject_manifest_path"] = reject_manifest.path
 
     if not quiet:
         print(f"  {stats['input_records']:>12,} records processed (done)")
@@ -1959,6 +2050,9 @@ def run_rollup(
               f"  ({stats['virtual_exploded_event_count']:,} -> {stats['output_rows']:,})")
         if stats["parse_errors"] > 0:
             print(f"  Parse errors:               {stats['parse_errors']:>14,}")
+        if stats["rejected_records"] > 0:
+            print(f"  Rejected records:           {stats['rejected_records']:>14,}")
+            print(f"  Reject manifest:            {stats['reject_manifest_path']}")
         print(f"  Columns:                    {len(ROLLUP_HEADER):>14}")
         print(f"  Elapsed:                    {t_elapsed:>13.2f}s")
         if stats["input_records"] > 0 and t_elapsed > 0:
@@ -2191,8 +2285,16 @@ def write_userstats_files(
     session_csv_path: str | Path,
     quiet: bool,
     session_stats_csv_path: str | Path | None = None,
-    aggregated_rows: Any | None = None,
-    session_stats_rows: Any | None = None,
+    aggregated_rows: (
+        Iterable[dict[str, Any]]
+        | Callable[[], Iterable[dict[str, Any]]]
+        | None
+    ) = None,
+    session_stats_rows: (
+        Iterable[dict[str, Any]]
+        | Callable[[], Iterable[dict[str, Any]]]
+        | None
+    ) = None,
 ) -> tuple[int, int]:
     """
     Read the just-written aggregated rollup CSV and produce two additional files:
@@ -2204,11 +2306,13 @@ def write_userstats_files(
     raw audit-event counts. This matches the AI in One semantics and prevents
     service-principal / plugin-chain inflation from skewing the CE Quadrant.
 
-    When `aggregated_rows` is provided (an iterable of dict[str,str]), it is used
-    as the rollup source instead of reading from `aggregated_csv_path`. This allows
-    callers (pax_fabric's Delta-backed recompute) to stream rows from a Delta table
-    without intermediate temp files. Similarly, `session_stats_rows` replaces
-    `session_stats_csv_path` when provided.
+    When `aggregated_rows` is provided, it is used as the rollup source instead
+    of reading from `aggregated_csv_path`. The rollup calculation requires two
+    passes, so one-shot sources must be supplied as a callable that returns a new
+    iterable for each pass. This allows pax_fabric's Delta-backed recompute to
+    reopen a bounded-memory Delta stream without intermediate input files.
+    `session_stats_rows` replaces `session_stats_csv_path` when provided and is
+    consumed once.
 
     Returns (user_count, session_cohort_row_count).
     """
@@ -2219,6 +2323,39 @@ def write_userstats_files(
             print(f"[UserStats] WARNING: Aggregated CSV not found: {agg_path} — skipping.",
                   file=sys.stderr)
         return 0, 0
+
+    def _csv_rollup_rows() -> Iterator[dict[str, Any]]:
+        with open(agg_path, "r", encoding="utf-8-sig", newline="") as handle:
+            yield from csv.DictReader(handle)
+
+    if aggregated_rows is None:
+        rollup_rows_factory: Callable[[], Iterable[dict[str, Any]]] = _csv_rollup_rows
+    elif callable(aggregated_rows):
+        rollup_rows_factory = aggregated_rows
+    else:
+        if iter(aggregated_rows) is aggregated_rows:
+            raise TypeError(
+                "aggregated_rows is a one-shot iterator; pass a callable that "
+                "returns a fresh iterator for each of the two rollup passes"
+            )
+        rollup_rows_factory = lambda: aggregated_rows
+
+    def _iter_session_stats_rows() -> Iterator[dict[str, Any]]:
+        if session_stats_rows is not None:
+            source = (
+                session_stats_rows()
+                if callable(session_stats_rows)
+                else session_stats_rows
+            )
+            yield from source
+            return
+        if not session_stats_csv_path:
+            return
+        session_path_source = Path(session_stats_csv_path)
+        if not session_path_source.is_file():
+            return
+        with open(session_path_source, "r", encoding="utf-8-sig", newline="") as handle:
+            yield from csv.DictReader(handle)
 
     userstats_path = Path(userstats_csv_path)
     session_path = Path(session_csv_path)
@@ -2267,12 +2404,10 @@ def write_userstats_files(
     # are inclusive lower bounds; a row qualifies for window W iff date_key >= cutoff[W].
     # The "Full" window has no cutoff and always qualifies.
     _d_max_str = ""
-    with open(agg_path, "r", encoding="utf-8-sig", newline="") as _f:
-        _r = csv.DictReader(_f)
-        for _row in _r:
-            _dk = (_row.get("CreationDate", "") or "")[:10]
-            if _dk and _dk > _d_max_str:
-                _d_max_str = _dk
+    for _row in rollup_rows_factory():
+        _dk = (_row.get("CreationDate", "") or "")[:10]
+        if _dk and _dk > _d_max_str:
+            _d_max_str = _dk
     if _d_max_str:
         try:
             _d_max = date.fromisoformat(_d_max_str)
@@ -2292,96 +2427,94 @@ def write_userstats_files(
 
     # ── Stream through aggregated CSV ────────────────────────────────────
     row_count = 0
-    with open(agg_path, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            row_count += 1
+    for row in rollup_rows_factory():
+        row_count += 1
 
-            user_id = row.get("UserId", "")
-            uid_lower = user_id.lower()
-            if uid_lower not in uid_original:
-                uid_original[uid_lower] = user_id
+        user_id = row.get("UserId", "")
+        uid_lower = user_id.lower()
+        if uid_lower not in uid_original:
+            uid_original[uid_lower] = user_id
 
-            date_key = row.get("CreationDate", "")[:10]   # YYYY-MM-DD
-            op = row.get("Operation", "")
-            wl = row.get("Workload", "")
-            ext = (row.get("SourceFileExtension", "") or "").lower()
-            app_host = (row.get("AppHost", "") or "").lower()
+        date_key = row.get("CreationDate", "")[:10]   # YYYY-MM-DD
+        op = row.get("Operation", "")
+        wl = row.get("Workload", "")
+        ext = (row.get("SourceFileExtension", "") or "").lower()
+        app_host = (row.get("AppHost", "") or "").lower()
 
-            if date_key:
-                all_dates.add(date_key)
+        if date_key:
+            all_dates.add(date_key)
 
-            try:
-                event_count = int(row.get("EventCount", "1") or "1")
-            except (ValueError, TypeError):
-                event_count = 1
+        try:
+            event_count = int(row.get("EventCount", "1") or "1")
+        except (ValueError, TypeError):
+            event_count = 1
 
-            copilot = is_copilot(op, wl)
-            excel_file = is_excel_file_op(ext, op)
+        copilot = is_copilot(op, wl)
+        excel_file = is_excel_file_op(ext, op)
 
-            # Core event counts
-            if copilot:
-                cop_ec[uid_lower] += event_count
-            else:
-                m365_ec[uid_lower] += event_count
+        # Core event counts
+        if copilot:
+            cop_ec[uid_lower] += event_count
+        else:
+            m365_ec[uid_lower] += event_count
 
-            # ExCopEC: Copilot interactions in Excel (via AppHost); ExM365EC: Excel file ops by non-Copilot
-            if copilot and app_host == "excel":
-                ex_cop_ec[uid_lower] += 1        # row count, not EventCount
-            if excel_file and not copilot:
-                ex_m365_ec[uid_lower] += 1       # row count, not EventCount
+        # ExCopEC: Copilot interactions in Excel (via AppHost); ExM365EC: Excel file ops by non-Copilot
+        if copilot and app_host == "excel":
+            ex_cop_ec[uid_lower] += 1        # row count, not EventCount
+        if excel_file and not copilot:
+            ex_m365_ec[uid_lower] += 1       # row count, not EventCount
 
-            # Active days (distinct CreationDate values)
-            if wl == "MicrosoftTeams" and op in TEAMS_OPS:
-                t_days[uid_lower].add(date_key)
-            if wl == "Exchange" and op in OUTLOOK_OPS:
-                o_days[uid_lower].add(date_key)
-            if ext in WORD_EXTS and op in FILE_OPS:
-                w_days[uid_lower].add(date_key)
-            if ext in EXCEL_EXTS and op in FILE_OPS:
-                x_days[uid_lower].add(date_key)
-            if ext in PPT_EXTS and op in FILE_OPS:
-                p_days[uid_lower].add(date_key)
+        # Active days (distinct CreationDate values)
+        if wl == "MicrosoftTeams" and op in TEAMS_OPS:
+            t_days[uid_lower].add(date_key)
+        if wl == "Exchange" and op in OUTLOOK_OPS:
+            o_days[uid_lower].add(date_key)
+        if ext in WORD_EXTS and op in FILE_OPS:
+            w_days[uid_lower].add(date_key)
+        if ext in EXCEL_EXTS and op in FILE_OPS:
+            x_days[uid_lower].add(date_key)
+        if ext in PPT_EXTS and op in FILE_OPS:
+            p_days[uid_lower].add(date_key)
 
-            # Activity event counts
-            if wl == "MicrosoftTeams" and op in TEAMS_OPS:
-                t_ec[uid_lower] += event_count
-            if wl == "Exchange" and op in OUTLOOK_OPS:
-                o_ec[uid_lower] += event_count
-            if ext in OFFICE_EXTS and op in FILE_OPS:
-                off_ec[uid_lower] += event_count
+        # Activity event counts
+        if wl == "MicrosoftTeams" and op in TEAMS_OPS:
+            t_ec[uid_lower] += event_count
+        if wl == "Exchange" and op in OUTLOOK_OPS:
+            o_ec[uid_lower] += event_count
+        if ext in OFFICE_EXTS and op in FILE_OPS:
+            off_ec[uid_lower] += event_count
 
-            # ── DAX-aligned raw counts, accumulated per window.
-            # Helper closure: write to Full always; to L60/L30 only if the row's
-            # date_key satisfies the trailing-window cutoff.
-            def _bump(buckets: dict[str, dict[str, int]], n: int) -> None:
-                buckets["Full"][uid_lower] += n
-                if date_key >= cutoff_l60:
-                    buckets["L60"][uid_lower] += n
-                if date_key >= cutoff_l30:
-                    buckets["L30"][uid_lower] += n
+        # ── DAX-aligned raw counts, accumulated per window.
+        # Helper closure: write to Full always; to L60/L30 only if the row's
+        # date_key satisfies the trailing-window cutoff.
+        def _bump(buckets: dict[str, dict[str, int]], n: int) -> None:
+            buckets["Full"][uid_lower] += n
+            if date_key >= cutoff_l60:
+                buckets["L60"][uid_lower] += n
+            if date_key >= cutoff_l30:
+                buckets["L30"][uid_lower] += n
 
-            if wl == "MicrosoftTeams" and op in DAX_TEAMS_OPS:
-                _bump(teams_raw, event_count)
-            if wl == "Exchange" and op in DAX_OUTLOOK_OPS:
-                _bump(outlook_raw, event_count)
-            if op in DAX_FILE_OPS:
-                if ext in WORD_EXTS:
-                    _bump(word_raw, event_count)
-                elif ext in EXCEL_EXTS:
-                    _bump(excel_raw, event_count)
-                elif ext in PPT_EXTS:
-                    _bump(ppt_raw, event_count)
-            if op == "CopilotInteraction":
-                _bump(copilot_chat_raw, event_count)
-            # CE Copilot Percentile filter: Workload="Copilot" OR Operation contains "CopilotInteraction"
-            if wl == "Copilot" or "CopilotInteraction" in op:
-                _bump(ce_copilot_raw, event_count)
+        if wl == "MicrosoftTeams" and op in DAX_TEAMS_OPS:
+            _bump(teams_raw, event_count)
+        if wl == "Exchange" and op in DAX_OUTLOOK_OPS:
+            _bump(outlook_raw, event_count)
+        if op in DAX_FILE_OPS:
+            if ext in WORD_EXTS:
+                _bump(word_raw, event_count)
+            elif ext in EXCEL_EXTS:
+                _bump(excel_raw, event_count)
+            elif ext in PPT_EXTS:
+                _bump(ppt_raw, event_count)
+        if op == "CopilotInteraction":
+            _bump(copilot_chat_raw, event_count)
+        # CE Copilot Percentile filter: Workload="Copilot" OR Operation contains "CopilotInteraction"
+        if wl == "Copilot" or "CopilotInteraction" in op:
+            _bump(ce_copilot_raw, event_count)
 
-            # Session cohort: distinct active dates per (user, app)
-            app = app_column(ext, op, wl)
-            if app != "M365 All Apps":
-                session_ops[(uid_lower, app)].add(date_key)
+        # Session cohort: distinct active dates per (user, app)
+        app = app_column(ext, op, wl)
+        if app != "M365 All Apps":
+            session_ops[(uid_lower, app)].add(date_key)
 
     if row_count == 0:
         if not quiet:
@@ -2483,34 +2616,34 @@ def write_userstats_files(
     # service-principal noise. Falls back to audit-event tally if SessionStats is
     # missing (older script invocations).
     prompt_raw = _wbuckets()
-    if session_stats_csv_path:
-        _ss = Path(session_stats_csv_path)
-        if _ss.is_file():
-            with open(_ss, "r", encoding="utf-8-sig", newline="") as _f:
-                _r = csv.DictReader(_f)
-                for _row in _r:
-                    _uid = (_row.get("UserId") or "").strip().lower()
-                    if not _uid:
-                        continue
-                    _date_key = (_row.get("CreationDate") or "")[:10]
-                    try:
-                        _pc = int(_row.get("PromptCount") or 0)
-                    except ValueError:
-                        _pc = 0
-                    if _pc <= 0:
-                        continue
-                    prompt_raw["Full"][_uid] += _pc
-                    if cutoff_l60 and _date_key >= cutoff_l60:
-                        prompt_raw["L60"][_uid] += _pc
-                    if cutoff_l30 and _date_key >= cutoff_l30:
-                        prompt_raw["L30"][_uid] += _pc
+    if session_stats_rows is not None or session_stats_csv_path:
+        _session_stats_available = session_stats_rows is not None
+        if session_stats_csv_path:
+            _session_stats_available = _session_stats_available or Path(session_stats_csv_path).is_file()
+        if _session_stats_available:
+            for _row in _iter_session_stats_rows():
+                _uid = (_row.get("UserId") or "").strip().lower()
+                if not _uid:
+                    continue
+                _date_key = (_row.get("CreationDate") or "")[:10]
+                try:
+                    _pc = int(_row.get("PromptCount") or 0)
+                except ValueError:
+                    _pc = 0
+                if _pc <= 0:
+                    continue
+                prompt_raw["Full"][_uid] += _pc
+                if cutoff_l60 and _date_key >= cutoff_l60:
+                    prompt_raw["L60"][_uid] += _pc
+                if cutoff_l30 and _date_key >= cutoff_l30:
+                    prompt_raw["L30"][_uid] += _pc
             if not quiet:
                 _tot = sum(prompt_raw["Full"].values())
                 print(f"[UserStats] CE Copilot Percentile source: PromptCount "
                       f"({_tot:,} prompts across {len(prompt_raw['Full']):,} users)")
         else:
             if not quiet:
-                print(f"[UserStats] WARNING: SessionStats CSV not found: {_ss} — "
+                print(f"[UserStats] WARNING: SessionStats CSV not found: {session_stats_csv_path} — "
                       f"falling back to audit-event count for CE Copilot Percentile.",
                       file=sys.stderr)
             prompt_raw = ce_copilot_raw  # fallback to legacy event-based percentile
@@ -2634,6 +2767,129 @@ def write_userstats_files(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# OUTPUT MANIFEST
+# ═════════════════════════════════════════════════════════════════════════════
+
+MANIFEST_SCHEMA_VERSION = "1.0"
+MANIFEST_PROCESSOR_NAME = "Purview_M365_Usage_Bundle_Explosion_Processor"
+MANIFEST_OUTPUT_TYPES: tuple[str, ...] = (
+    "Rollup",
+    "UserStats",
+    "SessionCohort",
+    "SessionStats",
+)
+MANIFEST_FIELD_SEP = "\x1f"
+
+
+def _manifest_is_empty_record(record: list[str]) -> bool:
+    return len(record) == 0 or (len(record) == 1 and record[0] == "")
+
+
+def _manifest_measure_output(output_type: str, path: str) -> dict[str, Any]:
+    """Measure one closed output file using RFC-4180 record semantics."""
+    abs_path = os.path.abspath(path)
+    if not os.path.isfile(abs_path):
+        raise FileNotFoundError(f"{output_type} output not found: {abs_path}")
+
+    with open(abs_path, "rb") as handle:
+        raw = handle.read()
+
+    header: list[str] = []
+    data_row_count = 0
+    with open(abs_path, "r", encoding="utf-8-sig", newline="") as handle:
+        for index, record in enumerate(csv.reader(handle)):
+            row = [str(field) for field in record]
+            if index == 0:
+                header = row
+            elif not _manifest_is_empty_record(row):
+                data_row_count += 1
+
+    header_join = MANIFEST_FIELD_SEP.join(header)
+    return {
+        "type": output_type,
+        "path": abs_path,
+        "header": header,
+        "headerSha256": hashlib.sha256(header_join.encode("utf-8")).hexdigest().upper(),
+        "dataRowCount": data_row_count,
+        "byteLength": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest().upper(),
+    }
+
+
+def _manifest_canonical_text(manifest: dict[str, Any]) -> str:
+    lines = [
+        f"schemaVersion={manifest['schemaVersion']}",
+        f"processorName={manifest['processorName']}",
+        f"processorVersion={manifest['processorVersion']}",
+        f"generatedUtc={manifest['generatedUtc']}",
+        f"generationMode={manifest['generationMode']}",
+        f"outputCount={len(manifest['outputs'])}",
+    ]
+    for index, entry in enumerate(manifest["outputs"]):
+        prefix = f"outputs[{index}]."
+        lines.append(f"{prefix}type={entry['type']}")
+        lines.append(f"{prefix}path={entry['path']}")
+        lines.append(f"{prefix}header={MANIFEST_FIELD_SEP.join(entry['header'])}")
+        lines.append(f"{prefix}headerSha256={entry['headerSha256']}")
+        lines.append(f"{prefix}dataRowCount={entry['dataRowCount']}")
+        lines.append(f"{prefix}byteLength={entry['byteLength']}")
+        lines.append(f"{prefix}sha256={entry['sha256']}")
+    return "\n".join(lines)
+
+
+def write_output_manifest(
+    manifest_path: str,
+    generation_mode: str,
+    outputs: list[tuple[str, str]],
+) -> str:
+    """Measure the four closed outputs and publish their manifest atomically."""
+    supplied = [output_type for output_type, _ in outputs]
+    duplicates = sorted({item for item in supplied if supplied.count(item) > 1})
+    if duplicates:
+        raise ValueError(f"output manifest: duplicate output type(s): {duplicates}")
+    if tuple(supplied) != MANIFEST_OUTPUT_TYPES:
+        raise ValueError(
+            "output manifest requires exactly these output types, in this order: "
+            f"{list(MANIFEST_OUTPUT_TYPES)}; got {supplied}"
+        )
+
+    manifest: dict[str, Any] = {
+        "schemaVersion": MANIFEST_SCHEMA_VERSION,
+        "processorName": MANIFEST_PROCESSOR_NAME,
+        "processorVersion": SCRIPT_VERSION,
+        "generatedUtc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generationMode": generation_mode,
+        "outputs": [_manifest_measure_output(kind, path) for kind, path in outputs],
+    }
+    manifest["integrityDigest"] = hashlib.sha256(
+        _manifest_canonical_text(manifest).encode("utf-8")
+    ).hexdigest().upper()
+
+    final_path = os.path.abspath(manifest_path)
+    parent = os.path.dirname(final_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    tmp_path = f"{final_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(manifest, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        with open(tmp_path, "r", encoding="utf-8") as handle:
+            json.load(handle)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp_path, final_path)
+    return final_path
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # CLI ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -2676,7 +2932,7 @@ EXAMPLES
         --output-dir ./output
 
 
-OUTPUT (rollup mode, both layouts produce the same three files):
+OUTPUT (rollup mode, both layouts produce the same four files):
 
     <stem>_Rollup_<timestamp>.csv         13 cols  -> M365Usage table
     <stem>_UserStats_<timestamp>.csv      40 cols  -> UserStats table
@@ -2739,6 +2995,15 @@ ADVANCED
         metavar="DIR",
         default=None,
         help="Directory for output files. Default: same folder as the (first) input.",
+    )
+    output.add_argument(
+        "--output-manifest",
+        metavar="JSON",
+        default=None,
+        help=(
+            "Write a JSON manifest describing the four completed rollup outputs "
+            "and their integrity measurements."
+        ),
     )
 
     # ── Optional behaviour flags ─────────────────────────────────────────
@@ -2824,6 +3089,20 @@ ADVANCED
     )
 
     args = parser.parse_args()
+
+    if args.output_manifest:
+        if args.debug_events:
+            parser.error("--output-manifest is not available with --debug-events.")
+        if args.skip_precompute or args.no_session_stats:
+            parser.error(
+                "--output-manifest requires all four rollup outputs and cannot be "
+                "combined with --skip-precompute/--no-userstats or --no-session-stats."
+            )
+        if args.rebuild_sidecars_from_rollup:
+            parser.error(
+                "--output-manifest is not available when regenerating sidecars "
+                "from an existing rollup."
+            )
 
     global _DEIDENTIFY
     _DEIDENTIFY = bool(args.deidentify)
@@ -2937,13 +3216,45 @@ ADVANCED
             quiet=args.quiet,
             session_stats_csv=session_stats_path,
         )
-        exit_code = 1 if stats["parse_errors"] > stats["input_records"] * 0.1 else 0
+        exit_code = EXIT_RESIDUAL_REJECTS if stats["rejected_records"] > 0 else 0
+        if exit_code != 0:
+            print(
+                f"ERROR: {stats['rejected_records']:,} input record(s) were rejected and are "
+                f"listed in full at {stats['reject_manifest_path']}. The candidate outputs are "
+                f"preserved but are NOT published.",
+                file=sys.stderr,
+            )
 
         if not args.skip_precompute:
             write_userstats_files(
                 rollup_path, userstats_path, session_path, args.quiet,
                 session_stats_csv_path=session_stats_path,
             )
+
+        if args.output_manifest:
+            if exit_code != 0:
+                print(
+                    "ERROR: output manifest not written: the rollup did not complete "
+                    "successfully.",
+                    file=sys.stderr,
+                )
+            else:
+                try:
+                    written = write_output_manifest(
+                        args.output_manifest,
+                        "rollup",
+                        [
+                            ("Rollup", rollup_path),
+                            ("UserStats", userstats_path),
+                            ("SessionCohort", session_path),
+                            ("SessionStats", session_stats_path),
+                        ],
+                    )
+                    if not args.quiet:
+                        print(f"[Manifest]      4 outputs \u2192 {Path(written).name}")
+                except Exception as exc:
+                    print(f"ERROR: output manifest generation failed: {exc}", file=sys.stderr)
+                    exit_code = 1
     else:
         stats = run_explosion(
             input_csv=input_paths[0],

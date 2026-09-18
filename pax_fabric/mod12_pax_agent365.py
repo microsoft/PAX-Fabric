@@ -26,9 +26,11 @@ Hard dependencies: pax_auth (delegated auth context), pax_graph_api (HTTP client
 """
 
 import csv
+import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -59,6 +61,8 @@ class Agent365State:
     pre_auth_completed: bool = False
     had_gaps: bool = False                       # PS: $script:Agent365HadGaps
     recovery_leafs: List[str] = field(default_factory=list)  # PS: $script:Agent365RecoveryLeafs
+    list_graph_version: str = ''
+    detail_graph_version: str = ''
 
 
 # =============================================================================
@@ -123,7 +127,9 @@ AGENT365_COLUMNS = [
 # Function 1: get_agent365_packages_uri (PS: Get-Agent365PackagesUri)
 # =============================================================================
 
-def get_agent365_packages_uri(package_id: str = '') -> str:
+def get_agent365_packages_uri(
+    package_id: str = '', graph_version: str = 'v1.0'
+) -> str:
     """Build the Agent 365 Packages API URI.
 
     PS signature:
@@ -135,7 +141,10 @@ def get_agent365_packages_uri(package_id: str = '') -> str:
     Returns:
         Full Graph API URI for packages (base or specific package).
     """
-    base = 'https://graph.microsoft.com/beta/copilot/admin/catalog/packages'
+    base = (
+        f'https://graph.microsoft.com/{graph_version}'
+        '/copilot/admin/catalog/packages'
+    )
     if not package_id or not package_id.strip():
         return base
     return base + '/' + url_quote(package_id, safe='')
@@ -201,15 +210,25 @@ def test_agent365_frontier_access(
     if state.frontier_available is not None:
         return state.frontier_available
 
-    uri = get_agent365_packages_uri() + '?$top=1'
+    last_error: Exception | None = None
+    if graph_request_fn is None:
+        last_error = RuntimeError("No graph_request_fn provided")
+    else:
+        for graph_version in ('v1.0', 'beta'):
+            try:
+                graph_request_fn(
+                    'GET',
+                    get_agent365_packages_uri(graph_version=graph_version) + '?$top=1',
+                )
+                state.list_graph_version = graph_version
+                state.detail_graph_version = graph_version
+                state.frontier_available = True
+                return True
+            except Exception as ex:
+                last_error = ex
 
+    e = last_error or RuntimeError("Agent 365 version negotiation failed")
     try:
-        if graph_request_fn is None:
-            raise RuntimeError("No graph_request_fn provided")
-        graph_request_fn('GET', uri)
-        state.frontier_available = True
-        return True
-    except Exception as e:
         status = _extract_status_code(e)
         if status in (401, 403, 404):
             logger.warning("")
@@ -242,6 +261,9 @@ def test_agent365_frontier_access(
             logger.error(
                 f"  Agent 365 probe failed (HTTP {status}): {e}"
             )
+        state.frontier_available = False
+        return False
+    except Exception:
         state.frontier_available = False
         return False
 
@@ -397,7 +419,9 @@ def get_agent365_packages(
         logger.warning("  Agent 365 list skipped: no graph_request_fn provided")
         return result
 
-    uri: Optional[str] = get_agent365_packages_uri()
+    uri: Optional[str] = get_agent365_packages_uri(
+        graph_version=state.list_graph_version or 'v1.0'
+    )
     seen_links: set = set()
 
     while uri:
@@ -454,6 +478,7 @@ def get_agent365_packages(
 
 def get_agent365_package_detail(
     package_id: str,
+    state: Agent365State | None = None,
     graph_request_fn: Optional[Callable] = None,
     refresh_token_fn: Optional[Callable] = None,
 ) -> Agent365DetailResult:
@@ -477,7 +502,10 @@ def get_agent365_package_detail(
         out.reason = 'NoGraphRequestFn'
         return out
 
-    uri = get_agent365_packages_uri(package_id)
+    uri = get_agent365_packages_uri(
+        package_id,
+        graph_version=(state.detail_graph_version if state else '') or 'v1.0',
+    )
 
     if refresh_token_fn:
         try:
@@ -506,6 +534,173 @@ def get_agent365_package_detail(
     out.detail = resp
     out.reason = 'OK'
     return out
+
+
+def get_agent365_package_details_batched(
+    package_ids: List[str],
+    state: Agent365State,
+    graph_request_fn: Optional[Callable],
+    refresh_token_fn: Optional[Callable] = None,
+    batch_size: int = 20,
+    max_parallel: int = 4,
+) -> tuple[Dict[str, Agent365DetailResult], int, bool]:
+    results: Dict[str, Agent365DetailResult] = {}
+    if not package_ids:
+        return results, 0, False
+    if graph_request_fn is None:
+        return {
+            package_id: Agent365DetailResult(
+                outcome='DetailFailed', reason='NoGraphRequestFn'
+            )
+            for package_id in package_ids
+        }, 0, True
+
+    graph_version = state.detail_graph_version or state.list_graph_version or 'v1.0'
+    batch_uri = f'https://graph.microsoft.com/{graph_version}/$batch'
+    batch_size = max(1, min(20, int(batch_size)))
+    max_parallel = max(1, min(8, int(max_parallel)))
+    package_groups = [
+        package_ids[offset:offset + batch_size]
+        for offset in range(0, len(package_ids), batch_size)
+    ]
+    batch_count = len(package_groups)
+    transport_failed = False
+
+    def fetch_group(
+        package_slice: List[str],
+    ) -> tuple[Dict[str, Agent365DetailResult], bool]:
+        group_results: Dict[str, Agent365DetailResult] = {}
+        group_transport_failed = False
+        if refresh_token_fn:
+            try:
+                refresh_token_fn()
+            except Exception:
+                pass
+        request_ids = {str(index): package_id for index, package_id in enumerate(package_slice)}
+        payload = {
+            'requests': [
+                {
+                    'id': request_id,
+                    'method': 'GET',
+                    'url': (
+                        f'/{graph_version}/copilot/admin/catalog/packages/'
+                        f'{url_quote(package_id, safe="")}'
+                    ),
+                }
+                for request_id, package_id in request_ids.items()
+            ]
+        }
+        try:
+            response = graph_request_fn('POST', batch_uri, payload) or {}
+        except Exception as ex:
+            group_transport_failed = True
+            for package_id in package_slice:
+                group_results[package_id] = Agent365DetailResult(
+                    outcome='DetailFailed', reason=str(ex)
+                )
+            return group_results, group_transport_failed
+
+        seen: set[str] = set()
+        for subresponse in response.get('responses') or []:
+            request_id = str(subresponse.get('id', ''))
+            package_id = request_ids.get(request_id)
+            if package_id is None:
+                continue
+            seen.add(package_id)
+            status = int(subresponse.get('status', 0) or 0)
+            body = subresponse.get('body')
+            if 200 <= status < 300 and isinstance(body, dict):
+                group_results[package_id] = Agent365DetailResult(
+                    outcome='Success', detail=body, reason='OK'
+                )
+            else:
+                outcome = 'FailedDependency' if status == 424 else 'DetailFailed'
+                group_results[package_id] = Agent365DetailResult(
+                    outcome=outcome, reason=f'HTTP {status}'
+                )
+        for package_id in package_slice:
+            if package_id not in seen:
+                group_transport_failed = True
+                group_results[package_id] = Agent365DetailResult(
+                    outcome='DetailFailed', reason='MissingBatchSubresponse'
+                )
+        return group_results, group_transport_failed
+
+    if len(package_groups) == 1 or max_parallel == 1:
+        group_outcomes = [fetch_group(group) for group in package_groups]
+    else:
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            futures = [executor.submit(fetch_group, group) for group in package_groups]
+            group_outcomes = [future.result() for future in futures]
+
+    for group_results, group_failed in group_outcomes:
+        results.update(group_results)
+        transport_failed = transport_failed or group_failed
+
+    return results, batch_count, transport_failed
+
+
+def _agent365_change_stamp(package: Dict[str, Any]) -> str:
+    for field_name in ('lastModifiedDateTime', 'lastUpdatedDateTime'):
+        value = package.get(field_name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ''
+
+
+def select_agent365_changed_packages(
+    package_ids: List[str],
+    list_entries: Dict[str, Dict[str, Any]],
+    store: Dict[str, Dict[str, Any]],
+) -> tuple[List[str], List[str], Dict[str, Dict[str, Any]], Dict[str, str]]:
+    changed: List[str] = []
+    reused: List[str] = []
+    reused_details: Dict[str, Dict[str, Any]] = {}
+    stamps: Dict[str, str] = {}
+    for package_id in package_ids:
+        canonical_id = package_id.strip().lower()
+        stamp = _agent365_change_stamp(list_entries.get(package_id, {}))
+        stamps[package_id] = stamp
+        cached = store.get(canonical_id) or {}
+        detail = cached.get('detail')
+        if stamp and cached.get('changeStamp') == stamp and isinstance(detail, dict):
+            reused.append(package_id)
+            reused_details[package_id] = detail
+        else:
+            changed.append(package_id)
+    return changed, reused, reused_details, stamps
+
+
+def import_agent365_reuse_store(path: str | None) -> Dict[str, Dict[str, Any]]:
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+        entries = payload.get('entries') if isinstance(payload, dict) else None
+        return entries if isinstance(entries, dict) else {}
+    except Exception:
+        return {}
+
+
+def export_agent365_reuse_store(
+    path: str | None, store: Dict[str, Dict[str, Any]]
+) -> bool:
+    if not path:
+        return False
+    temporary_path = path + '.writing'
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(temporary_path, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump({'schemaVersion': 1, 'entries': store}, handle, separators=(',', ':'))
+        os.replace(temporary_path, path)
+        return True
+    except Exception:
+        try:
+            os.remove(temporary_path)
+        except OSError:
+            pass
+        return False
 
 
 
@@ -1172,6 +1367,30 @@ def save_agent365_recovery_csv(
         return None
 
 
+AGENT365_STATUS_COLUMNS = [
+    'TitleId', 'ListCompleteness', 'DetailCompleteness', 'RowBuildStatus'
+]
+
+
+def save_agent365_status_csv(
+    entries: List[Dict[str, Any]],
+    output_path: str,
+    run_timestamp: str = '',
+) -> str:
+    if not run_timestamp:
+        run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    os.makedirs(output_path, exist_ok=True)
+    status_path = os.path.join(output_path, f'Agent365_Status_{run_timestamp}.csv')
+    with open(status_path, 'w', newline='', encoding='utf-8-sig') as handle:
+        writer = csv.DictWriter(handle, fieldnames=AGENT365_STATUS_COLUMNS)
+        writer.writeheader()
+        for entry in entries:
+            writer.writerow({
+                column: entry.get(column, '') for column in AGENT365_STATUS_COLUMNS
+            })
+    return status_path
+
+
 # =============================================================================
 # Function 11: add_agent365_workbook_tab (PS: Add-Agent365WorkbookTab)
 # =============================================================================
@@ -1240,6 +1459,7 @@ def invoke_agent365_phase(
     now_fn: Optional[Callable] = None,
     append_agent365_info: Optional[str] = None,
     workbook_path: Optional[str] = None,
+    reuse_store_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Top-level orchestrator for the Agent 365 phase.
 
@@ -1260,6 +1480,11 @@ def invoke_agent365_phase(
         'SkippedNoId': 0,
         'Reconciled': True,
         'ListComplete': True,
+        'DetailComplete': True,
+        'DetailRequested': 0,
+        'DetailReused': 0,
+        'BatchCount': 0,
+        'StatusPath': None,
         'RecoveryPath': None,
         'ListReason': '',
     }
@@ -1330,35 +1555,62 @@ def invoke_agent365_phase(
         list_result.page_count,
     )
 
-    # Fetch details and build rows with per-package outcome classification.
+    # Fetch details in bounded Graph batches, then build rows in listing order.
     rows: List[Dict[str, Any]] = []
     detail_failed = 0
     failed_dependency = 0
     row_build_failed = 0
     skipped_no_id = 0
+    status_entries: List[Dict[str, Any]] = []
 
-    for idx, p in enumerate(list_result.packages, 1):
+    identified_packages = []
+    for p in list_result.packages:
         pid = p.get('id') or p.get('titleId')
         if not pid:
             skipped_no_id += 1
             continue
+        identified_packages.append((str(pid), p))
 
-        detail_result = get_agent365_package_detail(
-            pid,
-            graph_request_fn=graph_request_fn,
-            refresh_token_fn=refresh_token_fn,
+    package_ids = [package_id for package_id, _ in identified_packages]
+    list_entries = dict(identified_packages)
+    reuse_store = import_agent365_reuse_store(reuse_store_path)
+    changed_ids, reused_ids, reused_details, change_stamps = (
+        select_agent365_changed_packages(package_ids, list_entries, reuse_store)
+    )
+    detail_results, batch_count, batch_failed = get_agent365_package_details_batched(
+        changed_ids,
+        state,
+        graph_request_fn,
+        refresh_token_fn=refresh_token_fn,
+    )
+    for package_id in reused_ids:
+        detail_results[package_id] = Agent365DetailResult(
+            outcome='Success', detail=reused_details[package_id], reason='Reused'
         )
 
-        if detail_result.outcome == 'FailedDependency':
-            failed_dependency += 1
-            continue
-        if detail_result.outcome != 'Success' or detail_result.detail is None:
-            detail_failed += 1
-            continue
+    for idx, (pid, p) in enumerate(identified_packages, 1):
 
+        detail_result = detail_results.get(
+            pid,
+            Agent365DetailResult(
+                outcome='DetailFailed', reason='MissingDetailOutcome'
+            ),
+        )
+
+        detail_payload: Dict[str, Any] = dict(p)
+        if detail_result.outcome == 'Success' and detail_result.detail is not None:
+            detail_payload.update(detail_result.detail)
+            detail_label = 'Reused' if detail_result.reason == 'Reused' else 'Retrieved'
+        else:
+            detail_failed += 1
+            detail_label = detail_result.outcome
+            if detail_result.outcome == 'FailedDependency':
+                failed_dependency += 1
+
+        row_label = 'Built'
         try:
             row = convert_to_agent365_row(
-                detail_result.detail,
+                detail_payload,
                 state,
                 audit_enrichment=audit_enrichment,
                 graph_request_fn=graph_request_fn,
@@ -1366,9 +1618,16 @@ def invoke_agent365_phase(
             rows.append(row)
         except Exception as e:  # noqa: BLE001
             row_build_failed += 1
+            row_label = 'BuildFailed'
             logger.warning(
                 "  WARNING: Row build failed for package '%s': %s", pid, e,
             )
+        status_entries.append({
+            'TitleId': pid,
+            'ListCompleteness': 'Complete' if list_result.complete else 'Incomplete',
+            'DetailCompleteness': detail_label,
+            'RowBuildStatus': row_label,
+        })
 
         if idx % 25 == 0:
             logger.info(
@@ -1376,8 +1635,12 @@ def invoke_agent365_phase(
             )
 
     emitted = len(rows)
-    accounted = emitted + detail_failed + failed_dependency + row_build_failed + skipped_no_id
+    accounted = emitted + row_build_failed + skipped_no_id
     reconciled = (accounted == listed_count)
+    detail_complete = not batch_failed and detail_failed == 0
+    status_path = save_agent365_status_csv(
+        status_entries, output_path, run_timestamp
+    )
 
     logger.info(
         "  Agent 365 reconciliation: Listed=%d Emitted=%d DetailFailed=%d "
@@ -1398,6 +1661,11 @@ def invoke_agent365_phase(
         'SkippedNoId': skipped_no_id,
         'Reconciled': reconciled,
         'ListComplete': list_result.complete,
+        'DetailComplete': detail_complete,
+        'DetailRequested': len(changed_ids),
+        'DetailReused': len(reused_ids),
+        'BatchCount': batch_count,
+        'StatusPath': status_path,
         'RecoveryPath': None,
         'ListReason': list_result.reason,
     }
@@ -1415,6 +1683,28 @@ def invoke_agent365_phase(
     # Complete listing but some packages could not be emitted => partial gap.
     if detail_failed or failed_dependency or row_build_failed or skipped_no_id:
         state.had_gaps = True
+
+    if not reconciled or row_build_failed or skipped_no_id:
+        recovery = save_agent365_recovery_csv(
+            rows, state, output_path, run_timestamp,
+        )
+        result_dict['RecoveryPath'] = recovery
+        return result_dict
+
+    for package_id, detail_result in detail_results.items():
+        stamp = change_stamps.get(package_id, '')
+        if (
+            stamp and detail_result.outcome == 'Success'
+            and isinstance(detail_result.detail, dict)
+        ):
+            reuse_store[package_id.strip().lower()] = {
+                'changeStamp': stamp,
+                'detail': detail_result.detail,
+            }
+    if reuse_store_path and not export_agent365_reuse_store(
+        reuse_store_path, reuse_store
+    ):
+        logger.warning("  Agent 365 reuse store could not be persisted")
 
     csv_path = export_agent365_csv(
         rows,

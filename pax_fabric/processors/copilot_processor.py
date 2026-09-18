@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Purview CopilotInteraction Processor v4.2.1
+Purview CopilotInteraction Processor v4.2.2
 -------------------------------------------
 Two-input / two-output preprocessor for the AI Business Value Dashboard
 (ValueLens / AIBV) and AI-in-One (AIO) Rollup PBIPs.
@@ -65,13 +65,14 @@ import csv
 import functools
 import hashlib
 import hmac
+import json
 import os
 import re
 import sqlite3
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -105,7 +106,76 @@ except ImportError:
     _JSON_ENGINE = "json (stdlib)"
 
 
-SCRIPT_VERSION = "4.2.1"
+def json_loads_rescue(value: str | bytes) -> Any:
+    """Retry optimized-parser failures with the standard library parser."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    return json.loads(value)
+
+
+SCRIPT_VERSION = "4.2.2"
+REJECT_MANIFEST_SCHEMA = "pax-reject-manifest/1"
+EXIT_RESIDUAL_REJECTS = 40
+
+
+class ResidualRejectError(RuntimeError):
+    pass
+
+
+def reject_row_digest(row: dict[str, Any]) -> str:
+    digest = hashlib.sha256()
+    for key in sorted(row.keys(), key=lambda item: "" if item is None else str(item)):
+        digest.update(str(key).encode("utf-8", "replace"))
+        digest.update(b"\x1e")
+        value = row.get(key)
+        digest.update(("" if value is None else str(value)).encode("utf-8", "replace"))
+        digest.update(b"\x1f")
+    return digest.hexdigest().upper()
+
+
+def reject_manifest_path_for(output_path: str) -> str:
+    target = Path(output_path)
+    return str(target.with_name(target.stem + "_Rejects.jsonl"))
+
+
+class RejectManifest:
+    """Stream every rejected row's ordinal, reason, and digest to disk."""
+
+    def __init__(self, path: str, processor: str, processor_version: str) -> None:
+        self.path = path
+        self.count = 0
+        self._processor = processor
+        self._processor_version = processor_version
+        self._handle: Any = None
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def record(self, ordinal: int, reason: str, digest: str) -> None:
+        if self._handle is None:
+            self._handle = open(self.path, "w", encoding="utf-8", newline="\n")
+            self._write({
+                "schema": REJECT_MANIFEST_SCHEMA,
+                "processor": self._processor,
+                "processorVersion": self._processor_version,
+            })
+        self.count += 1
+        self._write({
+            "ordinal": int(ordinal),
+            "reason": reason,
+            "sourceRowDigest": digest,
+        })
+
+    def _write(self, payload: dict[str, Any]) -> None:
+        self._handle.write(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        self._handle.write("\n")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
 
 # ---------------------------------------------------------------------------
 # Output schemas — TWO PROFILES
@@ -683,7 +753,7 @@ def resource_rows(ced: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def is_copilot_interaction(audit_data: dict[str, Any], raw_row: dict[str, Any]) -> bool:
-    # v4.2.1 parity: exact match on Operation only (upstream dropped the
+    # v4.2.2 parity: exact match on Operation only (upstream dropped the
     # RecordType=261 fallback that v3.1.0 had).
     operation = to_text(
         safe_get(audit_data, "Operation")
@@ -1454,13 +1524,97 @@ def detect_department_column(headers: list[str]) -> str | None:
     return None
 
 
+_UNKNOWN_EFFECTIVE_DATE = "Unknown"
+
+
+def temporal_effective_sort_key(effective_date: str) -> tuple[int, str]:
+    return (0, "") if effective_date == _UNKNOWN_EFFECTIVE_DATE else (1, effective_date)
+
+
+def temporal_state_key(
+    normalized_identity: str, has_license: str, license_status: str
+) -> str:
+    fingerprint = hashlib.sha256(
+        (has_license + "\x1f" + license_status).encode("utf-8")
+    ).hexdigest()
+    return normalized_identity + "\x1f" + fingerprint
+
+
+def load_user_history(
+    path: str | None, user_key_map: dict[str, int]
+) -> dict[str, list[dict[str, str]]]:
+    states: dict[str, list[dict[str, str]]] = {}
+    if not path:
+        return states
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {
+            "PersonId_Normalized", "Has license", "License Status",
+            "EffectiveDate", "UserKey",
+        }
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError("UserHistory target does not carry the required history columns")
+        for row in reader:
+            identity = (row.get("PersonId_Normalized") or "").strip().lower()
+            effective = (row.get("EffectiveDate") or "").strip()
+            has_license = (row.get("Has license") or "").strip()
+            license_status = (row.get("License Status") or "").strip()
+            key_text = (row.get("UserKey") or "").strip()
+            if not identity or not effective or not key_text:
+                raise ValueError("UserHistory target contains an incomplete state row")
+            if effective != _UNKNOWN_EFFECTIVE_DATE:
+                datetime.strptime(effective, "%Y-%m-%d")
+            key = int(key_text)
+            if key < 1:
+                raise ValueError("UserHistory target contains an invalid UserKey")
+            allocation_key = temporal_state_key(identity, has_license, license_status)
+            prior = user_key_map.get(allocation_key)
+            if prior is not None and prior != key:
+                raise ValueError("UserHistory target maps one state to multiple UserKeys")
+            user_key_map[allocation_key] = key
+            states.setdefault(identity, []).append({
+                "EffectiveDate": effective,
+                "Has license": has_license,
+                "License Status": license_status,
+                "UserKey": str(key),
+            })
+    for identity_states in states.values():
+        identity_states.sort(
+            key=lambda item: temporal_effective_sort_key(item["EffectiveDate"])
+        )
+    return states
+
+
+def resolve_user_history_state(
+    states: dict[str, list[dict[str, str]]],
+    normalized_identity: str,
+    event_date: str,
+) -> dict[str, str] | None:
+    selected = None
+    unknown_state = None
+    earliest_dated = None
+    for state in states.get(normalized_identity, []):
+        if state["EffectiveDate"] == _UNKNOWN_EFFECTIVE_DATE:
+            unknown_state = state
+            continue
+        if earliest_dated is None:
+            earliest_dated = state
+        if state["EffectiveDate"] > event_date:
+            break
+        selected = state
+    return selected or earliest_dated or unknown_state
+
+
 def load_entra_and_write_users(
     entra_csv: str,
     users_out_csv: str,
     user_key_map: dict[str, int],
     quiet: bool = False,
     profile: str = "aibv",
-) -> dict[str, dict[str, str]]:
+    user_history: bool = False,
+    history_effective_date: str = "",
+    history_states: dict[str, list[dict[str, str]]] | None = None,
+) -> dict[str, Any]:
     """
     Read the Entra CSV, write the Users dim CSV (with PBIP-compatible renames +
     precomputed License Status + UserKey INT surrogate + org/manager hierarchy
@@ -1486,16 +1640,16 @@ def load_entra_and_write_users(
       only the filler for level slots deeper than a user's own level.
 
     NOTE (pax_fabric port scope): ``profile`` is accepted for call-site parity
-    with the v4.2.1 dual-profile processor but is NOT yet used to select a
+    with the v4.2.2 dual-profile processor but is NOT yet used to select a
     3-file licensing input — that remains deferred (see module docstring).
     The AIO-only header aliasing IS implemented: ``displayName``/``country``
     are RENAMED to ``DisplayName``/``Country`` (case-only rename, dropping the
     lowercase duplicate), while ``mail`` -> ``Email`` is an ADDITIVE alias
     (``mail`` is retained unchanged; ``Email`` is a separate column populated
     from it). Both mirror the PowerShell embedded processor exactly.
-    Deidentification of Entra identity columns is likewise deferred here;
-    only the fact-row values produced by explode_record are deidentified in
-    this port.
+    When deidentification is enabled, Entra identity columns are transformed
+    before normalized join keys and hierarchy links are derived, matching the
+    embedded PowerShell processor.
     """
     with open(entra_csv, "r", encoding="utf-8-sig", newline="") as fin:
         # Sniff via a generous quote-aware reader; encoding="utf-8-sig" eats BOM if present.
@@ -1552,6 +1706,8 @@ def load_entra_and_write_users(
         # superseded by an already canonical header supplied by the source).
         renamed_headers = [h for h in renamed_headers if h is not None]
         injected = ["UserKey", "PersonId_Normalized", "License Status", "TotalEmployees"]
+        if user_history:
+            injected.append("EffectiveDate")
         if "Has license" not in renamed_headers:
             renamed_headers.append("Has license")
         for inj in injected:
@@ -1585,23 +1741,40 @@ def load_entra_and_write_users(
     for src_row in rows:
         pid = src_row.get(upn_col, "") if (upn_col and upn_col != "PersonId") else src_row.get("PersonId", "")
         pid = "" if pid is None else str(pid)
+        if _DEIDENTIFY:
+            pid = deid_upn(pid)
         pid_norm = pid.strip().lower()
         if not pid_norm:
             continue
-        uk = mint_user_key(user_key_map, pid_norm)
+        source_license = src_row.get(has_license_col, "") if has_license_col else ""
+        normalized_source_license = normalize_has_license(source_license)
+        source_status = compute_license_status(normalized_source_license)
+        allocation_key = (
+            temporal_state_key(pid_norm, normalized_source_license, source_status)
+            if user_history else pid_norm
+        )
+        uk = mint_user_key(user_key_map, allocation_key)
         uk_by_upn[pid_norm] = uk
         rid = src_row.get("id", "")
         rid = "" if rid is None else str(rid)
+        if _DEIDENTIFY:
+            rid = deid_guid(rid)
         rid_norm = rid.strip().lower()
         if rid_norm:
             uk_by_id[rid_norm] = uk
         mid = src_row.get("manager_id", "")
         mid = "" if mid is None else str(mid)
+        if _DEIDENTIFY:
+            mid = deid_guid(mid)
         mupn = src_row.get("manager_userPrincipalName", "")
         mupn = "" if mupn is None else str(mupn)
+        if _DEIDENTIFY:
+            mupn = deid_upn(mupn)
         mgr_ptr[uk] = (mid.strip().lower(), mupn.strip().lower())
         dn = src_row.get("displayName", "")
         dn = "" if dn is None else str(dn)
+        if _DEIDENTIFY:
+            dn = deid_name(dn)
         name_by_uk[uk] = dn
     hier_by_uk = _build_org_hierarchy(uk_by_id, uk_by_upn, mgr_ptr, name_by_uk)
 
@@ -1635,17 +1808,50 @@ def load_entra_and_write_users(
                         _fb = src_row.get(_srcname, "")
                         out_row[_canon] = "" if _fb is None else str(_fb)
 
+            # Transform Entra identities before deriving PersonId_Normalized
+            # so the Users lookup uses the same tokens as deidentified facts.
+            if _DEIDENTIFY:
+                if "PersonId" in out_row:
+                    out_row["PersonId"] = deid_upn(out_row["PersonId"])
+                if "displayName" in out_row:
+                    out_row["displayName"] = deid_name(out_row["displayName"])
+                if "DisplayName" in out_row:
+                    out_row["DisplayName"] = deid_name(out_row["DisplayName"])
+                if "Email" in out_row:
+                    out_row["Email"] = deid_upn(out_row["Email"])
+                if "mail" in out_row:
+                    out_row["mail"] = deid_upn(out_row["mail"])
+                if "givenName" in out_row:
+                    out_row["givenName"] = deid_name(out_row["givenName"])
+                if "surname" in out_row:
+                    out_row["surname"] = deid_name(out_row["surname"])
+                if "UserName" in out_row:
+                    out_row["UserName"] = deid_upn(out_row["UserName"])
+                if "employeeId" in out_row:
+                    out_row["employeeId"] = deid_token(out_row["employeeId"])
+                if "onPremisesImmutableId" in out_row:
+                    out_row["onPremisesImmutableId"] = deid_token(out_row["onPremisesImmutableId"])
+                if "proxyAddresses_Primary" in out_row:
+                    out_row["proxyAddresses_Primary"] = deid_proxy(out_row["proxyAddresses_Primary"])
+                if "proxyAddresses_All" in out_row:
+                    out_row["proxyAddresses_All"] = deid_proxy(out_row["proxyAddresses_All"])
+                if "id" in out_row:
+                    out_row["id"] = deid_guid(out_row["id"])
+                if "manager_id" in out_row:
+                    out_row["manager_id"] = deid_guid(out_row["manager_id"])
+                if "manager_userPrincipalName" in out_row:
+                    out_row["manager_userPrincipalName"] = deid_upn(out_row["manager_userPrincipalName"])
+                if "manager_displayName" in out_row:
+                    out_row["manager_displayName"] = deid_name(out_row["manager_displayName"])
+                if "manager_mail" in out_row:
+                    out_row["manager_mail"] = deid_upn(out_row["manager_mail"])
+                if "ManagerID" in out_row:
+                    out_row["ManagerID"] = deid_guid(out_row["ManagerID"])
+
             # PersonId_Normalized
             person_id = out_row.get("PersonId", "")
             person_id_norm = person_id.strip().lower() if person_id else ""
             out_row["PersonId_Normalized"] = person_id_norm
-
-            # UserKey (INT surrogate; assigned in Entra-file order)
-            if person_id_norm:
-                user_key = mint_user_key(user_key_map, person_id_norm)
-                out_row["UserKey"] = str(user_key)
-            else:
-                out_row["UserKey"] = ""
 
             # License Status (mirrors PBIP DAX exactly).
             # We also normalize Has license to canonical TRUE/FALSE so existing
@@ -1661,6 +1867,19 @@ def load_entra_and_write_users(
                 pax_unlicensed += 1
             out_row["Has license"] = normalized_has_license
             out_row["License Status"] = compute_license_status(normalized_has_license)
+
+            allocation_key = (
+                temporal_state_key(
+                    person_id_norm, out_row["Has license"], out_row["License Status"]
+                )
+                if user_history else person_id_norm
+            )
+            out_row["UserKey"] = (
+                str(mint_user_key(user_key_map, allocation_key))
+                if person_id_norm else ""
+            )
+            if user_history:
+                out_row["EffectiveDate"] = history_effective_date
 
             # TotalEmployees (matches M-code: row count repeated per row)
             out_row["TotalEmployees"] = str(total_rows)
@@ -1685,10 +1904,37 @@ def load_entra_and_write_users(
             # Build fact-lookup dict (dedupe on normalized key, last-wins matches
             # M-code Table.Distinct behavior on the licensed-users path).
             if person_id_norm:
-                user_lookup[person_id_norm] = {
-                    "Has license": normalized_has_license,
-                    "License Status": out_row["License Status"],
-                }
+                if user_history:
+                    state_by_values = {
+                        (
+                            item["EffectiveDate"], item["Has license"],
+                            item["License Status"],
+                        ): item
+                        for item in (history_states or {}).get(person_id_norm, [])
+                    }
+                    current_state = {
+                        "EffectiveDate": history_effective_date,
+                        "Has license": normalized_has_license,
+                        "License Status": out_row["License Status"],
+                        "UserKey": out_row["UserKey"],
+                    }
+                    state_by_values[
+                        (
+                            history_effective_date, normalized_has_license,
+                            out_row["License Status"],
+                        )
+                    ] = current_state
+                    user_lookup[person_id_norm] = sorted(
+                        state_by_values.values(),
+                        key=lambda item: temporal_effective_sort_key(
+                            item["EffectiveDate"]
+                        ),
+                    )
+                else:
+                    user_lookup[person_id_norm] = {
+                        "Has license": normalized_has_license,
+                        "License Status": out_row["License Status"],
+                    }
                 seen_normalized_keys.add(person_id_norm)
 
     if not quiet:
@@ -1741,10 +1987,11 @@ def mint_user_key(user_key_map: dict[str, int], normalized_key: str) -> int:
 
 def explode_record(
     audit_data: dict[str, Any],
-    user_lookup: dict[str, dict[str, str]],
+    user_lookup: dict[str, Any],
     user_key_map: dict[str, int],
     thread_key_map: dict[str, int],
     profile: str,
+    user_history: bool = False,
 ) -> list[tuple[tuple[str, ...], str, dict[str, Any], bool, str]]:
     creation_time_raw = audit_data.get("CreationTime")
     creation_time_raw_str = to_text(creation_time_raw).strip()
@@ -1779,10 +2026,6 @@ def explode_record(
     # hashed) Users dim.
     audit_user_id_raw = deid_upn(audit_user_id_raw)
     audit_user_id_norm = normalize_user_id(audit_user_id_raw)
-    if audit_user_id_norm:
-        user_key = mint_user_key(user_key_map, audit_user_id_norm)
-    else:
-        user_key = ""
     # ThreadId INT surrogate. deid_guid is a no-op unless --deidentify; under
     # --deidentify it returns a deterministic, format-preserving token so the
     # INT-surrogate keying, the ThreadId_Raw output column, and cross-run
@@ -1799,7 +2042,28 @@ def explode_record(
     model_name_str = to_text(first_model.get("ModelName")) if first_model else ""
 
     # User-level lookups (constant per record)
-    user_rec = user_lookup.get(audit_user_id_norm) or {}
+    if user_history:
+        user_rec = resolve_user_history_state(
+            user_lookup, audit_user_id_norm, creation_date_str
+        ) or {
+            "EffectiveDate": _UNKNOWN_EFFECTIVE_DATE,
+            "Has license": "Unknown",
+            "License Status": "Unknown",
+        }
+        user_key = (
+            user_rec.get("UserKey")
+            or mint_user_key(
+                user_key_map,
+                temporal_state_key(audit_user_id_norm, "Unknown", "Unknown"),
+            )
+            if audit_user_id_norm else ""
+        )
+    else:
+        user_key = (
+            mint_user_key(user_key_map, audit_user_id_norm)
+            if audit_user_id_norm else ""
+        )
+        user_rec = user_lookup.get(audit_user_id_norm) or {}
     has_license_raw = user_rec.get("Has license", "")
     license_status = user_rec.get("License Status") or compute_license_status(has_license_raw)
     environment = compute_environment(profile, has_license_raw, agent_name, agent_id, app_host_str)
@@ -2175,6 +2439,9 @@ def _run_processor_with_store(
     seed_thread_map_path: str | None = None,
     seed_userkey_map_path: str | None = None,
     state_store: SQLiteStateStore | None = None,
+    user_history: bool = False,
+    history_effective_date: str = "",
+    user_history_csv: str | None = None,
 ) -> dict[str, Any]:
     start_time = time.perf_counter()
     stats: dict[str, Any] = {
@@ -2182,8 +2449,14 @@ def _run_processor_with_store(
         "skipped_non_copilot": 0,
         "output_rows": 0,
         "errors": 0,
+        "reject_manifest_path": None,
         "unmatched_users": 0,
     }
+    reject_manifest = RejectManifest(
+        reject_manifest_path_for(fact_out_csv),
+        "CopilotInteraction",
+        SCRIPT_VERSION,
+    )
 
     profile_label = "ValueLens" if profile == "aibv" else "AI-in-One"
 
@@ -2239,8 +2512,16 @@ def _run_processor_with_store(
     if seed_mid_map_path:
         _load_int_seed(seed_mid_map_path, mid_to_int)
 
+    history_states = load_user_history(user_history_csv, user_key_map)
     user_lookup = load_entra_and_write_users(
-        entra_csv, users_out_csv, user_key_map, quiet=quiet, profile=profile
+        entra_csv,
+        users_out_csv,
+        user_key_map,
+        quiet=quiet,
+        profile=profile,
+        user_history=user_history,
+        history_effective_date=history_effective_date,
+        history_states=history_states,
     )
 
     if not quiet:
@@ -2271,11 +2552,20 @@ def _run_processor_with_store(
             try:
                 audit_data = json_loads(audit_raw) if audit_raw.strip() else {}
             except Exception:
-                stats["errors"] += 1
-                continue
+                try:
+                    audit_data = json_loads_rescue(audit_raw)
+                except Exception:
+                    stats["errors"] += 1
+                    reject_manifest.record(
+                        stats["input_records"], "JSON_PARSE_FAILED", reject_row_digest(raw_row)
+                    )
+                    continue
 
             if not isinstance(audit_data, dict):
                 stats["errors"] += 1
+                reject_manifest.record(
+                    stats["input_records"], "AUDITDATA_NOT_OBJECT", reject_row_digest(raw_row)
+                )
                 continue
 
             if not is_copilot_interaction(audit_data, raw_row):
@@ -2283,11 +2573,21 @@ def _run_processor_with_store(
                 continue
 
             try:
-                rows = explode_record(audit_data, user_lookup, user_key_map, thread_key_map, profile)
+                rows = explode_record(
+                    audit_data,
+                    user_lookup,
+                    user_key_map,
+                    thread_key_map,
+                    profile,
+                    user_history=user_history,
+                )
             except sqlite3.Error:
                 raise
             except Exception:
                 stats["errors"] += 1
+                reject_manifest.record(
+                    stats["input_records"], "ROW_BUILD_FAILED", reject_row_digest(raw_row)
+                )
                 continue
 
             for grain_key, message_id_str, nongrain, in_entra, audit_user_norm in rows:
@@ -2308,12 +2608,17 @@ def _run_processor_with_store(
                     f"rollupRows={state_store.rollup_count:,}"
                 )
         state_store.commit_batch()
+    reject_manifest.close()
+    if reject_manifest.count:
+        stats["reject_manifest_path"] = reject_manifest.path
 
     if not quiet:
         print(f"  Input records:         {stats['input_records']:,}")
         print(f"  Skipped (non-Copilot): {stats['skipped_non_copilot']:,}")
         print(f"  Raw prompt rows:       {stats['output_rows']:,}")
         print(f"  Errors:                {stats['errors']:,}")
+        if reject_manifest.count:
+            print(f"  Reject manifest:       {reject_manifest.path}")
         print()
         print("Writing rolled-up fact CSV...")
 
@@ -2357,6 +2662,12 @@ def _run_processor_with_store(
         print(f"  Unmatched users:       {stats['unmatched_users']:,}")
         print(f"  Elapsed:               {elapsed:.2f}s")
 
+    if reject_manifest.count:
+        raise ResidualRejectError(
+            f"Copilot processor rejected {reject_manifest.count} input row(s); "
+            f"candidate outputs preserved; manifest={reject_manifest.path}"
+        )
+
     return stats
 
 
@@ -2373,6 +2684,9 @@ def run_processor(
     seed_userkey_map_path: str | None = None,
     state_db_path: str | None = None,
     state_log_fn=None,
+    user_history: bool = False,
+    history_effective_date: str = "",
+    user_history_csv: str | None = None,
 ) -> dict[str, Any]:
     """Run with bounded driver-local SQLite state.
 
@@ -2392,6 +2706,7 @@ def run_processor(
                 purview_csv, entra_csv, fact_out_csv, users_out_csv,
                 profile, agg_paths, quiet, seed_mid_map_path,
                 seed_thread_map_path, seed_userkey_map_path, state_store,
+                user_history, history_effective_date, user_history_csv,
             )
 
     with tempfile.TemporaryDirectory(prefix="pax_copilot_sqlite_") as temp_dir:
@@ -2401,6 +2716,7 @@ def run_processor(
                 purview_csv, entra_csv, fact_out_csv, users_out_csv,
                 profile, agg_paths, quiet, seed_mid_map_path,
                 seed_thread_map_path, seed_userkey_map_path, state_store,
+                user_history, history_effective_date, user_history_csv,
             )
 
 
@@ -2577,18 +2893,22 @@ def main() -> None:
             "licensed_summary": str(out_dir / f"{purview_stem}_LicensedUserSummary_{run_ts}.csv"),
         }
 
-    stats = run_processor(
-        purview_csv=purview_path,
-        entra_csv=entra_path,
-        fact_out_csv=fact_out,
-        users_out_csv=users_out,
-        profile=args.profile,
-        agg_paths=agg_paths,
-        quiet=args.quiet,
-        seed_mid_map_path=args.seed_mid_map,
-        seed_thread_map_path=args.seed_thread_map,
-        seed_userkey_map_path=args.seed_userkey_map,
-    )
+    try:
+        stats = run_processor(
+            purview_csv=purview_path,
+            entra_csv=entra_path,
+            fact_out_csv=fact_out,
+            users_out_csv=users_out,
+            profile=args.profile,
+            agg_paths=agg_paths,
+            quiet=args.quiet,
+            seed_mid_map_path=args.seed_mid_map,
+            seed_thread_map_path=args.seed_thread_map,
+            seed_userkey_map_path=args.seed_userkey_map,
+        )
+    except ResidualRejectError as exc:
+        print(f"ERROR: {exc}; candidate outputs are NOT published.", file=sys.stderr)
+        sys.exit(EXIT_RESIDUAL_REJECTS)
     sys.exit(1 if stats["errors"] > 0 else 0)
 
 

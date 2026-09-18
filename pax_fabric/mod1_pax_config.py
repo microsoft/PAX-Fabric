@@ -32,7 +32,17 @@ from typing import Optional
 # SCRIPT METADATA
 # ===========================================================================
 
-SCRIPT_VERSION = "1.11.15"
+SCRIPT_VERSION = "1.11.16"
+# Mirrors $ScriptReleaseType / $ScriptReleaseDate in PAX v1.11.16 PS (L8532-L8534).
+SCRIPT_RELEASE_TYPE = "Stable"   # "Stable" or "Prerelease"
+SCRIPT_RELEASE_DATE = "2026-09-10"
+
+
+def script_version_banner() -> str:
+    """Composed banner string used everywhere the version is logged."""
+    if SCRIPT_RELEASE_TYPE and SCRIPT_RELEASE_TYPE.lower() != "stable":
+        return f"{SCRIPT_VERSION}-{SCRIPT_RELEASE_TYPE.lower()}-{SCRIPT_RELEASE_DATE}"
+    return SCRIPT_VERSION
 
 
 # ===========================================================================
@@ -286,6 +296,7 @@ class PAXConfig:
     auto_completeness: bool = False
     # v1.11.15 additions
     dashboard: str = "AIO"
+    requested_dashboards: list[str] = field(default_factory=lambda: ["AIO"])
     deidentify: bool = False 
     filler_label: Optional[str] = None
     filler_label_text: Optional[str] = None
@@ -296,6 +307,29 @@ class PAXConfig:
     # directory by UserPrincipalName (hybrid enrichment). A string path, NOT
     # a bare switch — mirrors PS `[string]$UserInfoSupplement`.
     user_info_supplement: Optional[str] = None
+    # v1.11.16 additions (Fabric notebook parity with PS $ScriptVersion 1.11.16)
+    # Watermark mode: when True, skip Purview and load the last checkpoint
+    # watermark to resume. Mirrors PS `[switch]$Watermark`.
+    watermark: bool = False
+    # Bootstrap start day (yyyy-MM-dd) for the first watermark run when no
+    # checkpoint exists. Mirrors PS `[string]$WatermarkStartDate`.
+    watermark_start_date: Optional[str] = None
+    # BYOD (Bring-Your-Own-Data) input: JSON records from a prior
+    # Search-UnifiedAuditLog export. When supplied, the Purview fetch is
+    # skipped and records are read from this file. Mirrors PS
+    # `[string]$PurviewInputFile`.
+    purview_input_file: Optional[str] = None
+    # Fabric-native BYOD source. ``auto`` resolves the dashboard's canonical
+    # raw Delta table; an explicit value selects a table in TargetSchema.
+    purview_input_table: Optional[str] = None
+    # User temporal history mode: 'Off' (legacy — current-state Users.csv)
+    # or 'On' (append-only history shape with dated effective rows).
+    # Mirrors PS `[ValidateSet('Off','On')][string]$UserHistory = 'Off'`.
+    user_history: str = "Off"
+    # Effective date (yyyy-MM-dd) tag written to Users history rows when
+    # UserHistory='On'. Only meaningful in history mode. Mirrors PS
+    # `[string]$HistoryEffectiveDate`.
+    history_effective_date: Optional[str] = None
     verify_partition_stability: bool = False
     disable_aisid_delta_cache: bool = False
     clear_uncertain_create: Optional[list[int]] = None
@@ -330,6 +364,8 @@ class PAXConfig:
     # supplied Dashboard (including 'AIO'), so apply_dashboard_side_effects can
     # auto-enable Rollup for an explicit AIO the same way it does for ValueLens/M365/AISID.
     _dashboard_explicit: bool = False
+    _multi_dashboard_enabled: bool = False
+    _dashboard_parse_errors: list[str] = field(default_factory=list)
 
     # --- ExcludeCopilotInteraction/IncludeCopilotInteraction conflict flag ---
     # Set by initialize_config() (via _detect_copilot_exclude_conflict) BEFORE
@@ -728,18 +764,14 @@ def validate_config(config: PAXConfig) -> list[str]:
     # PS L1881 [ValidateSet('AIO','ValueLens','M365','AISID')] parity — reject
     # anything outside the four accepted values before any downstream comparison
     # (all uppercase-based) silently no-ops on an unknown dashboard.
+    errors.extend(getattr(config, "_dashboard_parse_errors", []))
     _dash_raw = str(getattr(config, "dashboard", "AIO") or "AIO")
     _dash_uc = _dash_raw.upper()
-    if _dash_uc not in {"AIO", "VALUELENS", "M365", "AISID"}:
-        errors.append(
-            f"Dashboard='{_dash_raw}' is not a valid value. "
-            "Use one of: AIO, ValueLens, M365, AISID."
-        )
 
     # v1.11.15 intentionally ships AISID as a gated preview. Keep Fabric in
     # lockstep with the source script: fail early rather than claim success
     # while omitting Defender/AISID datasets.
-    if _dash_uc == "AISID":
+    if "AISID" in config.requested_dashboards:
         errors.append(
             "Dashboard=AISID is temporarily gated in PAX v1.11.15 and is not "
             "available for customer use."
@@ -749,6 +781,15 @@ def validate_config(config: PAXConfig) -> list[str]:
 
     if getattr(config, "deidentify", False) and config.export_workbook:
         errors.append("Deidentify cannot be combined with ExportWorkbook; use CSV output to avoid identifiable Excel data.")
+
+    if config._multi_dashboard_enabled and (
+        config.append_file or config.append_user_info or config.append_agent365_info
+    ):
+        errors.append(
+            "Adding to an existing data set is not available when more than one "
+            "Dashboard is selected. Run each dashboard separately for append, or "
+            "remove AppendFile, AppendUserInfo, and AppendAgent365Info."
+        )
 
     # --- ExcludeCopilotInteraction conflict (v1.11.15 parity, PS L7845-7916) ---
     # PS prompts INCLUDE/EXCLUDE interactively, or hard-errors on a
@@ -871,7 +912,7 @@ def validate_config(config: PAXConfig) -> list[str]:
     # -IncludeM365Usage (no explicit -Dashboard) is a legal M365-only run.
     # Mirror that here via _dashboard_explicit — otherwise Fabric users who
     # leave Dashboard blank + toggle IncludeM365Usage hit a spurious error.
-    if getattr(config, "_dashboard_explicit", False):
+    if getattr(config, "_dashboard_explicit", False) and not config._multi_dashboard_enabled:
         dashboard_uc = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
         if dashboard_uc in ("AIO", "VALUELENS") and config.include_m365_usage:
             errors.append(
@@ -1304,9 +1345,32 @@ def validate_config(config: PAXConfig) -> list[str]:
             f"Provide all Local, all SharePoint, or all Fabric destinations."
         )
 
-    # AppRegistration credential check: client_id + client_secret are required
-    # (only auth path supported in v1.11.4+).
-    if not (config.client_id and config.client_secret):
+    # AppRegistration credentials are required only when this run actually
+    # calls Purview/Graph. A Fabric-native table BYOD run reads both audit and
+    # Entra inputs from Delta and therefore has no live authentication step.
+    table_byod = bool(
+        str(getattr(config, "purview_input_table", "") or "").strip()
+    )
+    supplied_audit = bool(
+        config.raw_input_csv or config.purview_input_file or table_byod
+    )
+    purview_live = bool(
+        not supplied_audit
+        and not config.only_user_info
+        and not config.only_agent365_info
+    )
+    entra_live = bool(
+        (config.include_user_info or config.only_user_info)
+        and not config.user_info_file
+        and not table_byod
+    )
+    graph_auth_required = bool(
+        purview_live
+        or entra_live
+        or config.include_agent365_info
+        or config.only_agent365_info
+    )
+    if graph_auth_required and not (config.client_id and config.client_secret):
         errors.append(
             "AppRegistration auth requires both client_id and client_secret. "
             "Supply them via CLI (-ClientId / -ClientSecret) or environment variables."
@@ -1341,6 +1405,138 @@ def validate_config(config: PAXConfig) -> list[str]:
                 errors.append(f"EndDate ({config.end_date}) is earlier than StartDate ({config.start_date}).")
         except ValueError:
             pass  # Already caught above
+
+    # --- v1.11.16: Watermark / UserHistory / BYOD validators -----------------
+    # Mirrors PS L37678-L37700 (Watermark blocker set), PS L31386
+    # (WatermarkStartDate format), PS L19228 / L23956 (UserHistory ValidateSet),
+    # and PS L24016 (Merge-UsersCsv HistoryEffectiveDate contract). Kept in
+    # lockstep with the source script so Fabric fails fast on the same
+    # illegal-parameter combinations the CLI refuses.
+
+    # PS L37679: -WatermarkStartDate is only valid together with -Watermark.
+    if config.watermark_start_date and not config.watermark:
+        errors.append(
+            "WatermarkStartDate is only valid together with Watermark. "
+            "Add Watermark=True, or remove WatermarkStartDate and supply "
+            "StartDate/EndDate instead."
+        )
+
+    # PS L31386: WatermarkStartDate must be a valid yyyy-MM-dd calendar date.
+    if config.watermark_start_date:
+        try:
+            datetime.strptime(config.watermark_start_date, "%Y-%m-%d")
+        except ValueError:
+            errors.append(
+                f"WatermarkStartDate must be yyyy-MM-dd format. "
+                f"Got: {config.watermark_start_date}"
+            )
+
+    # PS L37678 comment: the resume allow-list refuses -Watermark on a resume
+    # command line (the resumed window is restored from the checkpoint, not
+    # derived from a watermark).
+    if config.watermark and config.resume is not None:
+        errors.append(
+            "Watermark cannot be combined with Resume; the resumed window is "
+            "restored from the checkpoint, not derived from a watermark."
+        )
+
+    # PS L37684-L37700: -Watermark fresh runs refuse switches that would
+    # collide with the derived catch-up window.
+    if config.watermark and config.resume is None:
+        wm_blockers: list[str] = []
+        if getattr(config, "_start_date_explicit", False):
+            wm_blockers.append(
+                "StartDate (the catch-up range is derived from the watermark)"
+            )
+        if getattr(config, "_end_date_explicit", False):
+            wm_blockers.append(
+                "EndDate (the catch-up range ends at the current UTC day boundary)"
+            )
+        if config.raw_input_csv:
+            wm_blockers.append(
+                "RAWInputCSV (replay mode does not collect new days)"
+            )
+        if config.purview_input_file:
+            wm_blockers.append(
+                "PurviewInputFile (supplied-input mode does not collect new days)"
+            )
+        if config.purview_input_table:
+            wm_blockers.append(
+                "PurviewInputTable (supplied-table mode does not collect new days)"
+            )
+        if config.use_eom:
+            wm_blockers.append("UseEOM")
+        if config.only_user_info:
+            wm_blockers.append(
+                "OnlyUserInfo (no audit activity is collected)"
+            )
+        if config.only_agent365_info:
+            wm_blockers.append(
+                "OnlyAgent365Info (no audit activity is collected)"
+            )
+        if str(getattr(config, "dashboard", "") or "").strip().upper() == "AISID":
+            wm_blockers.append(
+                "Dashboard=AISID (that dashboard resolves its own collection window)"
+            )
+        if wm_blockers:
+            errors.append(
+                "Watermark cannot be combined with the following: "
+                + "; ".join(wm_blockers)
+                + ". Remove them and re-run, or run without Watermark and "
+                "supply StartDate/EndDate."
+            )
+
+    # PS L19228 / L23956: [ValidateSet('Off','On')] on -UserHistory.
+    uh_raw = str(getattr(config, "user_history", "Off") or "Off")
+    if uh_raw not in ("Off", "On"):
+        errors.append(
+            f"UserHistory='{uh_raw}' is not a valid value. Use one of: Off, On."
+        )
+
+    if config.purview_input_file and config.purview_input_table:
+        errors.append(
+            "PurviewInputFile and PurviewInputTable cannot both be supplied. "
+            "Choose one authoritative BYOD source."
+        )
+    elif uh_raw == "On":
+        if not (config.rollup or config.rollup_plus_raw):
+            errors.append("UserHistory On requires Rollup or RollupPlusRaw.")
+        if not config.include_user_info:
+            errors.append(
+                "UserHistory On requires IncludeUserInfo so the effective-dated "
+                "Users dimension can be produced."
+            )
+        if config.include_m365_usage:
+            errors.append(
+                "UserHistory On is not available for the M365 usage rollup because "
+                "that processor does not produce a Users dimension."
+            )
+
+    # PS L24016: Merge-UsersCsv throws on UserHistory=On + blank
+    # HistoryEffectiveDate. PS derives an implicit value from TrimStartDateUTC
+    # when not supplied (L66282, L66319, L66659), so we only validate the
+    # format when explicitly provided — an unsupplied value is legal and
+    # gets filled in at merge time by the run-time date machinery.
+    if config.history_effective_date:
+        try:
+            datetime.strptime(config.history_effective_date, "%Y-%m-%d")
+        except ValueError:
+            errors.append(
+                f"HistoryEffectiveDate must be yyyy-MM-dd format. "
+                f"Got: {config.history_effective_date}"
+            )
+
+    # PS L947 (comment) + L69224 (runtime): -MetricsPath requires
+    # -EmitMetricsJson. PS never rejects at parse-time — it just silently
+    # ignores MetricsPath when EmitMetricsJson is False — but for the Fabric
+    # notebook UX we surface it as a config error to prevent a user from
+    # thinking their custom path took effect. Additive-only (no legacy
+    # break: legacy users don't set MetricsPath).
+    if config.metrics_path and not config.emit_metrics_json:
+        errors.append(
+            "MetricsPath requires EmitMetricsJson=True. Either set "
+            "EmitMetricsJson=True or clear MetricsPath."
+        )
 
     return errors
 
@@ -1391,6 +1587,55 @@ def compute_trim_boundaries(config: PAXConfig) -> None:
 # DASHBOARD SIDE-EFFECTS  (PS L8082-8114 parity)
 # ===========================================================================
 
+_DASHBOARD_CANONICAL_ORDER = ("AIO", "M365", "ValueLens", "AISID")
+_DASHBOARD_CANONICAL = {
+    dashboard.casefold(): dashboard for dashboard in _DASHBOARD_CANONICAL_ORDER
+}
+
+
+def resolve_dashboards(value: object) -> tuple[list[str], list[str]]:
+    """Parse repeated/list or comma-separated dashboard values like PowerShell."""
+    raw_values = value if isinstance(value, (list, tuple)) else [value]
+    requested: set[str] = set()
+    errors: list[str] = []
+    for raw_value in raw_values:
+        for token in str(raw_value or "").split(","):
+            trimmed = token.strip()
+            if not trimmed:
+                errors.append(
+                    "Dashboard contains a blank value. Use one or more of: "
+                    "AIO, ValueLens, M365, AISID."
+                )
+                continue
+            canonical = _DASHBOARD_CANONICAL.get(trimmed.casefold())
+            if canonical is None:
+                errors.append(
+                    f"Dashboard='{trimmed}' is not a valid value. "
+                    "Use one or more of: AIO, ValueLens, M365, AISID."
+                )
+                continue
+            requested.add(canonical)
+    return (
+        [name for name in _DASHBOARD_CANONICAL_ORDER if name in requested],
+        errors,
+    )
+
+
+def normalize_dashboard_selection(config: PAXConfig) -> None:
+    """Populate the canonical dashboard list and retain the primary scalar."""
+    selection: object = config.dashboard
+    if (
+        config._multi_dashboard_enabled
+        and config.requested_dashboards
+        and config.dashboard == config.requested_dashboards[0]
+    ):
+        selection = config.requested_dashboards
+    dashboards, errors = resolve_dashboards(selection)
+    config._dashboard_parse_errors = errors
+    config.requested_dashboards = dashboards or ["AIO"]
+    config._multi_dashboard_enabled = len(config.requested_dashboards) > 1
+    config.dashboard = config.requested_dashboards[0]
+
 def apply_dashboard_side_effects(config: PAXConfig) -> None:
     """Apply auto-enables implied by ``Dashboard`` before other side-effects run.
 
@@ -1417,10 +1662,10 @@ def apply_dashboard_side_effects(config: PAXConfig) -> None:
 
     dashboard_raw = str(getattr(config, "dashboard", "AIO") or "AIO")
     dashboard = dashboard_raw.upper()
-    if dashboard == "M365" and not config.include_m365_usage:
+    if "M365" in config.requested_dashboards and not config.include_m365_usage:
         config.include_m365_usage = True
         _info(
-            "INFO: -Dashboard M365 auto-enabled -IncludeM365Usage "
+            "INFO: Requesting M365 auto-enabled -IncludeM365Usage "
             "(the M365 dashboard consumes the M365 usage bundle)."
         )
     # PS L8087-8115: only an EXPLICITLY supplied -Dashboard implies Rollup. The
@@ -1601,6 +1846,9 @@ def initialize_config(config: PAXConfig) -> list[str]:
     
     Returns list of validation errors (empty = success).
     """
+    # 0. Normalize Dashboard before any dashboard-implied side effects.
+    normalize_dashboard_selection(config)
+
     # 1. Date defaults
     apply_date_defaults(config)
 
@@ -1752,9 +2000,16 @@ def config_from_params(params: dict) -> "PAXConfig":
 
     # --- Output (legacy local + new lakehouse) -----------------------
     op = pick("outputpath", "output_path")
-    if op is not None:
+    if op is not None and str(op).strip():
         cfg.output_path = str(op)
         cfg._output_path_explicit = True
+    for src, dst in (
+        ("outputpathuserinfo", "output_path_user_info"),
+        ("outputpathagent365info", "output_path_agent365_info"),
+    ):
+        value = pick(src, dst)
+        if value is not None and str(value).strip():
+            setattr(cfg, dst, str(value))
     cro = pick("csvoutputroot", "csv_output_root")
     if cro is not None:
         cfg.csv_output_root = str(cro)
@@ -1824,11 +2079,15 @@ def config_from_params(params: dict) -> "PAXConfig":
         ("combineoutput", "combine_output"),
         ("respectretryafter", "respect_retry_after"),
         ("withaggregates", "with_aggregates"),
+        # v1.11.16 additions
+        ("watermark", "watermark"),
     )
     for src, dst in bool_fields:
         v = pick(src, dst)
         if v is not None:
             setattr(cfg, dst, bool(v))
+            if dst == "include_user_info":
+                cfg._include_user_info_explicit = bool(v)
 
     numeric_fields = (
         ("blockhours", "block_hours", float),
@@ -1866,6 +2125,8 @@ def config_from_params(params: dict) -> "PAXConfig":
     for src, dst in (
         ("parallelmode", "parallel_mode"),
         ("appendfile", "append_file"),
+        ("appenduserinfo", "append_user_info"),
+        ("appendagent365info", "append_agent365_info"),
         ("metricspath", "metrics_path"),
         ("rawinputcsv", "raw_input_csv"),
         ("resume", "resume"),
@@ -1876,9 +2137,19 @@ def config_from_params(params: dict) -> "PAXConfig":
         ("userinfosupplement", "user_info_supplement"),
         ("outputpathdefenderusage", "output_path_defender_usage"),
         ("appenddefenderusage", "append_defender_usage"),
+        # v1.11.16 additions
+        ("watermarkstartdate", "watermark_start_date"),
+        ("purviewinputfile", "purview_input_file"),
+        ("purviewinputtable", "purview_input_table"),
+        ("userhistory", "user_history"),
+        ("historyeffectivedate", "history_effective_date"),
     ):
         v = pick(src, dst)
         if v is None:
+            continue
+        if dst in {
+            "append_file", "append_user_info", "append_agent365_info",
+        } and not str(v).strip():
             continue
         # Fabric pipeline blank parameters arrive as '' — treat as "not supplied"
         # so we match PS's $PSBoundParameters.ContainsKey('Dashboard') semantics
@@ -1887,6 +2158,9 @@ def config_from_params(params: dict) -> "PAXConfig":
             if not str(v).strip():
                 continue
             cfg._dashboard_explicit = True
+            if isinstance(v, (list, tuple)):
+                setattr(cfg, dst, ",".join(str(item) for item in v))
+                continue
         setattr(cfg, dst, str(v))
 
     for src, dst, caster in (

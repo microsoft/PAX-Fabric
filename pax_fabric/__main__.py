@@ -39,6 +39,7 @@ from typing import Any
 from .models import PAXConfig, PAXRunContext
 from .mod1_pax_config import (
     SCRIPT_VERSION,
+    script_version_banner,
     canonical_filler_mode,
     check_for_updates,
     initialize_config,
@@ -162,6 +163,39 @@ class _NeedsSubdivision:
 # writer never sees more than _SPILL_BATCH_SIZE rows at a time.
 
 _SPILL_BATCH_SIZE = 5000
+
+
+def _record_matches_agent_filter(
+    record: dict[str, Any],
+    agent_ids: list[str] | None,
+    agents_only: bool,
+    exclude_agents: bool,
+) -> bool:
+    """Apply the PowerShell Test-AgentFilter contract to one audit record."""
+    if not agent_ids and not agents_only and not exclude_agents:
+        return True
+
+    audit_data = record.get("AuditData")
+    if isinstance(audit_data, str):
+        try:
+            audit_data = json.loads(audit_data)
+        except (TypeError, json.JSONDecodeError):
+            audit_data = None
+    record_agent_id = ""
+    if isinstance(audit_data, dict):
+        record_agent_id = str(audit_data.get("AgentId") or "").strip()
+
+    if exclude_agents:
+        return not record_agent_id
+    if not record_agent_id:
+        return False
+    if agent_ids:
+        normalized_agent_id = record_agent_id.casefold()
+        return any(
+            normalized_agent_id == str(agent_id).strip().casefold()
+            for agent_id in agent_ids
+        )
+    return agents_only
 
 
 def _spill_records_to_jsonl(
@@ -457,6 +491,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("-MetricsPath", "--metrics-path", default=None)
     p.add_argument("-AutoCompleteness", "--auto-completeness",
                    action="store_true", default=None)
+    p.add_argument("-Deidentify", "--deidentify",
+                   action="store_true", default=None)
 
     # --- Resume ---
     p.add_argument("-Resume", "--resume", nargs="?", const="", default=None,
@@ -534,6 +570,7 @@ def _apply_cli_args(config: 'PAXConfig', args: argparse.Namespace) -> None:
         "emit_metrics_json": "emit_metrics_json",
         "metrics_path": "metrics_path",
         "auto_completeness": "auto_completeness",
+        "deidentify": "deidentify",
         "resume": "resume",
         "circuit_breaker_threshold": "circuit_breaker_threshold",
         "backoff_base_seconds": "backoff_base_seconds",
@@ -678,7 +715,7 @@ def main() -> int:
                 _pkg_logger.removeHandler(_h)
         _pkg_logger.propagate = True
 
-        write_log(f"PAX Purview Audit Log Processor v{SCRIPT_VERSION}")
+        write_log(f"PAX Purview Audit Log Processor v{script_version_banner()}")
         if not getattr(config, "skip_version_check", False):
             check_for_updates(SCRIPT_VERSION, log=write_log_host)
         write_log(f"Start: {config.start_date}  End: {config.end_date}")
@@ -822,6 +859,13 @@ def main() -> int:
             seen_ids: set[str] = set()
             dup_skipped = 0
             trim_skipped = 0
+            agent_filtered = 0
+            exclude_agents_active = bool(getattr(config, 'exclude_agents', False))
+            agent_filter_active = bool(
+                getattr(config, 'agent_id', None)
+                or getattr(config, 'agents_only', False)
+            )
+            agent_filter_started = time.perf_counter()
             rows_written = 0
             writer: CsvWriter | None = None
             csv_columns: list[str] = []
@@ -871,6 +915,23 @@ def main() -> int:
                             trim_skipped += 1
                             continue
 
+                if exclude_agents_active:
+                    ctx.metrics.exclude_agents_pre_count += 1
+                elif agent_filter_active:
+                    ctx.metrics.agent_filter_pre_count += 1
+                if not _record_matches_agent_filter(
+                    record,
+                    getattr(config, 'agent_id', None),
+                    bool(getattr(config, 'agents_only', False)),
+                    exclude_agents_active,
+                ):
+                    agent_filtered += 1
+                    continue
+                if exclude_agents_active:
+                    ctx.metrics.exclude_agents_post_count += 1
+                elif agent_filter_active:
+                    ctx.metrics.agent_filter_post_count += 1
+
                 # Structuring (8-column) or explosion (1:N flattening)
                 try:
                     if enable_explosion or enable_deep:
@@ -906,6 +967,25 @@ def main() -> int:
                 write_log(
                     f"Date-range trim: Removed {trim_skipped} record(s) "
                     f"outside requested date boundaries"
+                )
+            if agent_filtered:
+                ctx.metrics.filtering_skipped_records += agent_filtered
+                if exclude_agents_active:
+                    ctx.metrics.filtering_exclude_agents += agent_filtered
+                else:
+                    ctx.metrics.filtering_agent_filtered += agent_filtered
+                write_log(f"Agent filter: removed {agent_filtered} record(s)")
+            if exclude_agents_active:
+                ctx.metrics.exclude_agents_applied = True
+                ctx.metrics.exclude_agents_removed = agent_filtered
+                ctx.metrics.exclude_agents_elapsed_sec = (
+                    time.perf_counter() - agent_filter_started
+                )
+            elif agent_filter_active:
+                ctx.metrics.agent_filter_applied = True
+                ctx.metrics.agent_filter_removed_count = agent_filtered
+                ctx.metrics.agent_filter_elapsed_sec = (
+                    time.perf_counter() - agent_filter_started
                 )
 
             ctx.metrics.explosion_ms = (
@@ -1042,6 +1122,8 @@ def main() -> int:
         elif include_user_info:
             _export_entra_users(ctx)
 
+        _assert_deidentify_append_consistency(ctx)
+
         # --- Rollup Seed Map Integration (PS L7273, L7318) ---
         # When -AppendFile + -Rollup, pre-seed surrogate keys from append target
         seed_mid_map_path = None
@@ -1088,6 +1170,8 @@ def main() -> int:
                 seed_thread_map_path=seed_thread_map_path,
                 seed_userkey_map_path=seed_userkey_map_path,
             )
+        else:
+            _deidentify_non_rollup_outputs(ctx)
 
         # --- Append/Merge Integration (PS L7520, L7724) ---
         _run_append_merge(ctx)
@@ -1144,6 +1228,163 @@ def main() -> int:
 # ---------------------------------------------------------------------------
 
 
+# v1.11.16 BYOD required columns from Test-PaxPurviewInputCsv.
+_BYOD_REQUIRED_HEADERS = (
+    'RecordId', 'CreationDate', 'RecordType', 'Operation', 'UserId', 'AuditData'
+)
+
+
+def _load_csv_to_shards(
+    ctx: 'PAXRunContext',
+    src: str,
+    start_ns: int,
+    *,
+    source_label: str,
+    bypass_date_trim: bool,
+) -> int:
+    """Validate and stream a Purview CSV into the normal JSONL shard path."""
+    import csv
+
+    config = ctx.config
+    src_path = Path(src)
+
+    write_log(f"{source_label} mode: reading Purview audit records from '{src}'")
+
+    if not src_path.exists():
+        raise FileNotFoundError(f"{source_label} source not found: {src}")
+    if not src_path.is_file():
+        raise ValueError(f"{source_label} source is not a file: {src}")
+    if src_path.suffix.lower() != '.csv':
+        raise ValueError(f"{source_label} source must be a .csv file: {src}")
+
+    # Prepare the same spill layout the live-fetch path uses so Phase 6's
+    # shard iterator sees no difference between BYOD and live sources.
+    spill_run_ts = (
+        config.script_run_timestamp
+        or datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+    )
+    spill_out_dir = Path(_resolve_output_path(config)).parent
+    spill_out_dir.mkdir(parents=True, exist_ok=True)
+    incremental_dir = spill_out_dir / ".pax_incremental"
+    incremental_dir.mkdir(parents=True, exist_ok=True)
+
+    spilled_shards: list[str] = []
+    shard_seq = 0
+    records_total = 0
+    batch: list[dict[str, Any]] = []
+
+    def _flush(recs: list[dict[str, Any]]) -> None:
+        nonlocal shard_seq
+        if not recs:
+            return
+        shard_seq += 1
+        path = _spill_records_to_jsonl(
+            recs,
+            shard_seq=shard_seq,
+            partition_idx=0,  # BYOD has no partitions; use 0 as sentinel
+            run_timestamp=spill_run_ts,
+            incremental_dir=incremental_dir,
+        )
+        if path:
+            spilled_shards.append(path)
+            write_log(
+                f"  [BYOD] shard {shard_seq:04d} ({len(recs)} records) "
+                f"written to {Path(path).name}"
+            )
+
+    with open(src_path, 'r', encoding='utf-8-sig', newline='') as fh:
+        reader = csv.reader(fh, strict=True)
+        try:
+            raw_headers = next(reader)
+        except StopIteration as ex:
+            raise ValueError(f"{source_label} source has no header row: {src}") from ex
+        headers = [header.strip() for header in raw_headers]
+        if not headers or any(not header for header in headers):
+            raise ValueError(f"{source_label} source contains a blank column name")
+        lowered = [header.casefold() for header in headers]
+        if len(set(lowered)) != len(lowered):
+            raise ValueError(f"{source_label} source contains duplicate column names")
+        header_map = {header.casefold(): index for index, header in enumerate(headers)}
+        missing = [
+            required for required in _BYOD_REQUIRED_HEADERS
+            if required.casefold() not in header_map
+        ]
+        if missing:
+            raise ValueError(
+                f"{source_label} source missing required column(s): {', '.join(missing)}"
+            )
+
+        audit_index = header_map['auditdata']
+        for row_number, values in enumerate(reader, 1):
+            if len(values) != len(headers):
+                raise ValueError(
+                    f"Row {row_number} of the {source_label} source has "
+                    f"{len(values)} values where the header declares {len(headers)}"
+                )
+            audit_text = values[audit_index].strip()
+            if not audit_text:
+                raise ValueError(
+                    f"Row {row_number} of the {source_label} source has no AuditData value"
+                )
+            try:
+                audit_object = json.loads(audit_text)
+            except (TypeError, json.JSONDecodeError) as ex:
+                raise ValueError(
+                    f"Row {row_number} of the {source_label} source has AuditData "
+                    "that is not valid JSON"
+                ) from ex
+            if not isinstance(audit_object, dict):
+                raise ValueError(
+                    f"Row {row_number} of the {source_label} source has AuditData "
+                    "that is not a single JSON object"
+                )
+            batch.append(dict(zip(headers, values)))
+            records_total += 1
+            if len(batch) >= _SPILL_BATCH_SIZE:
+                _flush(batch)
+                batch = []
+        _flush(batch)
+
+    if records_total == 0:
+        raise ValueError(f"{source_label} source contains a header but no data rows")
+
+    # Hand the shard manifest to Phase 6 exactly as the live path does.
+    ctx.spilled_shards = spilled_shards  # type: ignore[attr-defined]
+    ctx.incremental_dir = str(incremental_dir)  # type: ignore[attr-defined]
+    ctx.bypass_date_trim = bypass_date_trim  # type: ignore[attr-defined]
+    ctx.all_logs = []
+    ctx.metrics.total_records_fetched = records_total
+    write_log(
+        f"  [{source_label}] Loaded {records_total} record(s) across "
+        f"{len(spilled_shards)} JSONL shard(s) in {incremental_dir}"
+    )
+
+    elapsed = (time.perf_counter_ns() - start_ns) // 1_000_000
+    return elapsed
+
+
+def _load_byod_purview_csv(ctx: 'PAXRunContext', start_ns: int) -> int:
+    """Load a strictly validated, read-only Purview BYOD source."""
+    return _load_csv_to_shards(
+        ctx,
+        str(ctx.config.purview_input_file),
+        start_ns,
+        source_label="BYOD",
+        bypass_date_trim=True,
+    )
+
+
+def _load_replay_csv(ctx: 'PAXRunContext', start_ns: int) -> int:
+    """Load an offline RAWInputCSV source into the notebook transform path."""
+    return _load_csv_to_shards(
+        ctx,
+        str(ctx.config.raw_input_csv),
+        start_ns,
+        source_label="Replay",
+        bypass_date_trim=False,
+    )
+
+
 def _run_query_phase(ctx: PAXRunContext) -> int:
     """Execute query orchestration. Returns elapsed ms."""
     import requests
@@ -1151,13 +1392,18 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     config = ctx.config
     start = time.perf_counter_ns()
 
-    # RAW CSV replay mode — skip for now; replay requires reading CSV as log records
     if config.raw_input_csv:
         write_log(f"Replay mode from: {config.raw_input_csv}")
-        # TODO: Implement CSV-to-records reader + invoke_replay_inline_export
-        # with correct signature (logs, output_file, header, convert_fn, ...)
-        write_log("Replay inline export not yet wired — skipping.", level="WARN")
-        elapsed = (time.perf_counter_ns() - start) // 1_000_000
+        return _load_replay_csv(ctx, start)
+
+    # v1.11.16 BYOD (Bring-Your-Own-Data) mode — parity with PS
+    # `Invoke-PaxByodSourcePreparation` (L10991) + `Get-PaxByodBootstrap` (L10266).
+    # When -PurviewInputFile is set, the caller has already collected a raw
+    # Purview audit dump; we skip Search-UnifiedAuditLog entirely and drain
+    # the supplied CSV through the same JSONL-shard queue that live fetch uses
+    # so Phase 6 (dedup/trim/structure) is fed identically.
+    if getattr(config, 'purview_input_file', None):
+        elapsed = _load_byod_purview_csv(ctx, start)
         return elapsed
 
     # Expand group memberships to target users
@@ -1235,7 +1481,10 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             "AutoCompleteness": getattr(config, 'auto_completeness', False),
             "IncludeTelemetry": getattr(config, 'include_telemetry', False),
             "AppendFile": getattr(config, 'append_file', None),
-            "Dashboard": getattr(config, 'dashboard', 'AIO'),
+            "Dashboard": ",".join(
+                getattr(config, 'requested_dashboards', None)
+                or [getattr(config, 'dashboard', 'AIO')]
+            ),
             # PS L34094 parity: checkpoint stores the CANONICAL HierarchyFillMode
             # (none|self|manager|fixed), NOT the raw user string. The checkpoint
             # is authoritative on resume, so canonicalize once here.
@@ -1243,6 +1492,18 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             "FillerLabelText": getattr(config, 'filler_label_text', None) or "",
             "Deidentify": getattr(config, 'deidentify', False),
             "WithAggregates": getattr(config, 'with_aggregates', False),
+            # v1.11.16 additive checkpoint persistence (item 9). These flow into
+            # mod6.initialize_checkpoint_for_new_run's parameters dict so a
+            # resumed run has full v1.11.16 intent recorded. Legacy configs
+            # (v1.11.15 attrs missing on the dataclass) fall back to False /
+            # empty via getattr defaults, preserving byte-identical output on
+            # the non-additive path.
+            "UserHistory": getattr(config, 'user_history', 'Off'),
+            "HistoryEffectiveDate": getattr(config, 'history_effective_date', '') or '',
+            "PurviewInputFile": getattr(config, 'purview_input_file', '') or '',
+            "EmitMetricsJson": bool(getattr(config, 'emit_metrics_json', False)),
+            "MetricsPath": getattr(config, 'metrics_path', '') or '',
+            "Watermark": bool(getattr(config, 'watermark', False)),
         }
         initialize_checkpoint_for_new_run(
             output_path=config.output_path,
@@ -1294,6 +1555,21 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             graph_request_fn=_scope_graph_get,
             log_fn=lambda msg, lvl='info': write_log(msg, level=str(lvl).upper()),
         )
+
+        ctx.metrics.filtering_user_ids = len(_scope.requested_user_ids)
+        ctx.metrics.filtering_group_names = len(_scope.requested_groups)
+        ctx.metrics.scope_resolved_groups = len(_scope.resolved_groups)
+        ctx.metrics.scope_failed_groups = sum((
+            len(_scope.failed_groups),
+            len(_scope.ambiguous_groups),
+            len(_scope.zero_member_groups),
+            len(_scope.unauthorized_groups),
+            len(_scope.transport_error_groups),
+            len(_scope.resolution_error_groups),
+        ))
+        ctx.metrics.scope_expanded_members = len(_scope.resolved_transitive_members)
+        ctx.metrics.scope_final_target_users = len(_scope.final_target_users)
+        ctx.resolved_user_scope = _scope
 
         if _scope.outcome != 'Succeeded':
             # PS parity: fail closed rather than run an unfiltered query.
@@ -2895,7 +3171,10 @@ def _run_rollup_processors(
     seed_thread_map_path: str | None = None,
     seed_userkey_map_path: str | None = None,
     state_db_path: str | None = None,
-) -> None:
+    user_history_csv: str | None = None,
+    output_dir: str | None = None,
+    retain_inputs: bool = False,
+) -> bool:
     """Invoke rollup post-processors (replaces Invoke-EmbeddedProcessor).
 
     Instead of writing embedded Python to a temp file and calling subprocess,
@@ -2919,7 +3198,8 @@ def _run_rollup_processors(
         if copilot_in_types and not getattr(config, 'include_m365_usage', False):
             from .processors.copilot_processor import run_processor as copilot_run
 
-            out_dir = Path(ctx.output_file).parent
+            out_dir = Path(output_dir) if output_dir else Path(ctx.output_file).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
             entra_csv = getattr(ctx, '_entra_csv_path', '') or ''
 
             # PS L4303-4304: Output names derived from input stems.
@@ -2933,9 +3213,9 @@ def _run_rollup_processors(
             # -Deidentify sets the processor's module-level flag before the run.
             dashboard = str(getattr(config, 'dashboard', 'AIO') or 'AIO').upper()
             copilot_profile = 'aibv' if dashboard == 'VALUELENS' else 'aio'
-            if getattr(config, 'deidentify', False):
-                import pax_fabric.processors.copilot_processor as _copilot_mod
-                _copilot_mod._DEIDENTIFY = True
+            import pax_fabric.processors.copilot_processor as _copilot_mod
+            _copilot_mod._DEIDENTIFY = bool(getattr(config, 'deidentify', False))
+            _copilot_mod._deid_cache.clear()
 
             # v1.11.15 parity: -FillerLabel controls what appears in org-hierarchy
             # level slots deeper than a user's own level in the rolled-up Users
@@ -2976,13 +3256,25 @@ def _run_rollup_processors(
                 _rollup_aggregates_note = (
                     ' + pre-aggregated tables' if agg_paths else ' (aggregates off)'
                 )
+            _rollup_user_history = str(
+                getattr(config, 'user_history', None) or 'Off'
+            )
+            _rollup_hed = str(
+                getattr(config, 'history_effective_date', None) or ''
+            )
+            _rollup_history_note = ''
+            if _rollup_user_history.lower() == 'on':
+                _rollup_history_note = (
+                    f'; user-history=On history-effective-date='
+                    f'{_rollup_hed or "<unset>"}'
+                )
             write_log(
                 f"Rollup post-processor: Purview_CopilotInteraction_Processor "
                 f"({_rollup_profile_flag}; profile={_rollup_profile_label}; "
                 f"target={_rollup_profile_label} (Analytics-Hub)"
-                f"{_rollup_aggregates_note}; inputs: Purview CSV + Entra users CSV)"
+                f"{_rollup_aggregates_note}{_rollup_history_note}; "
+                f"inputs: Purview CSV + Entra users CSV)"
             )
-
             try:
                 copilot_run(
                     purview_csv=ctx.output_file,
@@ -2997,6 +3289,9 @@ def _run_rollup_processors(
                     seed_userkey_map_path=seed_userkey_map_path,
                     state_db_path=state_db_path,
                     state_log_fn=write_log,
+                    user_history=_rollup_user_history.lower() == 'on',
+                    history_effective_date=_rollup_hed,
+                    user_history_csv=user_history_csv,
                 )
             finally:
                 if state_db_path:
@@ -3034,9 +3329,11 @@ def _run_rollup_processors(
 
         if getattr(config, 'include_m365_usage', False):
             from .processors.m365_processor import run_rollup as m365_rollup
+            from .processors.m365_processor import write_output_manifest
             from .processors.m365_processor import write_userstats_files
 
-            out_dir = Path(ctx.output_file).parent
+            out_dir = Path(output_dir) if output_dir else Path(ctx.output_file).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
             # PS L1989-1993: Output filenames derived from input stem
             # (Purview_Audit_UsageActivity_CombinedActivityTypes_<ts>_Rollup.csv)
             # The input stem already contains the run timestamp, so no duplication.
@@ -3046,17 +3343,37 @@ def _run_rollup_processors(
             session_path = str(out_dir / f"{input_stem}_SessionCohort.csv")
             session_stats_path = str(out_dir / f"{input_stem}_SessionStats.csv")
 
-            m365_rollup(
+            m365_stats = m365_rollup(
                 input_csv=ctx.output_file,
                 output_csv=rollup_path,
                 prompt_filter=getattr(config, 'prompt_filter', None),
                 quiet=False,
                 session_stats_csv=session_stats_path,
+                deidentify=bool(getattr(config, 'deidentify', False)),
             )
 
             # PS L2005-2006: UserStats + SessionCohort derived from rollup output
             write_userstats_files(rollup_path, userstats_path, session_path, quiet=False,
                                   session_stats_csv_path=session_stats_path)
+
+            if m365_stats.get("rejected_records", 0):
+                raise RuntimeError(
+                    f"M365 processor rejected {m365_stats['rejected_records']} input row(s); "
+                    f"candidate outputs preserved; manifest={m365_stats['reject_manifest_path']}"
+                )
+
+            manifest_path = str(out_dir / f"{input_stem}_OutputManifest.json")
+            write_output_manifest(
+                manifest_path,
+                "rollup",
+                [
+                    ("Rollup", rollup_path),
+                    ("UserStats", userstats_path),
+                    ("SessionCohort", session_path),
+                    ("SessionStats", session_stats_path),
+                ],
+            )
+            write_log(f"Rollup: verified four-output M365 manifest: {manifest_path}")
 
             raw_csv_list.append(ctx.output_file)
 
@@ -3071,6 +3388,9 @@ def _run_rollup_processors(
 
     # Retention: -Rollup deletes raw CSV(s) on success; -RollupPlusRaw always
     # keeps them; any failure ALWAYS preserves them (regardless of switch).
+    retention_success = True
+    if retain_inputs:
+        return rollup_success
     if rollup_success and getattr(config, 'rollup', False) and not getattr(config, 'rollup_plus_raw', False):
         for raw_path in raw_csv_list:
             try:
@@ -3079,7 +3399,8 @@ def _run_rollup_processors(
                     p.unlink()
                     write_log(f"Rollup: deleted raw CSV (per -Rollup): {raw_path}")
             except OSError as e:
-                write_log(f"Rollup: failed to delete raw CSV '{raw_path}': {e}", level="WARN")
+                retention_success = False
+                write_log(f"Rollup: failed to delete raw CSV '{raw_path}': {e}", level="ERROR")
 
         for extra_path in always_delete_list:
             try:
@@ -3088,61 +3409,258 @@ def _run_rollup_processors(
                     p.unlink()
                     write_log(f"Rollup: deleted internal input CSV (per -Rollup): {extra_path}")
             except OSError as e:
-                write_log(f"Rollup: failed to delete '{extra_path}': {e}", level="WARN")
+                retention_success = False
+                write_log(f"Rollup: failed to delete '{extra_path}': {e}", level="ERROR")
     elif rollup_success and getattr(config, 'rollup_plus_raw', False):
+        if getattr(config, 'deidentify', False):
+            from .mod18_pax_deidentify import PaxDeidentifier
+
+            deidentifier = PaxDeidentifier()
+            retained_paths = list(dict.fromkeys(
+                raw_csv_list
+                + ([getattr(ctx, '_entra_csv_path', '')]
+                   if getattr(ctx, '_entra_csv_path', '') else [])
+            ))
+            for raw_path in retained_paths:
+                deidentifier.deidentify_csv(raw_path)
+                write_log(f"Deidentify: scrubbed retained raw CSV: {raw_path}")
         write_log("Rollup: raw CSV(s) retained (per -RollupPlusRaw).")
 
+    return rollup_success and retention_success
 
-def _run_append_merge(ctx: PAXRunContext) -> None:
+
+def _deidentify_non_rollup_outputs(ctx: PAXRunContext) -> None:
+    """Scrub final raw CSV outputs once, matching the PowerShell post-write pass."""
+    config = ctx.config
+    if (
+        not getattr(config, 'deidentify', False)
+        or getattr(config, 'rollup', False)
+        or getattr(config, 'rollup_plus_raw', False)
+    ):
+        return
+
+    from .mod18_pax_deidentify import PaxDeidentifier
+
+    paths = list(getattr(ctx, 'csv_split_files', []) or [])
+    if not paths and ctx.output_file:
+        paths.append(ctx.output_file)
+    entra_csv = getattr(ctx, '_entra_csv_path', '') or ''
+    if entra_csv:
+        paths.append(entra_csv)
+
+    deidentifier = PaxDeidentifier()
+    for path in dict.fromkeys(paths):
+        deidentifier.deidentify_csv(path)
+        write_log(f"Deidentify: scrubbed raw CSV: {path}")
+
+
+def _assert_deidentify_append_consistency(ctx: PAXRunContext) -> None:
+    """Apply the PowerShell deidentify/append compatibility gate."""
+    config = ctx.config
+    targets = []
+    append_fact = getattr(config, 'append_file', None)
+    append_user = getattr(config, 'append_user_info', None)
+    if append_fact and not str(append_fact).lower().startswith(('http://', 'https://')):
+        targets.append((str(append_fact), 'AppendFile'))
+    if append_user and not str(append_user).lower().startswith(('http://', 'https://')):
+        targets.append((str(append_user), 'AppendUserInfo'))
+    if not targets:
+        return
+
+    from .mod18_pax_deidentify import assert_append_deidentify_consistency
+
+    assert_append_deidentify_consistency(
+        targets,
+        run_deidentified=bool(getattr(config, 'deidentify', False)),
+        is_rollup=bool(
+            getattr(config, 'rollup', False)
+            or getattr(config, 'rollup_plus_raw', False)
+        ),
+    )
+
+
+def _run_append_merge(ctx: PAXRunContext) -> dict:
     """Run append/merge for Users and Fact CSVs when -Append* flags are bound.
 
     Mirrors PS Merge-UsersCsv (L7520) and Merge-FactCsv (L7724).
     """
     config = ctx.config
     run_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    output: dict = {"success": True, "users": None, "fact": None, "m365": None}
+    is_rollup = bool(
+        getattr(config, 'rollup', False)
+        or getattr(config, 'rollup_plus_raw', False)
+    )
+    include_m365 = bool(getattr(config, 'include_m365_usage', False))
+    raw_path = Path(ctx.output_file) if ctx.output_file else None
+    entra_path_text = getattr(ctx, '_entra_csv_path', None)
+    entra_path = Path(entra_path_text) if entra_path_text else None
+
+    current_fact = raw_path
+    current_users = entra_path
+    if is_rollup and raw_path:
+        if include_m365:
+            current_fact = raw_path.with_name(f"{raw_path.stem}_Rollup.csv")
+        else:
+            current_fact = raw_path.with_name(f"{raw_path.stem}_Interactions.csv")
+            if entra_path:
+                current_users = entra_path.with_name(f"{entra_path.stem}_Users.csv")
 
     # Merge Users CSV
     append_user = getattr(config, 'append_user_info', None)
-    entra_csv = getattr(ctx, '_entra_csv_path', None)
-    if append_user and entra_csv and Path(entra_csv).exists():
+    if append_user:
         try:
             from .mod15_pax_append_merge import merge_users_csv
-            merged_path = str(Path(entra_csv).parent / f"{Path(entra_csv).stem}_Merged.csv")
+            if not current_users or not current_users.exists():
+                raise FileNotFoundError(
+                    f"Current Users CSV not found: '{current_users or ''}'"
+                )
+            merged_path = str(
+                current_users.parent / f"{current_users.stem}_Merged.csv"
+            )
             tally = merge_users_csv(
                 target_csv=append_user,
-                current_csv=entra_csv,
+                current_csv=str(current_users),
                 output_path=merged_path,
                 run_date=run_date,
+                user_history=(
+                    str(getattr(config, 'user_history', 'Off')).lower() == 'on'
+                ),
+                history_effective_date=str(
+                    getattr(config, 'history_effective_date', '') or ''
+                ),
             )
+            output["users"] = {"path": merged_path, "tally": tally}
             write_log(
                 f"Users merge: Retained={tally['Retained']}, New={tally['New']}, "
                 f"Departed={tally['Departed']}, Union={tally['Union']}"
             )
         except Exception as ex:
+            output["success"] = False
+            output["users"] = {"error": str(ex)}
             write_log(f"Users merge failed: {ex}", level="ERROR")
 
     # Merge Fact CSV
     append_fact = getattr(config, 'append_file', None)
-    if append_fact and ctx.output_file and Path(ctx.output_file).exists():
+    if append_fact:
         try:
-            from .mod15_pax_append_merge import merge_fact_csv
-            merged_path = str(Path(ctx.output_file).parent / f"{Path(ctx.output_file).stem}_Merged.csv")
-            # Use Message_Id_Raw for rollup CSVs, RecordId for raw
-            is_rollup = getattr(config, 'rollup', False) or getattr(config, 'rollup_plus_raw', False)
-            key_col = "Message_Id_Raw" if is_rollup else "RecordId"
-            tally = merge_fact_csv(
-                target_csv=append_fact,
-                current_csv=ctx.output_file,
-                output_path=merged_path,
-                key_column=key_col,
-                run_date=run_date,
-            )
-            write_log(
-                f"Fact merge: Retained={tally['Retained']}, New={tally['New']}, "
-                f"Departed={tally['Departed']}, Union={tally['Union']}"
-            )
+            if not current_fact or not current_fact.exists():
+                raise FileNotFoundError(
+                    f"Current Fact CSV not found: '{current_fact or ''}'"
+                )
+            if is_rollup and include_m365:
+                from .mod15_pax_append_merge import (
+                    merge_m365_rollup_csv,
+                    merge_m365_session_stats_csv,
+                )
+                from .processors.m365_processor import write_userstats_files
+
+                merged_rollup = str(
+                    current_fact.parent / f"{current_fact.stem}_Merged.csv"
+                )
+                rollup_tally = merge_m365_rollup_csv(
+                    append_fact, str(current_fact), merged_rollup,
+                )
+                current_session_stats = current_fact.with_name(
+                    current_fact.name.replace("_Rollup.csv", "_SessionStats.csv")
+                )
+                target_name = Path(append_fact).name
+                import re as _re
+                anchor_stem = _re.sub(
+                    r'_Rollup(?:_\d{8}_\d{6})?\.csv$', '', target_name,
+                    flags=_re.IGNORECASE,
+                )
+                target_session_stats = str(
+                    Path(append_fact).parent / f"{anchor_stem}_SessionStats.csv"
+                )
+                merged_session_stats = str(
+                    current_fact.parent / f"{current_fact.stem}_SessionStats_Merged.csv"
+                )
+                session_tally = merge_m365_session_stats_csv(
+                    target_session_stats,
+                    str(current_session_stats),
+                    merged_session_stats,
+                )
+                merged_userstats = str(
+                    current_fact.parent / f"{current_fact.stem}_UserStats_Merged.csv"
+                )
+                merged_cohort = str(
+                    current_fact.parent / f"{current_fact.stem}_SessionCohort_Merged.csv"
+                )
+                write_userstats_files(
+                    merged_rollup,
+                    merged_userstats,
+                    merged_cohort,
+                    quiet=True,
+                    session_stats_csv_path=merged_session_stats,
+                )
+                output["fact"] = {
+                    "path": merged_rollup, "tally": rollup_tally,
+                }
+                output["m365"] = {
+                    "session_stats": merged_session_stats,
+                    "user_stats": merged_userstats,
+                    "session_cohort": merged_cohort,
+                    "session_tally": session_tally,
+                }
+                write_log(
+                    f"M365 merge: Retained={rollup_tally['Retained']}, "
+                    f"New={rollup_tally['New']}, Updated={rollup_tally['Updated']}, "
+                    f"Union={rollup_tally['Union']}"
+                )
+            else:
+                import csv as _csv
+                from .mod15_pax_append_merge import merge_fact_csv
+
+                if is_rollup:
+                    with current_fact.open(
+                        "r", encoding="utf-8-sig", newline=""
+                    ) as handle:
+                        header = next(_csv.reader(handle), [])
+                    is_aibv = "Is_Agent_Activity" in header
+                    key_col = [
+                        "Audit_UserId_Normalized" if is_aibv else "User_Id_Normalized",
+                        "InteractionDate", "AgentId", "AgentName", "AppHost",
+                        "Environment", "License Status", "Context_Type",
+                        "Behavior_Category", "Behavior_Enriched", "AI_Model",
+                        "Is_Sensitive", "Autonomy_Pattern", "AppIdentity_AppId",
+                        "AISystemPlugin_Name", "ThreadId_Raw",
+                    ]
+                    if is_aibv:
+                        key_col.extend([
+                            "Is_Agent_Activity", "Web_Grounded_Signal",
+                            "Workflow_Action",
+                        ])
+                    key_col.append("Message_Id_Raw")
+                    missing = [column for column in key_col if column not in header]
+                    if missing:
+                        raise ValueError(
+                            "Current rollup is missing grain-composite append "
+                            f"column(s): {', '.join(missing)}"
+                        )
+                else:
+                    key_col = "RecordId"
+                merged_path = str(
+                    current_fact.parent / f"{current_fact.stem}_Merged.csv"
+                )
+                tally = merge_fact_csv(
+                    target_csv=append_fact,
+                    current_csv=str(current_fact),
+                    output_path=merged_path,
+                    key_column=key_col,
+                    run_date=run_date,
+                )
+                output["fact"] = {"path": merged_path, "tally": tally}
+                write_log(
+                    f"Fact merge: Retained={tally['Retained']}, New={tally['New']}, "
+                    f"Departed={tally['Departed']}, Union={tally['Union']}"
+                )
         except Exception as ex:
+            output["success"] = False
+            output["fact"] = {"error": str(ex)}
             write_log(f"Fact merge failed: {ex}", level="ERROR")
+
+    return output
 
 
 def _run_delta_export(ctx: PAXRunContext) -> None:
@@ -3323,6 +3841,110 @@ def _fetch_entra_users_with_overrides(
     return entra_data
 
 
+def _scope_entra_users(
+    ctx: PAXRunContext,
+    entra_data: list[dict[str, Any]],
+    entra_session: Any,
+) -> list[dict[str, Any]]:
+    """Apply the run's Fabric user/group scope to an Entra directory export."""
+    config = ctx.config
+    requested_user_ids = list(getattr(config, 'user_ids', None) or [])
+    requested_group_names = list(getattr(config, 'group_names', None) or [])
+    if not requested_user_ids and not requested_group_names:
+        return entra_data
+
+    scope = ctx.resolved_user_scope
+    if scope is None:
+        roster_upns = {
+            str(row.get('userPrincipalName') or '').strip().lower()
+            for row in entra_data
+            if row.get('userPrincipalName')
+        }
+
+        def _scope_graph_get(_method: str, url: str) -> dict:
+            response = entra_session.get(url, timeout=60)
+            response.raise_for_status()
+            try:
+                return response.json() or {}
+            except ValueError:
+                return {}
+
+        scope = resolve_pax_user_scope(
+            user_ids=requested_user_ids,
+            group_names=requested_group_names,
+            graph_request_fn=_scope_graph_get,
+            roster_validator=lambda user_id: user_id.strip().lower() in roster_upns,
+            log_fn=lambda msg, lvl='info': write_log(msg, level=str(lvl).upper()),
+        )
+        ctx.resolved_user_scope = scope
+        ctx.metrics.filtering_user_ids = len(scope.requested_user_ids)
+        ctx.metrics.filtering_group_names = len(scope.requested_groups)
+        ctx.metrics.scope_resolved_groups = len(scope.resolved_groups)
+        ctx.metrics.scope_failed_groups = sum((
+            len(scope.failed_groups),
+            len(scope.ambiguous_groups),
+            len(scope.zero_member_groups),
+            len(scope.unauthorized_groups),
+            len(scope.transport_error_groups),
+            len(scope.resolution_error_groups),
+        ))
+        ctx.metrics.scope_expanded_members = len(scope.resolved_transitive_members)
+        ctx.metrics.scope_final_target_users = len(scope.final_target_users)
+
+    if scope.outcome != 'Succeeded':
+        raise RuntimeError(
+            f"User scope resolution failed ({scope.failure_stage}); refusing "
+            "to export an unscoped Entra directory."
+        )
+    if not scope.final_target_users:
+        raise RuntimeError(
+            "User scope resolution produced zero target users; refusing to "
+            "export an unscoped Entra directory."
+        )
+
+    target_upns = {
+        str(user_id).strip().lower()
+        for user_id in scope.final_target_users
+        if str(user_id).strip()
+    }
+    before_count = len(entra_data)
+    scoped_data = [
+        row for row in entra_data
+        if str(row.get('userPrincipalName') or '').strip().lower() in target_upns
+    ]
+    after_count = len(scoped_data)
+    ctx.metrics.directory_rows_before_scope = before_count
+    ctx.metrics.directory_rows_after_scope = after_count
+    ctx.metrics.directory_rows_excluded_by_scope = before_count - after_count
+    write_log(
+        f"Entra directory scope applied: {before_count} -> {after_count} "
+        f"({before_count - after_count} excluded)"
+    )
+    return scoped_data
+
+
+def _resolve_stream_staging_dir(
+    ctx: PAXRunContext, configured_output: str | None
+) -> Path:
+    notebook_root = getattr(ctx, '_csv_output_root', None)
+    if notebook_root:
+        output_dir = Path(notebook_root)
+    else:
+        remote_scratch = getattr(ctx.config, 'remote_scratch_dir', None)
+        effective_output = remote_scratch or configured_output
+        if effective_output:
+            candidate = Path(effective_output)
+            output_dir = (
+                candidate
+                if candidate.is_dir() or str(effective_output).endswith(('/', '\\'))
+                else candidate.parent
+            )
+        else:
+            output_dir = Path.cwd()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
 def _export_entra_users_only(ctx: PAXRunContext) -> None:
     """Export Entra user/license data as the sole output (-OnlyUserInfo mode).
 
@@ -3341,15 +3963,7 @@ def _export_entra_users_only(ctx: PAXRunContext) -> None:
     # OnlyUserInfo uses OutputPathUserInfo as the destination (PS Resolve-DataTypePaths
     # resolves 'UserInfo' key first, then falls back to Purview/OutputPath).
     effective_output = config.output_path_user_info or config.output_path
-    if effective_output:
-        candidate = Path(effective_output)
-        if candidate.is_dir() or effective_output.endswith(('/', '\\')):
-            output_dir = candidate
-        else:
-            output_dir = candidate.parent
-        output_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        output_dir = Path.cwd()
+    output_dir = _resolve_stream_staging_dir(ctx, effective_output)
 
     entra_csv = str(output_dir / filename)
 
@@ -3383,10 +3997,8 @@ def _export_entra_users_only(ctx: PAXRunContext) -> None:
         write_log(f"Entra directory fetch failed: {ex}", level="ERROR")
         ctx.metrics.entra_directory_fetch_failed = True
         entra_data = []
+    entra_data = _scope_entra_users(ctx, entra_data, entra_session)
     if entra_data:
-        if getattr(config, 'deidentify', False):
-            from .mod18_pax_deidentify import PaxDeidentifier
-            entra_data = PaxDeidentifier().deidentify_rows("EntraUsers", entra_data)
         entra_columns = list(entra_data[0].keys()) if entra_data else []
         writer = CsvWriter(path=entra_csv, columns=entra_columns)
         writer.write_rows(entra_data)
@@ -3450,10 +4062,8 @@ def _export_entra_users(ctx: PAXRunContext) -> None:
     except Exception as ex:
         write_log(f"Entra directory fetch failed: {ex}", level="ERROR")
         ctx.metrics.entra_directory_fetch_failed = True
+    entra_data = _scope_entra_users(ctx, entra_data, entra_session)
     if entra_data:
-        if getattr(config, 'deidentify', False):
-            from .mod18_pax_deidentify import PaxDeidentifier
-            entra_data = PaxDeidentifier().deidentify_rows("EntraUsers", entra_data)
         entra_columns = list(entra_data[0].keys()) if entra_data else []
         writer = CsvWriter(path=entra_csv, columns=entra_columns)
         writer.write_rows(entra_data)
