@@ -681,6 +681,7 @@ def _read_directory_csv(path: str) -> list[dict[str, Any]]:
     for a missing local path and ``NotImplementedError`` for a remote
     (SharePoint/OneLake) URL, which is out of scope for this port."""
     import csv as _csv
+    from . import files_io
 
     if path.startswith("https://") or path.startswith("http://"):
         raise NotImplementedError(
@@ -688,7 +689,9 @@ def _read_directory_csv(path: str) -> list[dict[str, Any]]:
             f"in pax_fabric (got: {path!r}). Download the CSV locally first, or "
             f"stage it under the lakehouse Files/ path and pass that local path."
         )
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+    # v1.11.16 parity with the BYOD Purview resolver: accept 'Files/...' shortform.
+    resolved = files_io.resolve_lakehouse_input_path(path)
+    with open(resolved, "r", encoding="utf-8-sig", newline="") as f:
         reader = _csv.DictReader(f)
         return [dict(row) for row in reader]
 

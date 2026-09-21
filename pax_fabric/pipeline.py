@@ -376,15 +376,42 @@ def _iter_delta_as_dicts(
 
 
 def _resolve_byod_raw_table(config: PAXConfig) -> str:
-    """Resolve PurviewInputTable=auto to the dashboard's canonical raw table."""
+    """Resolve PurviewInputTable=auto to the dashboard's canonical raw table.
+
+    Honours ``requested_dashboards`` (multi-dashboard mode) before falling back
+    to the scalar ``dashboard`` attribute, so a run like ``Dashboard=AIO,M365``
+    with ``PurviewInputTable=auto`` is rejected explicitly instead of silently
+    picking the wrong table for one of the passes.
+    """
     import re
 
     requested = str(getattr(config, "purview_input_table", "") or "").strip()
-    dashboard = str(getattr(config, "dashboard", "") or "").strip().upper()
+    dashboards = [
+        str(item).strip().upper()
+        for item in (getattr(config, "requested_dashboards", None) or [])
+        if str(item).strip()
+    ]
+    if not dashboards:
+        scalar = str(getattr(config, "dashboard", "") or "").strip().upper()
+        if scalar:
+            dashboards = [scalar]
     if requested.lower() == "auto":
-        if dashboard == "M365" or getattr(config, "include_m365_usage", False):
+        copilot_dashboards = {"AIO", "VALUELENS"}
+        wants_m365 = (
+            "M365" in dashboards
+            or getattr(config, "include_m365_usage", False)
+        )
+        wants_copilot = any(dash in copilot_dashboards for dash in dashboards)
+        if wants_m365 and wants_copilot:
+            raise ValueError(
+                "PurviewInputTable='auto' cannot be resolved when both M365 and "
+                "a Copilot dashboard (AIO/ValueLens) are requested — the two "
+                "read from different raw tables (M365_Raw vs "
+                "CopilotInteractions_Raw). Supply an explicit table name."
+            )
+        if wants_m365:
             return "M365_Raw"
-        if dashboard in ("AIO", "VALUELENS"):
+        if wants_copilot:
             return "CopilotInteractions_Raw"
         return "Audit_Raw"
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", requested):
@@ -1500,6 +1527,46 @@ def run(params: Optional[dict] = None) -> dict:
         result["authentication_reasons"] = list(
             source_plan["authentication_reasons"]
         )
+
+        # v1.11.16 BYOD parity: PS `Get-PaxByodBootstrap` (L10276-L10293)
+        # prints a NOTE when a supplied file is ignored (no rollup/dashboard
+        # requested) so the user isn't left wondering why a live run happened.
+        if source_plan["source_state"] == "ByodIgnored":
+            supplied = (
+                getattr(config, "purview_input_file", None)
+                or getattr(config, "purview_input_table", None)
+                or "(unknown)"
+            )
+            write_log(
+                f"NOTE: PurviewInput* was supplied ('{supplied}') but is ignored "
+                "because neither Rollup, RollupPlusRaw, nor a Dashboard selector "
+                "(AIO/M365/ValueLens) was requested. Add one of those to activate "
+                "BYOD, or remove the input to run the live Purview collection.",
+                level="WARN",
+            )
+        # v1.11.16 BYOD date-notice parity: PS `Get-PaxByodDateNotice`
+        # (L10515) warns that StartDate/EndDate are ignored when BYOD is
+        # active because the full supplied CSV/table is always processed.
+        if source_plan["source_state"] == "ByodActive" and (
+            getattr(config, "_start_date_explicit", False)
+            or getattr(config, "_end_date_explicit", False)
+        ):
+            write_log(
+                "NOTE: StartDate/EndDate were supplied but are ignored — "
+                "BYOD reads the full supplied CSV/table (records are not "
+                "date-trimmed against the requested window).",
+                level="WARN",
+            )
+        # v1.11.16 BYOD short-circuit: PS exits after `Get-PaxByodBootstrap`
+        # when nothing else is requested. In the notebook path we still let
+        # the standard pipeline run (it will write a zero-record CSV / no
+        # Delta table), but surface a clear NOTE so the user knows.
+        if source_plan.get("no_work"):
+            write_log(
+                "NOTE: no live Purview / Entra / Agent 365 work requested and "
+                "BYOD is ignored — this run will produce no data outputs.",
+                level="WARN",
+            )
 
         # --- Checkpoint self-gate (PS L17575) ---
         set_checkpoint_enabled(bool(source_plan["checkpoint_permitted"]))
