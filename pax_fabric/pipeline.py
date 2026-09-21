@@ -65,6 +65,7 @@ from .mod6_pax_checkpoint import (
     find_checkpoints,
     get_checkpoint_data,
     get_checkpoint_path,
+    is_checkpoint_enabled,
     read_checkpoint,
     remove_checkpoint,
     reset_checkpoint_state,
@@ -2640,7 +2641,8 @@ def run(params: Optional[dict] = None) -> dict:
                 result["exit_code"] = EXIT_ERROR
                 result["error"] = f"Watermark advance failed: {_wm_exc}"
                 write_log(result["error"], level="ERROR")
-        if ctx.script_completed:
+        # BYOD / OnlyUserInfo disable checkpointing outright — nothing was ever written to preserve.
+        if ctx.script_completed and is_checkpoint_enabled():
             cp_data_final = get_checkpoint_data() or {}
             cp_parts = (
                 cp_data_final.get("partitions", {})

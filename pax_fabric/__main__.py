@@ -67,6 +67,7 @@ from .mod6_pax_checkpoint import (
     get_checkpoint_data,
     get_partitions_to_process,
     initialize_checkpoint_for_new_run,
+    is_checkpoint_enabled,
     is_resume_mode,
     read_checkpoint,
     remove_checkpoint,
@@ -4171,7 +4172,8 @@ def _cleanup(ctx: PAXRunContext) -> None:
         pass
 
     # Remove checkpoint only when every planned partition completed.
-    if ctx.script_completed:
+    # BYOD / OnlyUserInfo disable checkpointing outright — nothing to preserve or warn about.
+    if ctx.script_completed and is_checkpoint_enabled():
         cp_data = get_checkpoint_data() or {}
         cp_parts = cp_data.get("partitions", {}) if isinstance(cp_data, dict) else {}
         cp_stats = cp_data.get("statistics", {}) if isinstance(cp_data, dict) else {}
