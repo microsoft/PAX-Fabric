@@ -2410,7 +2410,7 @@ def run(params: Optional[dict] = None) -> dict:
 
             # ----------------------------------------------------------
             # 7b. Recompute UserStats + SessionCohort from accumulated
-            #     Rollup Delta (M365 usage mode only).
+            #     Rollup Delta (M365 usage rollup runs only).
             #
             #     The per-run CSV-derived UserStats/SessionCohort were
             #     already drained in step 7 (overwrite strategy), but
@@ -2418,8 +2418,18 @@ def run(params: Optional[dict] = None) -> dict:
             #     from the full accumulated Rollup Delta ensures the
             #     percentiles, tiers, and cohort buckets cover the
             #     entire history — not just the latest run.
+            #
+            #     PS parity: the recompute is the Python port's trailing
+            #     pass of the M365Bundle rollup processor. PS only fires
+            #     that processor under -Rollup / -RollupPlusRaw, so a
+            #     bare -IncludeM365Usage run is raw-only. Gate the same
+            #     way here, otherwise raw-only runs blow up because no
+            #     _Rollup Delta was produced this pass.
             # ----------------------------------------------------------
-            if getattr(config, "include_m365_usage", False):
+            if getattr(config, "include_m365_usage", False) and (
+                getattr(config, "rollup", False)
+                or getattr(config, "rollup_plus_raw", False)
+            ):
                 set_progress_phase("Export", status="Recompute UserStats")
                 write_log(
                     "Recomputing UserStats/SessionCohort from accumulated "
