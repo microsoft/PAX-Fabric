@@ -748,6 +748,159 @@ def canonical_filler_mode(raw) -> str:
     return _FILLER_MODE_MAP.get(key, "none")
 
 
+# Defaults used to detect "non-default" live-query pacing knobs for the BYOD
+# rejected-switches check. Sourced from the field defaults on ``PAXConfig`` at
+# import time so any future default change is picked up automatically. PS
+# parity: L10500-L10509 ($nonDefaultNames build in `Get-PaxByodBootstrap`).
+def _byod_pacing_defaults() -> dict[str, Any]:
+    defaults = PAXConfig()
+    return {
+        "block_hours": defaults.block_hours,
+        "partition_hours": defaults.partition_hours,
+        "max_partitions": defaults.max_partitions,
+        "max_concurrency": defaults.max_concurrency,
+        "pacing_ms": defaults.pacing_ms,
+        "result_size": defaults.result_size,
+        "parallel_mode": defaults.parallel_mode,
+        "max_parallel_groups": defaults.max_parallel_groups,
+        "enable_parallel": defaults.enable_parallel,
+        "disable_adaptive": defaults.disable_adaptive,
+        "adaptive_concurrency_ceiling": getattr(defaults, "adaptive_concurrency_ceiling", None),
+        "backoff_base_seconds": getattr(defaults, "backoff_base_seconds", None),
+        "backoff_max_seconds": getattr(defaults, "backoff_max_seconds", None),
+        "circuit_breaker_threshold": getattr(defaults, "circuit_breaker_threshold", None),
+        "circuit_breaker_cooldown_seconds": getattr(defaults, "circuit_breaker_cooldown_seconds", None),
+        "max_network_outage_minutes": getattr(defaults, "max_network_outage_minutes", None),
+    }
+
+
+def _collect_byod_rejected_switches(config: "PAXConfig") -> list[str]:
+    """Port of PS `Get-PaxByodRejectedSwitches` (L10477-L10510).
+
+    Returns validation error strings when a caller-supplied Purview input
+    (``PurviewInputFile`` or ``PurviewInputTable``) is combined with switches
+    that the BYOD pipeline cannot honour. Two tiers, matching PS:
+
+    * Always-rejected (fired whenever an input is supplied, even when it will be
+      ignored because no rollup/dashboard turns BYOD active): ``RAWInputCSV``,
+      ``UseEOM``, ``Resume``, ``Dashboard AISID``.
+    * Live-only-rejected (fired only when BYOD is *active*, i.e. rollup is on):
+      the suppression-list filter switches and any non-default value on the
+      live-query pacing knobs — a supplied file/table is passed to the
+      processor verbatim, so these controls can never shape it.
+
+    Only switches surfaced by ``PAXConfig`` are checked; PS-only switches
+    (e.g. Dashboard AISID which lives in a separate gate) are already caught
+    elsewhere.
+    """
+    byod_supplied = bool(
+        getattr(config, "purview_input_file", None)
+        or getattr(config, "purview_input_table", None)
+    )
+    if not byod_supplied:
+        return []
+
+    errors: list[str] = []
+    always_rejected: list[str] = []
+
+    # Always-rejected group. RAWInputCSV / PurviewInputFile is already covered
+    # by the offline-source mutex above, so only surface it here when it wasn't
+    # (i.e. the user supplied RAWInputCSV alongside PurviewInputTable — which
+    # DOES get its own mutex — or as a defensive belt-and-braces guard).
+    if getattr(config, "use_eom", False):
+        always_rejected.append("UseEOM")
+    if str(getattr(config, "resume", "") or "").strip():
+        always_rejected.append("Resume")
+    # Dashboard=AISID with a supplied Purview input is rejected even when BYOD
+    # is otherwise ignored — the AISID dashboard is live-only.
+    dashboard = str(getattr(config, "dashboard", "") or "").strip().upper()
+    if dashboard == "AISID":
+        always_rejected.append("Dashboard AISID")
+
+    for name in always_rejected:
+        if name == "Dashboard AISID":
+            errors.append(
+                "Dashboard=AISID cannot be combined with PurviewInputFile/"
+                "PurviewInputTable: the AISID dashboard is produced only by "
+                "its live multi-service collection and cannot be built from a "
+                "supplied file/table."
+            )
+        else:
+            errors.append(
+                f"{name} cannot be combined with PurviewInputFile/"
+                f"PurviewInputTable. Remove the conflicting switch and re-run."
+            )
+
+    byod_active = byod_supplied and bool(
+        getattr(config, "rollup", False) or getattr(config, "rollup_plus_raw", False)
+    )
+    if not byod_active:
+        return errors
+
+    live_only_rejected: list[str] = []
+
+    # PS parity: mirror $PSBoundParameters.ContainsKey for filters the M365 bundle auto-injects.
+    _rec_user_supplied = bool(getattr(config, "_user_supplied_record_types", False))
+    _svc_user_supplied = bool(getattr(config, "_user_supplied_service_types", False))
+    filter_map = (
+        ("user_ids", "UserIds", lambda v: bool(v)),
+        ("group_names", "GroupNames", lambda v: bool(v)),
+        ("agent_id", "AgentId", lambda v: bool(v)),
+        ("agents_only", "AgentsOnly", lambda v: bool(v)),
+        ("exclude_agents", "ExcludeAgents", lambda v: bool(v)),
+        ("prompt_filter", "PromptFilter", lambda v: bool(str(v or "").strip())),
+        ("record_types", "RecordTypes", lambda v: bool(v) and _rec_user_supplied),
+        ("service_types", "ServiceTypes", lambda v: bool(v) and _svc_user_supplied),
+        ("auto_completeness", "AutoCompleteness", lambda v: bool(v)),
+        ("include_telemetry", "IncludeTelemetry", lambda v: bool(v)),
+        ("verify_partition_stability", "VerifyPartitionStability", lambda v: bool(v)),
+    )
+    for attr, ps_name, is_supplied in filter_map:
+        if is_supplied(getattr(config, attr, None)):
+            live_only_rejected.append(ps_name)
+
+    # Non-default pacing knobs.
+    defaults = _byod_pacing_defaults()
+    pacing_map = (
+        ("block_hours", "BlockHours"),
+        ("partition_hours", "PartitionHours"),
+        ("max_partitions", "MaxPartitions"),
+        ("max_concurrency", "MaxConcurrency"),
+        ("pacing_ms", "PacingMs"),
+        ("result_size", "ResultSize"),
+        ("parallel_mode", "ParallelMode"),
+        ("max_parallel_groups", "MaxParallelGroups"),
+        ("enable_parallel", "EnableParallel"),
+        ("disable_adaptive", "DisableAdaptive"),
+        ("adaptive_concurrency_ceiling", "AdaptiveConcurrencyCeiling"),
+        ("backoff_base_seconds", "BackoffBaseSeconds"),
+        ("backoff_max_seconds", "BackoffMaxSeconds"),
+        ("circuit_breaker_threshold", "CircuitBreakerThreshold"),
+        ("circuit_breaker_cooldown_seconds", "CircuitBreakerCooldownSeconds"),
+        ("max_network_outage_minutes", "MaxNetworkOutageMinutes"),
+    )
+    for attr, ps_name in pacing_map:
+        default_value = defaults.get(attr)
+        if default_value is None:
+            continue
+        current = getattr(config, attr, None)
+        if current is None:
+            continue
+        if current != default_value:
+            live_only_rejected.append(ps_name)
+
+    if live_only_rejected:
+        joined = ", ".join(f"-{name}" for name in live_only_rejected)
+        errors.append(
+            "Live-collection controls cannot be combined with PurviewInputFile/"
+            f"PurviewInputTable while BYOD is active: {joined}. The supplied "
+            "CSV/table is passed to the processor exactly as provided and cannot "
+            "be re-shaped by pacing or filter switches."
+        )
+
+    return errors
+
+
 # ===========================================================================
 # VALIDATION FUNCTIONS
 # ===========================================================================
@@ -1498,7 +1651,29 @@ def validate_config(config: PAXConfig) -> list[str]:
             "PurviewInputFile and PurviewInputTable cannot both be supplied. "
             "Choose one authoritative BYOD source."
         )
-    elif uh_raw == "On":
+
+    # PS L11012-L11066 parity: RAWInputCSV (replay) and PurviewInputFile
+    # (BYOD) are both offline sources — mixing them is a configuration
+    # error because the pipeline can only drain one at a time.
+    if config.raw_input_csv and config.purview_input_file:
+        errors.append(
+            "RAWInputCSV and PurviewInputFile cannot both be supplied. "
+            "Choose one offline audit source."
+        )
+    if config.raw_input_csv and config.purview_input_table:
+        errors.append(
+            "RAWInputCSV and PurviewInputTable cannot both be supplied. "
+            "Choose one offline audit source."
+        )
+
+    # PS L10477-L10510 / L11012-L11045 parity: Get-PaxByodRejectedSwitches.
+    # A supplied Purview input rejects a fixed list of switches unconditionally;
+    # when BYOD is actually active a further list of live-query controls is also
+    # rejected because a caller-supplied CSV/table is passed to the processor
+    # verbatim and cannot be shaped by pacing/filter switches.
+    errors.extend(_collect_byod_rejected_switches(config))
+
+    if uh_raw == "On":
         if not (config.rollup or config.rollup_plus_raw):
             errors.append("UserHistory On requires Rollup or RollupPlusRaw.")
         if not config.include_user_info:
@@ -1991,11 +2166,14 @@ def config_from_params(params: dict) -> "PAXConfig":
     cfg = PAXConfig()
 
     # --- Dates -------------------------------------------------------
+    # Fabric pipeline blank parameters arrive as '' — treat as "not supplied"
+    # so __post_init__ leaves _start_date_explicit / _end_date_explicit False
+    # and the BYOD date-notice WARN doesn't misfire on empty defaults.
     sd = pick("startdate", "start_date")
     ed = pick("enddate", "end_date")
-    if sd is not None:
+    if sd is not None and str(sd).strip():
         cfg.start_date = str(sd)
-    if ed is not None:
+    if ed is not None and str(ed).strip():
         cfg.end_date = str(ed)
 
     # --- Output (legacy local + new lakehouse) -----------------------
@@ -2042,6 +2220,11 @@ def config_from_params(params: dict) -> "PAXConfig":
             coerced = _coerce_csv_list(v)
             if coerced is not None:
                 setattr(cfg, dst, coerced)
+                # PS $PSBoundParameters.ContainsKey parity: only user-supplied values count.
+                if dst == "record_types" and coerced:
+                    cfg._user_supplied_record_types = True
+                elif dst == "service_types" and coerced:
+                    cfg._user_supplied_service_types = True
 
     pf = pick("promptfilter", "prompt_filter")
     if pf is not None:

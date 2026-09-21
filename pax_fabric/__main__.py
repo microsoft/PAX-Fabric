@@ -67,6 +67,7 @@ from .mod6_pax_checkpoint import (
     get_checkpoint_data,
     get_partitions_to_process,
     initialize_checkpoint_for_new_run,
+    is_checkpoint_enabled,
     is_resume_mode,
     read_checkpoint,
     remove_checkpoint,
@@ -585,6 +586,12 @@ def _apply_cli_args(config: 'PAXConfig', args: argparse.Namespace) -> None:
     # Track explicit output path
     if args.output_path is not None:
         config._output_path_explicit = True
+
+    # PS $PSBoundParameters.ContainsKey parity for RecordTypes / ServiceTypes.
+    if getattr(args, "record_types", None):
+        config._user_supplied_record_types = True
+    if getattr(args, "service_types", None):
+        config._user_supplied_service_types = True
 
 
 # ---------------------------------------------------------------------------
@@ -1244,18 +1251,27 @@ def _load_csv_to_shards(
 ) -> int:
     """Validate and stream a Purview CSV into the normal JSONL shard path."""
     import csv
+    from . import files_io
 
     config = ctx.config
-    src_path = Path(src)
+    # v1.11.16 BYOD parity: Fabric users type lakehouse-relative paths
+    # ("Files/byod/audit.csv"); resolve to the openable filesystem path
+    # so open() succeeds. Absolute paths and abfss:// URIs pass through.
+    resolved = files_io.resolve_lakehouse_input_path(src)
+    src_path = Path(resolved)
 
-    write_log(f"{source_label} mode: reading Purview audit records from '{src}'")
+    if resolved != src:
+        write_log(
+            f"{source_label} mode: resolved '{src}' -> '{resolved}'"
+        )
+    write_log(f"{source_label} mode: reading Purview audit records from '{resolved}'")
 
     if not src_path.exists():
-        raise FileNotFoundError(f"{source_label} source not found: {src}")
+        raise FileNotFoundError(f"{source_label} source not found: {resolved}")
     if not src_path.is_file():
-        raise ValueError(f"{source_label} source is not a file: {src}")
+        raise ValueError(f"{source_label} source is not a file: {resolved}")
     if src_path.suffix.lower() != '.csv':
-        raise ValueError(f"{source_label} source must be a .csv file: {src}")
+        raise ValueError(f"{source_label} source must be a .csv file: {resolved}")
 
     # Prepare the same spill layout the live-fetch path uses so Phase 6's
     # shard iterator sees no difference between BYOD and live sources.
@@ -1288,7 +1304,7 @@ def _load_csv_to_shards(
         if path:
             spilled_shards.append(path)
             write_log(
-                f"  [BYOD] shard {shard_seq:04d} ({len(recs)} records) "
+                f"  [{source_label}] shard {shard_seq:04d} ({len(recs)} records) "
                 f"written to {Path(path).name}"
             )
 
@@ -1297,7 +1313,7 @@ def _load_csv_to_shards(
         try:
             raw_headers = next(reader)
         except StopIteration as ex:
-            raise ValueError(f"{source_label} source has no header row: {src}") from ex
+            raise ValueError(f"{source_label} source has no header row: {resolved}") from ex
         headers = [header.strip() for header in raw_headers]
         if not headers or any(not header for header in headers):
             raise ValueError(f"{source_label} source contains a blank column name")
@@ -1358,6 +1374,13 @@ def _load_csv_to_shards(
         f"  [{source_label}] Loaded {records_total} record(s) across "
         f"{len(spilled_shards)} JSONL shard(s) in {incremental_dir}"
     )
+    # v1.11.16 BYOD privacy guarantee (PS L52678): the supplied source is
+    # streamed once and never rewritten; downstream deidentify/retention
+    # operates on the run-owned shards, not on the caller's file.
+    if source_label == "BYOD":
+        write_log(
+            f"  [BYOD] Supplied source is read-only; no changes were made to '{resolved}'"
+        )
 
     elapsed = (time.perf_counter_ns() - start_ns) // 1_000_000
     return elapsed
@@ -4155,7 +4178,8 @@ def _cleanup(ctx: PAXRunContext) -> None:
         pass
 
     # Remove checkpoint only when every planned partition completed.
-    if ctx.script_completed:
+    # BYOD / OnlyUserInfo disable checkpointing outright — nothing to preserve or warn about.
+    if ctx.script_completed and is_checkpoint_enabled():
         cp_data = get_checkpoint_data() or {}
         cp_parts = cp_data.get("partitions", {}) if isinstance(cp_data, dict) else {}
         cp_stats = cp_data.get("statistics", {}) if isinstance(cp_data, dict) else {}

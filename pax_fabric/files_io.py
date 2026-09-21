@@ -145,4 +145,33 @@ def onelake_storage_options() -> Optional[dict]:
     return {"bearer_token": token, "use_fabric_endpoint": "true"}
 
 
+# v1.11.16 BYOD parity: PS `Resolve-DirectoryCsvInput` (L10267) accepts a
+# supplied file as (a) an absolute local path, (b) a lakehouse-relative
+# `Files/...` path, or (c) an already-mounted `/lakehouse/...` path and
+# normalizes them to something `open()` can read. Fabric users typically
+# type `Files/byod/audit.csv` because that's what the lakehouse browser
+# shows; without this resolver the loader would fail with FileNotFound.
+def resolve_lakehouse_input_path(user_path: str) -> str:
+    """Resolve a BYOD input path to an openable filesystem path."""
+    if not user_path:
+        return user_path
+    stripped = str(user_path).strip()
+    if not stripped:
+        return stripped
+    lowered = stripped.lower()
+    # abfss:// and onelake HTTPS URIs go through deltalake, not open()
+    if lowered.startswith("abfss://") or lowered.startswith("https://"):
+        return stripped
+    normalized = stripped.replace("\\", "/")
+    # Already-mounted absolute paths (Linux Fabric runtime + Windows dev)
+    if normalized.startswith("/lakehouse/") or normalized.startswith("/mnt/lakehouse/"):
+        return normalized
+    if os.path.isabs(stripped):
+        return stripped
+    # Fabric convention: `Files/...` -> `/lakehouse/default/Files/...`
+    if normalized.startswith("Files/") or normalized == "Files":
+        return os.path.join(LAKEHOUSE_FILES_MOUNT, normalized[len("Files/"):] if normalized != "Files" else "")
+    return stripped
+
+
 

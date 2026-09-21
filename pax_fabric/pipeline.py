@@ -65,6 +65,7 @@ from .mod6_pax_checkpoint import (
     find_checkpoints,
     get_checkpoint_data,
     get_checkpoint_path,
+    is_checkpoint_enabled,
     read_checkpoint,
     remove_checkpoint,
     reset_checkpoint_state,
@@ -285,10 +286,14 @@ def _resolve_csv_output_root(cfg: PAXConfig, run_id: str, *,
     # PAXConfig snapshots (without these fields) working unchanged.
     _stream_bindings = (
         # (output attr, append attr, scope predicate)
+        # UserInfoFile / UserInfoSupplement force IncludeUserInfo on downstream (PS L8482),
+        # so pre-bind the EntraUsers destination now to avoid a Fabric-only XOR gap.
         ("output_path_user_info",
          "append_user_info",
          getattr(cfg, "include_user_info", False)
-         or getattr(cfg, "only_user_info", False)),
+         or getattr(cfg, "only_user_info", False)
+         or bool(getattr(cfg, "user_info_file", None))
+         or bool(getattr(cfg, "user_info_supplement", None))),
         ("output_path_agent365_info",
          "append_agent365_info",
          getattr(cfg, "include_agent365_info", False)
@@ -376,15 +381,42 @@ def _iter_delta_as_dicts(
 
 
 def _resolve_byod_raw_table(config: PAXConfig) -> str:
-    """Resolve PurviewInputTable=auto to the dashboard's canonical raw table."""
+    """Resolve PurviewInputTable=auto to the dashboard's canonical raw table.
+
+    Honours ``requested_dashboards`` (multi-dashboard mode) before falling back
+    to the scalar ``dashboard`` attribute, so a run like ``Dashboard=AIO,M365``
+    with ``PurviewInputTable=auto`` is rejected explicitly instead of silently
+    picking the wrong table for one of the passes.
+    """
     import re
 
     requested = str(getattr(config, "purview_input_table", "") or "").strip()
-    dashboard = str(getattr(config, "dashboard", "") or "").strip().upper()
+    dashboards = [
+        str(item).strip().upper()
+        for item in (getattr(config, "requested_dashboards", None) or [])
+        if str(item).strip()
+    ]
+    if not dashboards:
+        scalar = str(getattr(config, "dashboard", "") or "").strip().upper()
+        if scalar:
+            dashboards = [scalar]
     if requested.lower() == "auto":
-        if dashboard == "M365" or getattr(config, "include_m365_usage", False):
+        copilot_dashboards = {"AIO", "VALUELENS"}
+        wants_m365 = (
+            "M365" in dashboards
+            or getattr(config, "include_m365_usage", False)
+        )
+        wants_copilot = any(dash in copilot_dashboards for dash in dashboards)
+        if wants_m365 and wants_copilot:
+            raise ValueError(
+                "PurviewInputTable='auto' cannot be resolved when both M365 and "
+                "a Copilot dashboard (AIO/ValueLens) are requested — the two "
+                "read from different raw tables (M365_Raw vs "
+                "CopilotInteractions_Raw). Supply an explicit table name."
+            )
+        if wants_m365:
             return "M365_Raw"
-        if dashboard in ("AIO", "VALUELENS"):
+        if wants_copilot:
             return "CopilotInteractions_Raw"
         return "Audit_Raw"
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", requested):
@@ -1501,6 +1533,46 @@ def run(params: Optional[dict] = None) -> dict:
             source_plan["authentication_reasons"]
         )
 
+        # v1.11.16 BYOD parity: PS `Get-PaxByodBootstrap` (L10276-L10293)
+        # prints a NOTE when a supplied file is ignored (no rollup/dashboard
+        # requested) so the user isn't left wondering why a live run happened.
+        if source_plan["source_state"] == "ByodIgnored":
+            supplied = (
+                getattr(config, "purview_input_file", None)
+                or getattr(config, "purview_input_table", None)
+                or "(unknown)"
+            )
+            write_log(
+                f"NOTE: PurviewInput* was supplied ('{supplied}') but is ignored "
+                "because neither Rollup, RollupPlusRaw, nor a Dashboard selector "
+                "(AIO/M365/ValueLens) was requested. Add one of those to activate "
+                "BYOD, or remove the input to run the live Purview collection.",
+                level="WARN",
+            )
+        # v1.11.16 BYOD date-notice parity: PS `Get-PaxByodDateNotice`
+        # (L10515) warns that StartDate/EndDate are ignored when BYOD is
+        # active because the full supplied CSV/table is always processed.
+        if source_plan["source_state"] == "ByodActive" and (
+            getattr(config, "_start_date_explicit", False)
+            or getattr(config, "_end_date_explicit", False)
+        ):
+            write_log(
+                "NOTE: StartDate/EndDate were supplied but are ignored — "
+                "BYOD reads the full supplied CSV/table (records are not "
+                "date-trimmed against the requested window).",
+                level="WARN",
+            )
+        # v1.11.16 BYOD short-circuit: PS exits after `Get-PaxByodBootstrap`
+        # when nothing else is requested. In the notebook path we still let
+        # the standard pipeline run (it will write a zero-record CSV / no
+        # Delta table), but surface a clear NOTE so the user knows.
+        if source_plan.get("no_work"):
+            write_log(
+                "NOTE: no live Purview / Entra / Agent 365 work requested and "
+                "BYOD is ignored — this run will produce no data outputs.",
+                level="WARN",
+            )
+
         # --- Checkpoint self-gate (PS L17575) ---
         set_checkpoint_enabled(bool(source_plan["checkpoint_permitted"]))
 
@@ -2342,7 +2414,7 @@ def run(params: Optional[dict] = None) -> dict:
 
             # ----------------------------------------------------------
             # 7b. Recompute UserStats + SessionCohort from accumulated
-            #     Rollup Delta (M365 usage mode only).
+            #     Rollup Delta (M365 usage rollup runs only).
             #
             #     The per-run CSV-derived UserStats/SessionCohort were
             #     already drained in step 7 (overwrite strategy), but
@@ -2350,8 +2422,18 @@ def run(params: Optional[dict] = None) -> dict:
             #     from the full accumulated Rollup Delta ensures the
             #     percentiles, tiers, and cohort buckets cover the
             #     entire history — not just the latest run.
+            #
+            #     PS parity: the recompute is the Python port's trailing
+            #     pass of the M365Bundle rollup processor. PS only fires
+            #     that processor under -Rollup / -RollupPlusRaw, so a
+            #     bare -IncludeM365Usage run is raw-only. Gate the same
+            #     way here, otherwise raw-only runs blow up because no
+            #     _Rollup Delta was produced this pass.
             # ----------------------------------------------------------
-            if getattr(config, "include_m365_usage", False):
+            if getattr(config, "include_m365_usage", False) and (
+                getattr(config, "rollup", False)
+                or getattr(config, "rollup_plus_raw", False)
+            ):
                 set_progress_phase("Export", status="Recompute UserStats")
                 write_log(
                     "Recomputing UserStats/SessionCohort from accumulated "
@@ -2573,7 +2655,8 @@ def run(params: Optional[dict] = None) -> dict:
                 result["exit_code"] = EXIT_ERROR
                 result["error"] = f"Watermark advance failed: {_wm_exc}"
                 write_log(result["error"], level="ERROR")
-        if ctx.script_completed:
+        # BYOD / OnlyUserInfo disable checkpointing outright — nothing was ever written to preserve.
+        if ctx.script_completed and is_checkpoint_enabled():
             cp_data_final = get_checkpoint_data() or {}
             cp_parts = (
                 cp_data_final.get("partitions", {})

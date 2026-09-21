@@ -111,6 +111,11 @@ def set_checkpoint_enabled(enabled: bool) -> None:
     _checkpoint_enabled = enabled
 
 
+def is_checkpoint_enabled() -> bool:
+    """Returns the current self-gate state (False under BYOD / OnlyUserInfo)."""
+    return _checkpoint_enabled
+
+
 def reset_checkpoint_state() -> None:
     """Resets all module-level checkpoint state."""
     global _checkpoint_path, _checkpoint_data, _partial_output_path, _is_resume_mode
