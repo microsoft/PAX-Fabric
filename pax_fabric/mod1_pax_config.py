@@ -1676,7 +1676,18 @@ def validate_config(config: PAXConfig) -> list[str]:
     if uh_raw == "On":
         if not (config.rollup or config.rollup_plus_raw):
             errors.append("UserHistory On requires Rollup or RollupPlusRaw.")
-        if not config.include_user_info:
+        # -Rollup (CopilotInteraction) auto-enables -IncludeUserInfo at the
+        # rollup side-effect step, which runs AFTER validation (initialize_config
+        # step 7b). PS enables IncludeUserInfo BEFORE its UserHistory check
+        # (L3520 < L11801), so mirror that ordering here by treating a copilot
+        # rollup as already providing the Users stream. AppendUserInfo has
+        # already set include_user_info above (L1357).
+        rollup_provides_users = (
+            (config.rollup or config.rollup_plus_raw)
+            and not config.include_m365_usage
+            and COPILOT_BASE_ACTIVITY_TYPE in (config.activity_types or [])
+        )
+        if not (config.include_user_info or rollup_provides_users):
             errors.append(
                 "UserHistory On requires IncludeUserInfo so the effective-dated "
                 "Users dimension can be produced."
