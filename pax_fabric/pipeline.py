@@ -286,10 +286,14 @@ def _resolve_csv_output_root(cfg: PAXConfig, run_id: str, *,
     # PAXConfig snapshots (without these fields) working unchanged.
     _stream_bindings = (
         # (output attr, append attr, scope predicate)
+        # UserInfoFile / UserInfoSupplement force IncludeUserInfo on downstream (PS L8482),
+        # so pre-bind the EntraUsers destination now to avoid a Fabric-only XOR gap.
         ("output_path_user_info",
          "append_user_info",
          getattr(cfg, "include_user_info", False)
-         or getattr(cfg, "only_user_info", False)),
+         or getattr(cfg, "only_user_info", False)
+         or bool(getattr(cfg, "user_info_file", None))
+         or bool(getattr(cfg, "user_info_supplement", None))),
         ("output_path_agent365_info",
          "append_agent365_info",
          getattr(cfg, "include_agent365_info", False)

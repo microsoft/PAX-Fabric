@@ -839,7 +839,9 @@ def _collect_byod_rejected_switches(config: "PAXConfig") -> list[str]:
 
     live_only_rejected: list[str] = []
 
-    # Suppression-list filter switches — truthy means "user supplied it".
+    # PS parity: mirror $PSBoundParameters.ContainsKey for filters the M365 bundle auto-injects.
+    _rec_user_supplied = bool(getattr(config, "_user_supplied_record_types", False))
+    _svc_user_supplied = bool(getattr(config, "_user_supplied_service_types", False))
     filter_map = (
         ("user_ids", "UserIds", lambda v: bool(v)),
         ("group_names", "GroupNames", lambda v: bool(v)),
@@ -847,8 +849,8 @@ def _collect_byod_rejected_switches(config: "PAXConfig") -> list[str]:
         ("agents_only", "AgentsOnly", lambda v: bool(v)),
         ("exclude_agents", "ExcludeAgents", lambda v: bool(v)),
         ("prompt_filter", "PromptFilter", lambda v: bool(str(v or "").strip())),
-        ("record_types", "RecordTypes", lambda v: bool(v)),
-        ("service_types", "ServiceTypes", lambda v: bool(v)),
+        ("record_types", "RecordTypes", lambda v: bool(v) and _rec_user_supplied),
+        ("service_types", "ServiceTypes", lambda v: bool(v) and _svc_user_supplied),
         ("auto_completeness", "AutoCompleteness", lambda v: bool(v)),
         ("include_telemetry", "IncludeTelemetry", lambda v: bool(v)),
         ("verify_partition_stability", "VerifyPartitionStability", lambda v: bool(v)),
@@ -2218,6 +2220,11 @@ def config_from_params(params: dict) -> "PAXConfig":
             coerced = _coerce_csv_list(v)
             if coerced is not None:
                 setattr(cfg, dst, coerced)
+                # PS $PSBoundParameters.ContainsKey parity: only user-supplied values count.
+                if dst == "record_types" and coerced:
+                    cfg._user_supplied_record_types = True
+                elif dst == "service_types" and coerced:
+                    cfg._user_supplied_service_types = True
 
     pf = pick("promptfilter", "prompt_filter")
     if pf is not None:

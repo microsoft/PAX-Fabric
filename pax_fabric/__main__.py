@@ -587,6 +587,12 @@ def _apply_cli_args(config: 'PAXConfig', args: argparse.Namespace) -> None:
     if args.output_path is not None:
         config._output_path_explicit = True
 
+    # PS $PSBoundParameters.ContainsKey parity for RecordTypes / ServiceTypes.
+    if getattr(args, "record_types", None):
+        config._user_supplied_record_types = True
+    if getattr(args, "service_types", None):
+        config._user_supplied_service_types = True
+
 
 # ---------------------------------------------------------------------------
 # Main Pipeline
