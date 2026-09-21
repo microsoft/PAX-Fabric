@@ -2110,7 +2110,12 @@ def explode_record(
         user_rec = user_lookup.get(audit_user_id_norm) or {}
     has_license_raw = user_rec.get("Has license", "")
     license_status = user_rec.get("License Status") or compute_license_status(has_license_raw)
-    environment = compute_environment(profile, has_license_raw, agent_name, agent_id, app_host_str)
+    # PS parity: in history mode an Unknown-state user (e.g. audit-only, not in
+    # Entra) resolves to Environment=Unknown, not a license-derived value.
+    environment = (
+        "Unknown" if user_history and license_status == "Unknown"
+        else compute_environment(profile, has_license_raw, agent_name, agent_id, app_host_str)
+    )
     ai_model = compute_ai_model(model_name_str)
     user_month_key = compute_user_month_key(audit_user_id_raw, month_start_str)
 
@@ -2471,6 +2476,69 @@ def compute_and_write_aggregates(
     return counts
 
 
+def append_audit_only_user_rows(
+    users_out_csv: str,
+    unmatched_identities,
+    user_key_map,
+    user_lookup: dict[str, Any],
+) -> int:
+    """Append one placeholder Users row per audit-only identity.
+
+    Mirrors PS Add-PaxAuditOnlyUserRows (history shape): an identity seen only in
+    audit activity has no directory row, so its Fact rows have nothing to join to.
+    The stub carries PersonId_Normalized + the reserved UserKey and the explicit
+    Unknown state (EffectiveDate / Has license / License Status = Unknown) so the
+    temporal key resolves; every other column is blank. A real directory row wins,
+    so identities already in ``user_lookup`` are skipped.
+    """
+    identities = list(unmatched_identities)
+    if not identities:
+        return 0
+    with open(users_out_csv, "r", encoding="utf-8-sig", newline="") as handle:
+        header = next(csv.reader(handle), None)
+    if not header:
+        return 0
+    index = {name: i for i, name in enumerate(header)}
+    pid_norm_i = index.get("PersonId_Normalized")
+    user_key_i = index.get("UserKey")
+    if pid_norm_i is None or user_key_i is None:
+        return 0
+    person_id_i = index.get("PersonId")
+    effective_i = index.get("EffectiveDate")
+    has_license_i = index.get("Has license")
+    license_status_i = index.get("License Status")
+    width = len(header)
+
+    added = 0
+    with open(users_out_csv, "a", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        seen: set[str] = set()
+        for identity in identities:
+            identity = (identity or "").strip().lower()
+            if not identity or identity in seen or identity in user_lookup:
+                continue
+            seen.add(identity)
+            key = user_key_map.get(
+                temporal_state_key(identity, "Unknown", "Unknown")
+            )
+            if key is None:
+                continue
+            row = [""] * width
+            row[pid_norm_i] = identity
+            row[user_key_i] = str(key)
+            if person_id_i is not None:
+                row[person_id_i] = identity
+            if effective_i is not None:
+                row[effective_i] = _UNKNOWN_EFFECTIVE_DATE
+            if has_license_i is not None:
+                row[has_license_i] = "Unknown"
+            if license_status_i is not None:
+                row[license_status_i] = "Unknown"
+            writer.writerow(row)
+            added += 1
+    return added
+
+
 def _run_processor_with_store(
     purview_csv: str,
     entra_csv: str,
@@ -2688,6 +2756,21 @@ def _run_processor_with_store(
     stats["distinct_thread_ids"] = len(thread_key_map)
     stats["distinct_user_keys"] = len(user_key_map)
     stats["unmatched_users"] = state_store.unmatched_user_count
+
+    # PS Add-PaxAuditOnlyUserRows: users seen only in audit activity have no
+    # directory row, so append a placeholder Users row (Unknown state, reserved
+    # UserKey) per such identity. History mode only — the legacy shape is
+    # unchanged.
+    if user_history:
+        audit_only_added = append_audit_only_user_rows(
+            users_out_csv,
+            state_store.iter_unmatched_users(),
+            user_key_map,
+            user_lookup,
+        )
+        stats["audit_only_user_rows"] = audit_only_added
+        if audit_only_added and not quiet:
+            print(f"  Audit-only Users rows: {audit_only_added:,}")
 
     # Pre-aggregated tables (AIBV profile only, opt-in via --with-aggregates).
     if profile != "aio" and agg_paths:
