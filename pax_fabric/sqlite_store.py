@@ -175,6 +175,12 @@ class SQLiteStateStore:
     def unmatched_user_count(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM unmatched_user").fetchone()[0])
 
+    def iter_unmatched_users(self) -> Iterator[str]:
+        cursor = self.connection.execute(
+            "SELECT normalized_user FROM unmatched_user ORDER BY normalized_user"
+        )
+        return (str(row[0]) for row in cursor)
+
     def log_progress(self, message: str) -> None:
         self._log(f"[SQLITE] {message}")
 

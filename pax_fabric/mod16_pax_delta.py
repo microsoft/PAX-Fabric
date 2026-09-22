@@ -1505,7 +1505,9 @@ def write_delta_append(
         except Exception as shape_exc:
             error = (
                 f"[USER_HISTORY_SHAPE_MISMATCH] UserHistory shape mismatch for "
-                f"'{table_name}': {shape_exc}. The target was left unchanged."
+                f"'{table_name}': {shape_exc}. The target was left unchanged. "
+                f"To enable UserHistory, clear/drop the existing '{table_name}' "
+                f"Delta table (or target an empty one) and re-run."
             )
             if log_fn:
                 log_fn(error, "ERROR")

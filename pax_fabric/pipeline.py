@@ -757,25 +757,49 @@ def _prepare_copilot_delta_seeds(
     if user_history_enabled:
         import csv
 
+        from deltalake import DeltaTable
+
         history_path = state_dir / "user_history.csv"
-        history_columns = [
-            "PersonId_Normalized", "Has license", "License Status",
-            "EffectiveDate", "UserKey",
-        ]
+        # Delta forbids spaces in column names, so the Users table stores the
+        # sanitized forms; the staged CSV that load_user_history consumes uses
+        # the spaced headers. Map Delta name -> staged-CSV name.
+        delta_to_csv = {
+            "PersonId_Normalized": "PersonId_Normalized",
+            "Has_license": "Has license",
+            "License_Status": "License Status",
+            "EffectiveDate": "EffectiveDate",
+            "UserKey": "UserKey",
+        }
+        csv_columns = list(delta_to_csv.values())
         try:
-            rows_written = 0
-            with history_path.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=history_columns, lineterminator="\n")
-                writer.writeheader()
-                for row in _iter_delta_as_dicts(
-                    users_uri, storage_options, columns=history_columns
-                ):
-                    writer.writerow({column: row.get(column, "") for column in history_columns})
-                    rows_written += 1
-            user_history_csv = str(history_path)
-            write_log(
-                f"[SQLITE] Staged {rows_written:,} prior UserHistory rows from {users_uri}"
-            )
+            table = DeltaTable(users_uri, storage_options=storage_options)
+            field_names = {field.name for field in table.schema().fields}
+            if not set(delta_to_csv).issubset(field_names):
+                # A prior non-history (legacy) Users table has no EffectiveDate,
+                # so there is no history to stage. The write-time shape guard
+                # rejects the legacy/history mismatch with a clear message.
+                history_path.unlink(missing_ok=True)
+                write_log(
+                    f"[SQLITE] Prior Users Delta at {users_uri} is not history-shaped; "
+                    "no UserHistory rows staged"
+                )
+            else:
+                rows_written = 0
+                with history_path.open("w", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=csv_columns, lineterminator="\n")
+                    writer.writeheader()
+                    for row in _iter_delta_as_dicts(
+                        users_uri, storage_options, columns=list(delta_to_csv)
+                    ):
+                        writer.writerow({
+                            csv_col: row.get(delta_col, "")
+                            for delta_col, csv_col in delta_to_csv.items()
+                        })
+                        rows_written += 1
+                user_history_csv = str(history_path)
+                write_log(
+                    f"[SQLITE] Staged {rows_written:,} prior UserHistory rows from {users_uri}"
+                )
         except Exception as ex:
             message = str(ex).lower()
             if any(
