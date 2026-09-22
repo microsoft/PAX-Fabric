@@ -57,6 +57,7 @@ from .mod3_pax_logging import (
 from .mod5_pax_auth import (
     connect_purview_audit,
     get_graph_access_token,
+    get_shared_auth_state,
     invoke_token_refresh,
     is_connected,
     refresh_graph_token_if_needed,
@@ -1549,6 +1550,9 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     token = get_graph_access_token()
     if token:
         session.headers.update(get_current_headers(token))
+        # Tag the session with the shared refresh generation so a later peer
+        # refresh is picked up instead of triggering a redundant reactive one.
+        session._pax_token_generation = get_shared_auth_state().get("refresh_count", 0)
 
     # Auto-detect Graph API version (PS: Get-GraphAuditApiUri auto-detection L7884)
     api_version = detect_graph_audit_api_version(session)
@@ -1644,6 +1648,9 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     import threading
     _thread_sessions: dict[int, requests.Session] = {}
     _session_lock = threading.Lock()
+    # Serializes reactive token refresh so parallel 401s adopt one shared token
+    # instead of each worker performing its own MSAL round-trip.
+    _refresh_lock = threading.Lock()
 
     # Tracks partitions that already had a recorded FINAL data-loss event in
     # this run so we only bump partitions_with_data_loss once per partition.
@@ -1796,23 +1803,55 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     t = get_graph_access_token()
                     if t:
                         s.headers.update(get_current_headers(t))
+                    # Match generation to the token we just installed so a
+                    # peer refresh that happens later is picked up by sync.
+                    s._pax_token_generation = get_shared_auth_state().get("refresh_count", 0)
                     _thread_sessions[tid] = s
         return _thread_sessions[tid]
 
+    def _sync_session_from_shared() -> bool:
+        """Copy the shared token into this thread's session when a peer refreshed it.
+
+        Returns True when the session header was updated (i.e., a peer refresh
+        had advanced the shared refresh_count beyond what this session had
+        already adopted).
+        """
+        shared = get_shared_auth_state()
+        shared_gen = shared.get("refresh_count", 0)
+        session = _get_thread_session()
+        if getattr(session, "_pax_token_generation", -1) >= shared_gen:
+            return False
+        token = shared.get("token")
+        if not token:
+            return False
+        session.headers.update(get_current_headers(token))
+        session._pax_token_generation = shared_gen
+        return True
+
     def _refresh_session_token():
-        """Force token refresh and update session headers. Returns True on success."""
-        write_log("[AUTH-401] Token expired — attempting automatic re-authentication...", level="WARN")
-        refresh_result = invoke_token_refresh(force=True)
-        if refresh_result.get("success"):
-            new_token = refresh_result["new_token"]
-            # Publish to shared state so post-audit consumers (Entra, license,
-            # delta-write bearer, future thread sessions) see the fresh token.
-            update_shared_auth_state(token=new_token)
-            _get_thread_session().headers.update(get_current_headers(new_token))
-            write_log("[AUTH-401] Token refreshed successfully — retrying request.")
-            return True
-        write_log(f"[AUTH-401] Token refresh failed: {refresh_result.get('message')}", level="ERROR")
-        return False
+        """Force token refresh and update session headers. Returns True on success.
+
+        Serialized across worker threads: while one worker is refreshing, sibling
+        workers wait on the lock and then adopt the freshly-refreshed shared
+        token instead of each paying an additional MSAL round-trip.
+        """
+        with _refresh_lock:
+            # A peer worker may have refreshed while we were waiting on the lock.
+            if _sync_session_from_shared():
+                write_log("[AUTH-401] Adopted peer-refreshed token — skipping redundant refresh.")
+                return True
+            write_log("[AUTH-401] Token expired — attempting automatic re-authentication...", level="WARN")
+            refresh_result = invoke_token_refresh(force=True)
+            if refresh_result.get("success"):
+                new_token = refresh_result["new_token"]
+                # Publish to shared state so post-audit consumers (Entra, license,
+                # delta-write bearer, future thread sessions) see the fresh token.
+                update_shared_auth_state(token=new_token)
+                _sync_session_from_shared()
+                write_log("[AUTH-401] Token refreshed successfully — retrying request.")
+                return True
+            write_log(f"[AUTH-401] Token refresh failed: {refresh_result.get('message')}", level="ERROR")
+            return False
 
     def _proactive_refresh_session() -> bool:
         """Proactively refresh the Graph token if mod5 says it's needed.
@@ -1827,19 +1866,20 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         to call on every query submission — mod5's cooldown prevents
         thundering-herd refreshes.
         """
+        # First, adopt any peer-refreshed shared token so we don't re-refresh
+        # what another worker already did.
+        _sync_session_from_shared()
         try:
             result = refresh_graph_token_if_needed(buffer_minutes=5, force=False)
         except Exception as ex:
             write_log(f"[PROACTIVE-REFRESH] check raised (ignored): {ex}", level="WARN")
             return False
         if result is True:
-            new_token = get_graph_access_token()
-            if new_token:
-                _get_thread_session().headers.update(get_current_headers(new_token))
+            if _sync_session_from_shared():
                 write_log("[PROACTIVE-REFRESH] Graph token refreshed before outgoing call.")
                 return True
             write_log(
-                "[PROACTIVE-REFRESH] Token refresh reported success but no token was returned — skipping header update.",
+                "[PROACTIVE-REFRESH] Token refresh reported success but shared state was unchanged — skipping header update.",
                 level="WARN",
             )
             return False
@@ -1857,15 +1897,14 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     def _page_refresh_callback(force: bool) -> bool:
         """Callback handed to ``get_graph_audit_records``.
 
-        Only the reactive (force=True) path does work — invoked by mod7
-        after a 401 to refresh the token and resume from the same
-        @odata.nextLink. The proactive (force=False) path is a no-op:
-        mod5's 30-min age trigger handles long-running pagination, and
-        a per-page proactive sweep just adds noise and risks stale-token
-        retry loops.
+        Reactive (force=True) path refreshes on a 401 and resumes from the same
+        @odata.nextLink. The proactive (force=False) path silently adopts any
+        peer-refreshed shared token so long-running pagination in one worker
+        doesn't miss a refresh performed by another.
         """
         if force:
             return _refresh_session_token()
+        _sync_session_from_shared()
         return True
 
     def _extract_retry_after_seconds(exc: BaseException) -> float | None:
@@ -1974,6 +2013,10 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         submit_401_retried = False
         submit_403_retries = 0
         query_id = None
+        # Adopt any peer-refreshed shared token before the first outgoing call
+        # so a worker that was queued behind another worker's refresh doesn't
+        # send a stale Authorization header and immediately trip the 401 path.
+        _sync_session_from_shared()
         while True:
             try:
                 # PS parity: never send userPrincipalNameFilters. The PowerShell
@@ -2127,7 +2170,10 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             # In-loop proactive refresh removed: it fired every 15-60s for the
             # entire poll duration and produced most of the noise in earlier runs.
             # The 401 handler below catches the rare case where the token expires
-            # while we're polling.
+            # while we're polling. Cheap peer-refresh adoption stays in the loop
+            # so a worker that slept through another worker's refresh picks up
+            # the fresh token before hitting its own 401.
+            _sync_session_from_shared()
 
             try:
                 status_result = get_graph_audit_query_status(
