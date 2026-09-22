@@ -1895,6 +1895,14 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         except Exception:
             return None
 
+    def _is_submit_throttle(exc: BaseException) -> bool:
+        """Return True only for an explicit HTTP 429 submit response."""
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None) if response is not None else None
+        return status == 429
+
     def _query_fn(block_start, block_end, activity_type, result_size, user_ids, use_eom_mode, log_ctx=None, *, page_callback=None):
         """Submit Graph audit query, poll, retrieve and normalize records.
 
@@ -2035,6 +2043,13 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     f"submit 403-failed p={p_idx} q#{q_num}"
                 )
             except Exception as _submit_exc:
+                if _is_submit_throttle(_submit_exc):
+                    write_log(
+                        f"[THROTTLE] Query submit returned HTTP 429 for "
+                        f"p={p_idx} q#{q_num}; preserving response for in-place retry",
+                        level="WARN",
+                    )
+                    raise
                 # Ambiguous failure (network error, timeout, unexpected server
                 # response, etc.) — we cannot tell whether the server actually
                 # created the query. Mark it durably uncertain rather than
@@ -2815,6 +2830,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                         throttle_min_wait_seconds=config.throttle_min_wait_seconds,
                         throttle_max_wait_seconds=config.throttle_max_wait_seconds,
                         respect_retry_after=config.respect_retry_after,
+                        pacing_ms=config.pacing_ms,
                         target_users=target_users,
                         spill_callback=cb,
                         page_spill_callback=page_cb,
@@ -2846,6 +2862,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                         throttle_min_wait_seconds=config.throttle_min_wait_seconds,
                         throttle_max_wait_seconds=config.throttle_max_wait_seconds,
                         respect_retry_after=config.respect_retry_after,
+                        pacing_ms=config.pacing_ms,
                         target_users=target_users,
                         spill_callback=cb,
                         page_spill_callback=page_cb,

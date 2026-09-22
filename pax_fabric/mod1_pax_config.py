@@ -199,7 +199,9 @@ class PAXConfig:
     partition_hours: int = 0
     max_partitions: int = 160
     result_size: int = 10000
-    pacing_ms: int = 0
+    # Process-wide minimum gap between audit-query submissions. A modest
+    # default smooths parallel Fabric startup bursts; set to 0 to disable.
+    pacing_ms: int = 250
     max_concurrency: int = 10
 
     # --- Activity/Record/Service types ---
@@ -1173,7 +1175,7 @@ def validate_config(config: PAXConfig) -> list[str]:
             conflict_fields.append("BlockHours")
         if config.result_size != 10000:
             conflict_fields.append("ResultSize")
-        if config.pacing_ms != 0:
+        if config.pacing_ms != PAXConfig().pacing_ms:
             conflict_fields.append("PacingMs")
         if config.parallel_mode != "Auto":
             conflict_fields.append("ParallelMode")
@@ -1264,7 +1266,7 @@ def validate_config(config: PAXConfig) -> list[str]:
             only_user_conflicts.append("MaxPartitions")
         if config.result_size != 10000:
             only_user_conflicts.append("ResultSize")
-        if config.pacing_ms != 0:
+        if config.pacing_ms != PAXConfig().pacing_ms:
             only_user_conflicts.append("PacingMs")
         if config.auto_completeness:
             only_user_conflicts.append("AutoCompleteness")
