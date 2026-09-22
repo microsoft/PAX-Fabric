@@ -2481,15 +2481,16 @@ def append_audit_only_user_rows(
     unmatched_identities,
     user_key_map,
     user_lookup: dict[str, Any],
+    user_history: bool = False,
 ) -> int:
     """Append one placeholder Users row per audit-only identity.
 
-    Mirrors PS Add-PaxAuditOnlyUserRows (history shape): an identity seen only in
-    audit activity has no directory row, so its Fact rows have nothing to join to.
-    The stub carries PersonId_Normalized + the reserved UserKey and the explicit
-    Unknown state (EffectiveDate / Has license / License Status = Unknown) so the
-    temporal key resolves; every other column is blank. A real directory row wins,
-    so identities already in ``user_lookup`` are skipped.
+    Mirrors PS Add-PaxAuditOnlyUserRows: an identity seen only in audit activity
+    has no directory row, so its Fact rows have nothing to join to. The stub
+    carries PersonId_Normalized plus the reserved UserKey. History rows also carry
+    the explicit Unknown state so the temporal key resolves. Every other column is
+    blank. A real directory row wins, so identities already in ``user_lookup`` are
+    skipped.
     """
     identities = list(unmatched_identities)
     if not identities:
@@ -2518,9 +2519,11 @@ def append_audit_only_user_rows(
             if not identity or identity in seen or identity in user_lookup:
                 continue
             seen.add(identity)
-            key = user_key_map.get(
+            allocation_key = (
                 temporal_state_key(identity, "Unknown", "Unknown")
+                if user_history else identity
             )
+            key = user_key_map.get(allocation_key)
             if key is None:
                 continue
             row = [""] * width
@@ -2528,11 +2531,11 @@ def append_audit_only_user_rows(
             row[user_key_i] = str(key)
             if person_id_i is not None:
                 row[person_id_i] = identity
-            if effective_i is not None:
+            if user_history and effective_i is not None:
                 row[effective_i] = _UNKNOWN_EFFECTIVE_DATE
-            if has_license_i is not None:
+            if user_history and has_license_i is not None:
                 row[has_license_i] = "Unknown"
-            if license_status_i is not None:
+            if user_history and license_status_i is not None:
                 row[license_status_i] = "Unknown"
             writer.writerow(row)
             added += 1
@@ -2758,19 +2761,18 @@ def _run_processor_with_store(
     stats["unmatched_users"] = state_store.unmatched_user_count
 
     # PS Add-PaxAuditOnlyUserRows: users seen only in audit activity have no
-    # directory row, so append a placeholder Users row (Unknown state, reserved
-    # UserKey) per such identity. History mode only — the legacy shape is
-    # unchanged.
-    if user_history:
-        audit_only_added = append_audit_only_user_rows(
-            users_out_csv,
-            state_store.iter_unmatched_users(),
-            user_key_map,
-            user_lookup,
-        )
-        stats["audit_only_user_rows"] = audit_only_added
-        if audit_only_added and not quiet:
-            print(f"  Audit-only Users rows: {audit_only_added:,}")
+    # directory row, so append a placeholder Users row carrying the reserved
+    # UserKey per such identity. History mode additionally records Unknown state.
+    audit_only_added = append_audit_only_user_rows(
+        users_out_csv,
+        state_store.iter_unmatched_users(),
+        user_key_map,
+        user_lookup,
+        user_history=user_history,
+    )
+    stats["audit_only_user_rows"] = audit_only_added
+    if audit_only_added and not quiet:
+        print(f"  Audit-only Users rows: {audit_only_added:,}")
 
     # Pre-aggregated tables (AIBV profile only, opt-in via --with-aggregates).
     if profile != "aio" and agg_paths:

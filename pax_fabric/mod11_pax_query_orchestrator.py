@@ -50,6 +50,8 @@ logger = logging.getLogger(__name__)
 # already received a 429.
 _throttle_lock = threading.Lock()
 _global_throttle_until: float = 0.0  # epoch seconds; 0 = no throttle active
+_submit_pacing_lock = threading.Lock()
+_next_submit_at: float = 0.0
 
 
 def _bump_global_throttle(seconds: float) -> None:
@@ -72,6 +74,25 @@ def _wait_for_global_throttle(sleep_fn: Callable[[float], None]) -> float:
         sleep_fn(remaining)
         return remaining
     return 0.0
+
+
+def _wait_for_submit_slot(
+    minimum_interval_seconds: float,
+    sleep_fn: Callable[[float], None],
+) -> float:
+    """Reserve a process-wide submit slot and wait until it is due."""
+    if minimum_interval_seconds <= 0:
+        return 0.0
+
+    global _next_submit_at
+    now = _time.monotonic()
+    with _submit_pacing_lock:
+        submit_at = max(now, _next_submit_at)
+        _next_submit_at = submit_at + minimum_interval_seconds
+    remaining = submit_at - now
+    if remaining > 0:
+        sleep_fn(remaining)
+    return remaining
 
 
 def _extract_retry_after_seconds(exc: BaseException) -> Optional[float]:
@@ -528,6 +549,7 @@ def invoke_activity_time_window_processing(
     throttle_min_wait_seconds: float = 30.0,
     throttle_max_wait_seconds: float = 180.0,
     respect_retry_after: bool = True,
+    pacing_ms: int = 0,
     target_users: Optional[List[str]] = None,
     metrics: Optional[OrchestratorMetrics] = None,
     progress: Optional[ProgressState] = None,
@@ -678,6 +700,12 @@ def invoke_activity_time_window_processing(
                 logger.info(
                     f"    Reliability: Yielded to global throttle for "
                     f"{round(_waited, 2)}s before submit"
+                )
+            _paced = _wait_for_submit_slot(max(0, pacing_ms) / 1000.0, sleep_fn)
+            if _paced > 0:
+                logger.info(
+                    f"    Reliability: Paced Graph submission for "
+                    f"{round(_paced, 3)}s before submit"
                 )
             query_number += 1
             log_ctx = {
@@ -1101,6 +1129,7 @@ def invoke_partition_graph_processing(
     throttle_min_wait_seconds: float = 30.0,
     throttle_max_wait_seconds: float = 180.0,
     respect_retry_after: bool = True,
+    pacing_ms: int = 0,
     target_users: Optional[List[str]] = None,
     metrics: Optional["OrchestratorMetrics"] = None,
     sleep_fn: Optional[Callable[[float], None]] = None,
@@ -1189,6 +1218,12 @@ def invoke_partition_graph_processing(
             logger.info(
                 f"  Reliability: Yielded to global throttle for "
                 f"{round(waited, 2)}s before submit"
+            )
+        paced = _wait_for_submit_slot(max(0, pacing_ms) / 1000.0, sleep_fn)
+        if paced > 0:
+            logger.info(
+                f"  Reliability: Paced Graph submission for "
+                f"{round(paced, 3)}s before submit"
             )
 
         log_ctx = {
