@@ -632,6 +632,7 @@ def get_graph_audit_query_status(
             "QueryId": query_id,
             "Status": data.get("status"),
             "RecordCount": 0,
+            "RecordCountAvailable": "recordCount" in data,
         }
 
         # Some status responses include record count
