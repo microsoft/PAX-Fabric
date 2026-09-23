@@ -22,9 +22,9 @@ Behavior notes:
       Dashboard-shaped outputs are namespaced by a short prefix
       (``AIO_`` / ``ValueLens_`` / ``M365_`` / ``AISID_``); dashboard-agnostic
       tables (``CopilotInteractions_Raw``, ``Entra_Users_Raw``, ``Audit_Raw``,
-      ``Agent365``) stay shared. Same-run appends match v1.11.1 PowerShell
-      semantics so downstream Power BI / SQL endpoint consumers see a single
-      accumulating table per logical dataset.
+    ``Agent365``, ``Agent365_Status``) stay shared. Same-run appends match
+    v1.11.1 PowerShell semantics so downstream Power BI / SQL endpoint
+    consumers see a single accumulating table per logical dataset.
     * Delegates the actual Delta write to
       :func:`pax_fabric.mod16_pax_delta.write_delta_append`, which provides:
         - Column-name sanitization (Delta-forbidden chars → ``_``).
@@ -61,6 +61,7 @@ SHARED_TABLES: frozenset[str] = frozenset({
     "Entra_Users_Raw",
     "Audit_Raw",
     "Agent365",
+    "Agent365_Status",
 })
 
 # Regex-derived base name → short canonical name. Applied AFTER the regex step

@@ -913,10 +913,15 @@ def prefetch_agent365_developer_names(
             if app_id:
                 app_ids.add(app_id)
                 break
-    for app_id in sorted(app_ids):
+    total_app_ids = len(app_ids)
+    for index, app_id in enumerate(sorted(app_ids), 1):
         resolve_agent365_developer_name(
             state, app_id=app_id, graph_request_fn=graph_request_fn
         )
+        if index % 1500 == 0 or index == total_app_ids:
+            logger.info(
+                "    ... %d/%d developer names prefetched", index, total_app_ids,
+            )
 
 
 # =============================================================================
@@ -1918,7 +1923,7 @@ def invoke_agent365_phase(
             'Row Build Status': row_label,
         })
 
-        if idx % 25 == 0 or idx == len(identified_packages):
+        if idx % 1500 == 0 or idx == len(identified_packages):
             logger.info(
                 "    ... %d/%d rows built", idx, listed_count,
             )
