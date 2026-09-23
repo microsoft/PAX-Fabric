@@ -1108,8 +1108,52 @@ def main() -> int:
         if getattr(config, 'include_agent365_info', False) or only_agent365:
             set_progress_phase("Export")
             from .mod12_pax_agent365 import Agent365State
-            invoke_agent365_phase(
-                state=Agent365State(),
+            import requests as _requests
+
+            agent365_http = _requests.Session()
+
+            def _refresh_agent365_http(force: bool = False) -> bool:
+                refreshed = refresh_graph_token_if_needed(force=force)
+                agent365_http.headers.update(
+                    get_current_headers(get_graph_access_token())
+                )
+                return bool(refreshed)
+
+            def _agent365_graph_request(method, url, payload=None):
+                _refresh_agent365_http()
+                response = agent365_http.request(
+                    method, url, json=payload, timeout=60
+                )
+                response.raise_for_status()
+                return response.json() if response.content else {}
+
+            def _agent365_audit_submit(display_name, start, end, operations):
+                _refresh_agent365_http()
+                return invoke_graph_audit_query(
+                    display_name,
+                    start,
+                    end,
+                    operations,
+                    http_client=agent365_http,
+                )
+
+            def _agent365_audit_status(query_id):
+                _refresh_agent365_http()
+                return get_graph_audit_query_status(
+                    query_id, http_client=agent365_http
+                )
+
+            def _agent365_audit_records(query_id):
+                _refresh_agent365_http()
+                return get_graph_audit_records(
+                    query_id,
+                    http_client=agent365_http,
+                    token_refresh_fn=_refresh_agent365_http,
+                )
+
+            agent365_state = Agent365State()
+            agent365_result = invoke_agent365_phase(
+                state=agent365_state,
                 include_agent365_info=getattr(config, 'include_agent365_info', False),
                 only_agent365_info=getattr(config, 'only_agent365_info', False),
                 auth_mode=config.auth,
@@ -1118,6 +1162,21 @@ def main() -> int:
                 graph_connected=is_connected(),
                 start_date=config.trim_start_date_utc,
                 end_date=config.trim_end_date_utc,
+                graph_request_fn=_agent365_graph_request,
+                refresh_token_fn=_refresh_agent365_http,
+                invoke_audit_query_fn=_agent365_audit_submit,
+                get_query_status_fn=_agent365_audit_status,
+                get_audit_records_fn=_agent365_audit_records,
+                sleep_fn=time.sleep,
+                now_fn=lambda: datetime.now(timezone.utc),
+                append_agent365_info=getattr(
+                    config, 'append_agent365_info', None
+                ),
+            )
+            ctx.metrics.agent365_had_gaps = bool(
+                agent365_state.had_gaps
+                or not agent365_result.get('ListComplete', True)
+                or not agent365_result.get('Reconciled', True)
             )
 
         # --- Entra Users Export ---
