@@ -1827,10 +1827,14 @@ def normalize_dashboard_selection(config: PAXConfig) -> None:
 def apply_dashboard_side_effects(config: PAXConfig) -> None:
     """Apply auto-enables implied by ``Dashboard`` before other side-effects run.
 
-    Mirrors PS L8082-8114:
+        Dashboard selection immediately controls collection and rollup shape:
       * ``Dashboard=M365`` without ``IncludeM365Usage`` auto-enables it.
       * A NON-DEFAULT ``Dashboard`` (``ValueLens``/``M365``/``AISID``) without
         ``Rollup``/``RollupPlusRaw`` auto-enables ``Rollup``.
+
+        ``IncludeUserInfo`` is enabled later, after destination validation, when
+        M365 is selected. This matches the existing Copilot rollup ordering and
+        lets Fabric bind its internal Entra staging path after validation.
 
     The default ``AIO`` value is treated as inert (indistinguishable from
     "caller did not supply Dashboard"), so today's callers who set only
@@ -2077,7 +2081,7 @@ def initialize_config(config: PAXConfig) -> list[str]:
     # 7. Validate
     errors = validate_config(config)
 
-    # 7b. Rollup side-effects (PS L3498-3530)
+    # 7b. Dashboard and rollup side-effects (PS L3498-3530)
     # MUST come AFTER validation: in PS, the XOR destination validator runs at
     # L2881-2930 (checking $IncludeUserInfo which is still $false), and the
     # rollup auto-enable of $IncludeUserInfo happens later at L3520. Moving
@@ -2090,6 +2094,12 @@ def initialize_config(config: PAXConfig) -> list[str]:
         except Exception:
             _info = print  # type: ignore[assignment]
         rollup_switch = "-RollupPlusRaw" if config.rollup_plus_raw else "-Rollup"
+        if "M365" in config.requested_dashboards and not config.include_user_info:
+            config.include_user_info = True
+            _info(
+                "INFO: Dashboard M365 auto-enabled -IncludeUserInfo "
+                "(the M365 dashboard includes Entra user and license data)."
+            )
         is_copilot_only = (
             not config.include_m365_usage
             and COPILOT_BASE_ACTIVITY_TYPE in config.activity_types
