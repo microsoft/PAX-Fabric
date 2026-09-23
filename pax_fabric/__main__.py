@@ -3976,7 +3976,17 @@ def _fetch_entra_users_with_overrides(
     if supplement_path and entra_data:
         write_log(f"UserInfoSupplement supplied — enriching live directory from {supplement_path}.")
         supplement_rows, upn_col = load_user_info_supplement(supplement_path)
+        rows_read = len(supplement_rows)
+        columns_added = [
+            c for c in (supplement_rows[0].keys() if supplement_rows else []) if c != upn_col
+        ]
         entra_data, unmatched = merge_entra_supplement(entra_data, supplement_rows, upn_col)
+        # PS-equivalent supplement metrics (Import-PaxSupplementCsv / Merge-PaxEntraSupplement).
+        write_log(
+            f"UserInfoSupplement: {rows_read} row(s) read; "
+            f"{len(columns_added)} column(s) added ({', '.join(columns_added) or 'none'}); "
+            f"{rows_read - len(unmatched)} matched, {len(unmatched)} unmatched (excluded)."
+        )
         if unmatched:
             write_log(
                 f"UserInfoSupplement: {len(unmatched)} supplemental row(s) had no matching "

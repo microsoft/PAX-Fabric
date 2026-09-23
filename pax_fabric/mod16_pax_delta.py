@@ -556,6 +556,15 @@ def _merge_user_history(
         return _write_arrow_table(target_uri, table, storage_options)
 
     target_columns = [field.name for field in delta_table.schema().fields]
+    # deltalake's MERGE cannot add a brand-new column during
+    # when_not_matched_insert_all() schema evolution (raises "Duplicate field
+    # name"). Pre-evolve the target with any new source columns via a zero-row
+    # schema-merge append so the merge runs against a complete, stable schema.
+    new_columns = [column for column in source_columns if column not in target_columns]
+    if new_columns:
+        _write_arrow_table(target_uri, table.slice(0, 0), storage_options)
+        delta_table = DeltaTable(target_uri, storage_options=storage_options)
+        target_columns = [field.name for field in delta_table.schema().fields]
     table = _align_source_to_target(table, target_columns)
     update_columns = [
         column

@@ -676,10 +676,15 @@ def _detect_upn_column(fieldnames: list[str]) -> Optional[str]:
     return None
 
 
-def _read_directory_csv(path: str) -> list[dict[str, Any]]:
-    """Read a local CSV file into a list of dicts. Raises ``FileNotFoundError``
-    for a missing local path and ``NotImplementedError`` for a remote
-    (SharePoint/OneLake) URL, which is out of scope for this port."""
+def _read_directory_csv_with_header(
+    path: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read a local CSV into ``(rows, fieldnames)``. ``fieldnames`` preserves
+    the raw header (including duplicates) so callers can validate header-only
+    files and reject duplicate/missing columns; it is ``[]`` when the file has
+    no header at all. Raises ``FileNotFoundError`` for a missing local path and
+    ``NotImplementedError`` for a remote (SharePoint/OneLake) URL, which is out
+    of scope for this port."""
     import csv as _csv
     from . import files_io
 
@@ -693,7 +698,17 @@ def _read_directory_csv(path: str) -> list[dict[str, Any]]:
     resolved = files_io.resolve_lakehouse_input_path(path)
     with open(resolved, "r", encoding="utf-8-sig", newline="") as f:
         reader = _csv.DictReader(f)
-        return [dict(row) for row in reader]
+        fieldnames = list(reader.fieldnames or [])
+        rows = [dict(row) for row in reader]
+    return rows, fieldnames
+
+
+def _read_directory_csv(path: str) -> list[dict[str, Any]]:
+    """Read a local CSV file into a list of dicts. Raises ``FileNotFoundError``
+    for a missing local path and ``NotImplementedError`` for a remote
+    (SharePoint/OneLake) URL, which is out of scope for this port."""
+    rows, _ = _read_directory_csv_with_header(path)
+    return rows
 
 
 def load_user_info_file(path: str) -> list[dict[str, Any]]:
@@ -722,30 +737,124 @@ def load_user_info_file(path: str) -> list[dict[str, Any]]:
     return rows
 
 
+# PS parity: Get-PaxReservedDirectoryColumns (L54412). A supplemental column
+# must never collide (case-insensitive) with the live Entra schema or any
+# PAX/Rollup-owned identity, licensing, append-provenance, or hierarchy column
+# (these include the UserHistory SCD keys UserKey / PersonId_Normalized /
+# License Status). Supplemental columns are additive-only.
+_PAX_OWNED_RESERVED_COLUMNS: list[str] = [
+    "PersonId", "UserKey", "PersonId_Normalized", "License Status",
+    "TotalEmployees", "Date_Added", "Latest_Append_Date", "In_Latest_Append",
+    "Manager_UserKey", "OrgLevel", "HierarchyPath", "TopOfChain_UserKey",
+    "IsManager", "DirectReports", "TotalReports",
+]
+
+
+def _reserved_directory_columns() -> set[str]:
+    """Lowercased (case-insensitive) reserved-column set a supplemental column
+    can never override. Mirrors PS Get-PaxReservedDirectoryColumns: the live
+    Entra header UNION the PAX/Rollup-owned columns UNION the Level0..14
+    management-level columns."""
+    reserved = {c.strip().lower() for c in ENTRA_USERS_HEADER}
+    reserved.update(c.strip().lower() for c in _PAX_OWNED_RESERVED_COLUMNS)
+    for lvl in range(15):  # Level0..Level14
+        reserved.add(f"level{lvl}_userkey")
+        reserved.add(f"level{lvl}_name")
+    return reserved
+
+
 def load_user_info_supplement(path: str) -> tuple[list[dict[str, Any]], str]:
-    """Load the hybrid-enrichment supplemental CSV for ``-UserInfoSupplement``.
+    """Load + validate the hybrid-enrichment supplemental CSV for
+    ``-UserInfoSupplement``. Mirrors PS ``Import-PaxSupplementCsv`` exactly:
 
-    Requires EXACTLY ONE UserPrincipalName-like column (used purely as the
-    join key). Returns ``(rows, upn_column_name)``. Raises ``ValueError`` if
-    zero or more than one UPN-like column is present.
+    - readable header row and at least one data row;
+    - EXACTLY ONE literal ``UserPrincipalName`` column (case-insensitive, NO
+      aliases) used purely as the join key;
+    - no case-insensitive duplicate headers;
+    - non-blank UPN on every row and unique normalized UPNs;
+    - no passthrough (non-join-key) column colliding with a reserved
+      Entra/PAX-owned column.
+
+    Returns ``(rows, upn_column_name)``. Raises ``ValueError`` with a clear,
+    count/list-bearing message on any violation.
     """
-    rows = _read_directory_csv(path)
+    rows, fieldnames = _read_directory_csv_with_header(path)
+    if not fieldnames:
+        raise ValueError(
+            f"UserInfoSupplement {path!r} has no header row (not a CSV)."
+        )
     if not rows:
-        return [], ""
+        raise ValueError(
+            f"UserInfoSupplement {path!r} contains a header but zero data rows."
+        )
 
-    fieldnames = list(rows[0].keys())
-    matches = [name for name in fieldnames if name.strip().lower() in _UPN_COLUMN_VARIANTS]
-    if len(matches) == 0:
+    # Duplicate headers (case-insensitive).
+    seen_headers: dict[str, str] = {}
+    dup_headers: list[str] = []
+    for header in fieldnames:
+        key = header.strip().lower()
+        if key in seen_headers:
+            dup_headers.append(header)
+        else:
+            seen_headers[key] = header
+    if dup_headers:
         raise ValueError(
-            f"UserInfoSupplement {path!r} has no UserPrincipalName-like column "
-            f"(expected exactly one of: UserPrincipalName, UPN, PersonId)."
+            f"UserInfoSupplement {path!r} has duplicate column header(s) "
+            f"(case-insensitive): {', '.join(sorted(set(dup_headers)))}."
         )
-    if len(matches) > 1:
+
+    # Exactly one literal UserPrincipalName column (no aliases — PS parity).
+    upn_cols = [h for h in fieldnames if h.strip().lower() == "userprincipalname"]
+    if len(upn_cols) == 0:
         raise ValueError(
-            f"UserInfoSupplement {path!r} has multiple UserPrincipalName-like "
-            f"columns ({matches}); exactly one join key column is required."
+            f"UserInfoSupplement {path!r} is missing the required "
+            f"'UserPrincipalName' column. Found: {', '.join(fieldnames)}."
         )
-    return rows, matches[0]
+    if len(upn_cols) > 1:
+        raise ValueError(
+            f"UserInfoSupplement {path!r} has more than one 'UserPrincipalName' "
+            f"column; exactly one is required."
+        )
+    upn_col = upn_cols[0]
+
+    # Passthrough columns must not collide with reserved Entra/PAX-owned columns.
+    passthrough = [h for h in fieldnames if h != upn_col]
+    reserved = _reserved_directory_columns()
+    collisions = [h for h in passthrough if h.strip().lower() in reserved]
+    if collisions:
+        raise ValueError(
+            f"UserInfoSupplement {path!r} column(s) collide with reserved "
+            f"Entra/PAX-owned columns (supplemental columns are additive-only "
+            f"and cannot override PAX data): {', '.join(collisions)}."
+        )
+
+    # Non-blank UPN on every row; unique normalized UPNs.
+    blank_count = 0
+    seen_upns: set[str] = set()
+    dup_upns: list[str] = []
+    for row in rows:
+        raw_upn = str(row.get(upn_col, "") or "")
+        if not raw_upn.strip():
+            blank_count += 1
+            continue
+        norm = raw_upn.strip().lower()
+        if norm in seen_upns:
+            dup_upns.append(raw_upn.strip())
+        else:
+            seen_upns.add(norm)
+    if blank_count:
+        raise ValueError(
+            f"UserInfoSupplement {path!r} has {blank_count} row(s) with a blank "
+            f"UserPrincipalName; every supplemental row must carry a UPN."
+        )
+    if dup_upns:
+        raise ValueError(
+            f"UserInfoSupplement {path!r} has duplicate UserPrincipalName "
+            f"value(s) (normalized, case-insensitive): "
+            f"{', '.join(sorted(set(dup_upns)))}."
+        )
+
+    return rows, upn_col
 
 
 def merge_entra_supplement(
@@ -753,36 +862,45 @@ def merge_entra_supplement(
     supplement_rows: list[dict[str, Any]],
     supplement_upn_column: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Entra-LEFT join: append every supplemental column (except the join key
-    itself) onto each Entra row whose ``userPrincipalName`` matches
-    (case-insensitive). Every Entra row is preserved even with no match
-    (supplemental columns become absent/blank for that row). Returns
+    """Entra-LEFT join: append every supplemental passthrough column (all
+    columns except the join key) onto EVERY Entra row whose
+    ``userPrincipalName`` matches (case-insensitive) — the matched value for a
+    match, or ``''`` when the Entra user has no supplemental match. Blank-
+    filling every row (PS parity) keeps the output schema uniform so the
+    supplemental columns are never dropped when the first exported row happens
+    to be unmatched (CSV/Delta headers are derived from the first row). The
+    supplemental join key is never copied into the output. Returns
     ``(merged_rows, unmatched_supplement_rows)`` — the latter for caller-side
     reporting/logging, mirroring PS's "unmatched rows are reported and excluded".
     """
+    # Ordered passthrough columns (CSV header order), join key excluded.
+    passthrough_columns: list[str] = (
+        [c for c in supplement_rows[0].keys() if c != supplement_upn_column]
+        if supplement_rows
+        else []
+    )
+
     supplement_by_upn: dict[str, dict[str, Any]] = {}
-    matched_upns: set[str] = set()
     for srow in supplement_rows:
-        key = str(srow.get(supplement_upn_column, "")).strip().lower()
+        key = str(srow.get(supplement_upn_column, "") or "").strip().lower()
         if key:
             supplement_by_upn[key] = srow
 
+    matched_upns: set[str] = set()
     merged: list[dict[str, Any]] = []
     for erow in entra_rows:
-        upn_key = str(erow.get("userPrincipalName", "")).strip().lower()
+        upn_key = str(erow.get("userPrincipalName", "") or "").strip().lower()
         srow = supplement_by_upn.get(upn_key)
         out = dict(erow)
         if srow is not None:
             matched_upns.add(upn_key)
-            for col, val in srow.items():
-                if col == supplement_upn_column:
-                    continue  # join key is never copied into output
-                out[col] = val
+        for col in passthrough_columns:
+            out[col] = srow.get(col, "") if srow is not None else ""
         merged.append(out)
 
     unmatched = [
         srow
         for srow in supplement_rows
-        if str(srow.get(supplement_upn_column, "")).strip().lower() not in matched_upns
+        if str(srow.get(supplement_upn_column, "") or "").strip().lower() not in matched_upns
     ]
     return merged, unmatched
