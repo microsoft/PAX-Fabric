@@ -63,6 +63,7 @@ class Agent365State:
     recovery_leafs: List[str] = field(default_factory=list)  # PS: $script:Agent365RecoveryLeafs
     list_graph_version: str = ''
     detail_graph_version: str = ''
+    audit_enrichment_complete: Optional[bool] = None
 
 
 # =============================================================================
@@ -84,11 +85,12 @@ class Agent365DetailResult:
     outcome: str = 'DetailFailed'   # 'Success' | 'FailedDependency' | 'DetailFailed'
     detail: Optional[Dict[str, Any]] = None
     reason: str = ''
+    status_code: int = 0
 
 
 
 # =============================================================================
-# The 28-column schema for Agent 365 CSV output (exact column order from PS)
+# The 45-column schema for Agent 365 CSV output (exact column order from PS)
 # =============================================================================
 
 AGENT365_COLUMNS = [
@@ -120,7 +122,49 @@ AGENT365_COLUMNS = [
     'Can use code interpreter',
     'Contains uploaded files',
     'Uploaded files',
+    'Status',
+    'Creator',
+    'Publisher',
+    'Channel',
+    'Creator ID',
+    'Environment ID',
+    'Bot ID',
+    'Custom Actions List',
+    'Instructions',
+    'Groups Shared',
+    'Users Shared',
+    'Risks',
+    'Active Users',
+    'Total Sessions',
+    'Exception Rate',
+    'Last Activity Date',
+    'Entra Agent ID',
 ]
+
+
+def canonical_agent365_title_id(value: Any) -> str:
+    """Return the stable ``T_``-prefixed Agent 365 identity."""
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    if text[:2].lower() == 't_':
+        text = text[2:]
+    return f'T_{text}'
+
+
+def agent365_boolean_cell(value: Any) -> Any:
+    """Preserve unknown values as blank and parse only explicit booleans."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == 'true':
+            return True
+        if normalized == 'false':
+            return False
+    return ''
 
 
 # =============================================================================
@@ -543,6 +587,8 @@ def get_agent365_package_details_batched(
     refresh_token_fn: Optional[Callable] = None,
     batch_size: int = 20,
     max_parallel: int = 4,
+    max_attempts: int = 5,
+    sleep_fn: Optional[Callable[[float], None]] = None,
 ) -> tuple[Dict[str, Agent365DetailResult], int, bool]:
     results: Dict[str, Agent365DetailResult] = {}
     if not package_ids:
@@ -565,6 +611,7 @@ def get_agent365_package_details_batched(
     ]
     batch_count = len(package_groups)
     transport_failed = False
+    sleep_fn = sleep_fn or time.sleep
 
     def fetch_group(
         package_slice: List[str],
@@ -576,53 +623,92 @@ def get_agent365_package_details_batched(
                 refresh_token_fn()
             except Exception:
                 pass
-        request_ids = {str(index): package_id for index, package_id in enumerate(package_slice)}
-        payload = {
-            'requests': [
+        pending = list(package_slice)
+        for attempt in range(1, max(1, max_attempts) + 1):
+            request_ids = {
+                str(index): package_id for index, package_id in enumerate(pending)
+            }
+            payload = {'requests': [
                 {
                     'id': request_id,
                     'method': 'GET',
-                    'url': (
-                        f'/{graph_version}/copilot/admin/catalog/packages/'
-                        f'{url_quote(package_id, safe="")}'
-                    ),
+                    'url': '/copilot/admin/catalog/packages/'
+                           f'{url_quote(package_id, safe="")}',
                 }
                 for request_id, package_id in request_ids.items()
-            ]
-        }
-        try:
-            response = graph_request_fn('POST', batch_uri, payload) or {}
-        except Exception as ex:
-            group_transport_failed = True
-            for package_id in package_slice:
-                group_results[package_id] = Agent365DetailResult(
-                    outcome='DetailFailed', reason=str(ex)
-                )
-            return group_results, group_transport_failed
-
-        seen: set[str] = set()
-        for subresponse in response.get('responses') or []:
-            request_id = str(subresponse.get('id', ''))
-            package_id = request_ids.get(request_id)
-            if package_id is None:
-                continue
-            seen.add(package_id)
-            status = int(subresponse.get('status', 0) or 0)
-            body = subresponse.get('body')
-            if 200 <= status < 300 and isinstance(body, dict):
-                group_results[package_id] = Agent365DetailResult(
-                    outcome='Success', detail=body, reason='OK'
-                )
-            else:
-                outcome = 'FailedDependency' if status == 424 else 'DetailFailed'
-                group_results[package_id] = Agent365DetailResult(
-                    outcome=outcome, reason=f'HTTP {status}'
-                )
-        for package_id in package_slice:
-            if package_id not in seen:
+            ]}
+            try:
+                response = graph_request_fn('POST', batch_uri, payload) or {}
+            except Exception as ex:
+                if attempt < max_attempts:
+                    sleep_fn(float(min(60, 2 ** attempt)))
+                    continue
                 group_transport_failed = True
-                group_results[package_id] = Agent365DetailResult(
-                    outcome='DetailFailed', reason='MissingBatchSubresponse'
+                for package_id in pending:
+                    group_results[package_id] = Agent365DetailResult(
+                        outcome='DetailFailed', reason=str(ex),
+                        status_code=_extract_status_code(ex) or 0,
+                    )
+                break
+
+            retry_ids: List[str] = []
+            seen: set[str] = set()
+            retry_after = 0.0
+            for subresponse in response.get('responses') or []:
+                request_id = str(subresponse.get('id', ''))
+                package_id = request_ids.get(request_id)
+                if package_id is None:
+                    continue
+                seen.add(package_id)
+                status = int(subresponse.get('status', 0) or 0)
+                body = subresponse.get('body')
+                if 200 <= status < 300 and isinstance(body, dict):
+                    group_results[package_id] = Agent365DetailResult(
+                        outcome='Success', detail=body, reason='OK',
+                        status_code=status,
+                    )
+                elif status in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                    retry_ids.append(package_id)
+                    headers = subresponse.get('headers') or {}
+                    try:
+                        retry_after = max(
+                            retry_after,
+                            float(headers.get('Retry-After') or 0),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    outcome = 'FailedDependency' if status == 424 else 'DetailFailed'
+                    group_results[package_id] = Agent365DetailResult(
+                        outcome=outcome, reason=f'HTTP {status}',
+                        status_code=status,
+                    )
+            missing = [package_id for package_id in pending if package_id not in seen]
+            if attempt < max_attempts:
+                retry_ids.extend(missing)
+            else:
+                for package_id in missing:
+                    group_results[package_id] = Agent365DetailResult(
+                        outcome='DetailFailed', reason='MissingBatchSubresponse'
+                    )
+            pending = list(dict.fromkeys(retry_ids))
+            if not pending:
+                break
+            if refresh_token_fn:
+                try:
+                    refresh_token_fn()
+                except Exception:
+                    pass
+            sleep_fn(retry_after or float(min(60, 2 ** attempt)))
+
+        if pending:
+            group_transport_failed = True
+            for package_id in pending:
+                group_results.setdefault(
+                    package_id,
+                    Agent365DetailResult(
+                        outcome='DetailFailed', reason='BatchRetryExhausted'
+                    ),
                 )
         return group_results, group_transport_failed
 
@@ -644,7 +730,12 @@ def _agent365_change_stamp(package: Dict[str, Any]) -> str:
     for field_name in ('lastModifiedDateTime', 'lastUpdatedDateTime'):
         value = package.get(field_name)
         if value is not None and str(value).strip():
-            return str(value).strip()
+            text = str(value).strip()
+            try:
+                parsed = datetime.fromisoformat(text.replace('Z', '+00:00'))
+                return parsed.astimezone(timezone.utc).isoformat()
+            except (ValueError, TypeError):
+                return text
     return ''
 
 
@@ -658,7 +749,7 @@ def select_agent365_changed_packages(
     reused_details: Dict[str, Dict[str, Any]] = {}
     stamps: Dict[str, str] = {}
     for package_id in package_ids:
-        canonical_id = package_id.strip().lower()
+        canonical_id = canonical_agent365_title_id(package_id).lower()
         stamp = _agent365_change_stamp(list_entries.get(package_id, {}))
         stamps[package_id] = stamp
         cached = store.get(canonical_id) or {}
@@ -789,6 +880,33 @@ def resolve_agent365_developer_name(
     return resolved
 
 
+def prefetch_agent365_developer_names(
+    packages: List[Dict[str, Any]],
+    details: Dict[str, Agent365DetailResult],
+    state: Agent365State,
+    graph_request_fn: Optional[Callable],
+) -> None:
+    """Resolve each unique application ID once before row construction."""
+    if graph_request_fn is None:
+        return
+    app_ids: set[str] = set()
+    for package in packages:
+        package_id = str(package.get('id') or package.get('titleId') or '')
+        detail_result = details.get(package_id)
+        detail = detail_result.detail if detail_result else None
+        for tier in (detail, package):
+            if not isinstance(tier, dict):
+                continue
+            app_id = str(tier.get('appId') or tier.get('applicationId') or '').strip()
+            if app_id:
+                app_ids.add(app_id)
+                break
+    for app_id in sorted(app_ids):
+        resolve_agent365_developer_name(
+            state, app_id=app_id, graph_request_fn=graph_request_fn
+        )
+
+
 # =============================================================================
 # Function 8: get_agent365_audit_enrichment (PS: Get-Agent365AuditEnrichment)
 # =============================================================================
@@ -837,8 +955,10 @@ def get_agent365_audit_enrichment(
     enrichment: Dict[str, Dict[str, Any]] = {}
 
     if only_agent365_info:
+        state.audit_enrichment_complete = True
         return enrichment
     if not graph_connected:
+        state.audit_enrichment_complete = False
         return enrichment
 
     # Resolve time window
@@ -870,12 +990,14 @@ def get_agent365_audit_enrichment(
         display_name = f"PAX_Agents365_Enrichment_{_now_fn().strftime('%Y%m%d%H%M%S')}"
         query_id = invoke_audit_query_fn(display_name, start_date, end_date, ops)
     except Exception as e:
+        state.audit_enrichment_complete = False
         logger.warning(
             f"  WARNING: Agent 365 enrichment query submit failed: {e}"
         )
         return enrichment
 
     if not query_id:
+        state.audit_enrichment_complete = False
         logger.warning(
             "  WARNING: Agent 365 enrichment query did not return a query id; "
             "columns will be blank."
@@ -927,6 +1049,7 @@ def get_agent365_audit_enrichment(
             poll_interval_seconds = 30
 
     if not status or status.get('Status') != 'succeeded':
+        state.audit_enrichment_complete = False
         st = status.get('Status') if status else None
         logger.warning(
             f"  WARNING: Agent 365 enrichment query did not succeed "
@@ -940,9 +1063,11 @@ def get_agent365_audit_enrichment(
         if get_audit_records_fn:
             records = get_audit_records_fn(query_id) or []
     except Exception:
+        state.audit_enrichment_complete = False
         records = []
 
     if not records:
+        state.audit_enrichment_complete = True
         return enrichment
 
     # Parse records into enrichment dict
@@ -995,6 +1120,7 @@ def get_agent365_audit_enrichment(
     logger.info(
         f"  Audit enrichment matched {len(enrichment)} agent identifier key(s)."
     )
+    state.audit_enrichment_complete = True
     return enrichment
 
 
@@ -1007,8 +1133,9 @@ def convert_to_agent365_row(
     state: Agent365State,
     audit_enrichment: Optional[Dict[str, Dict[str, Any]]] = None,
     graph_request_fn: Optional[Callable] = None,
+    detail: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Map one package detail object to the exact 28-column schema.
+    """Map a listing plus optional detail to the exact 45-column schema.
 
     PS signature:
         ConvertTo-Agent365Row -Package <object> [-AuditEnrichment <hashtable>]
@@ -1022,7 +1149,7 @@ def convert_to_agent365_row(
         graph_request_fn: For resolve_agent365_developer_name lookups.
 
     Returns:
-        OrderedDict-like dict with exactly 28 keys matching AGENT365_COLUMNS.
+        OrderedDict-like dict with exactly 45 keys matching AGENT365_COLUMNS.
     """
     # Inner helper: get first non-empty value from multiple field names
     # PS: foreach ($n in $names) { if ($null -ne $obj.$n -and "$($obj.$n)" -ne '') { return $obj.$n } }
@@ -1074,12 +1201,12 @@ def convert_to_agent365_row(
             for n in names:
                 val = obj.get(n)
                 if val is not None:
-                    return bool(val)
+                    return agent365_boolean_cell(val)
         else:
             for n in names:
                 val = getattr(obj, n, None)
                 if val is not None:
-                    return bool(val)
+                    return agent365_boolean_cell(val)
         return ''
 
     # Inner helper: join iterable with separator
@@ -1109,15 +1236,35 @@ def convert_to_agent365_row(
         except Exception:
             return str(v)
 
-    elem = package.get('elementDetails') if isinstance(package, dict) else None
+    detail_tier = detail if isinstance(detail, dict) else package
+    list_tier = package
 
-    title_id_raw = _g(package, ['id', 'titleId', 'packageId'])
-    title_id = ''
-    if title_id_raw:
-        if title_id_raw.startswith('T_'):
-            title_id = str(title_id_raw)
-        else:
-            title_id = 'T_' + str(title_id_raw)
+    def _pick(names: List[str]) -> Any:
+        return _g(detail_tier, names) or _g(list_tier, names)
+
+    def _pick_nested(roots: List[str], names: List[str]) -> Any:
+        for tier in (detail_tier, list_tier):
+            for root in roots:
+                value = _g(_g(tier, [root]), names)
+                if value != '':
+                    return value
+        return ''
+
+    def _pick_element(names: List[str]) -> Any:
+        for tier in (detail_tier, list_tier):
+            entries = tier.get('elementDetails') if isinstance(tier, dict) else None
+            if entries is None:
+                continue
+            if not isinstance(entries, list):
+                entries = [entries]
+            values = [_join(_g(entry, names), ';') for entry in entries]
+            values = [value for value in values if value]
+            if values:
+                return ';'.join(values)
+        return ''
+
+    title_id_raw = _pick(['id', 'titleId', 'packageId'])
+    title_id = canonical_agent365_title_id(title_id_raw)
 
     # Audit enrichment lookup (lowercase keys)
     date_created = ''
@@ -1126,10 +1273,10 @@ def convert_to_agent365_row(
         probe_keys: List[str] = []
         if title_id_raw:
             probe_keys.append(str(title_id_raw).lower())
-        app_id_probe = _g(package, ['appId', 'applicationId'])
+        app_id_probe = _pick(['appId', 'applicationId'])
         if app_id_probe:
             probe_keys.append(str(app_id_probe).lower())
-        disp_probe = _g(package, ['displayName', 'name'])
+        disp_probe = _pick(['displayName', 'name'])
         if disp_probe:
             probe_keys.append(str(disp_probe).lower())
 
@@ -1144,66 +1291,117 @@ def convert_to_agent365_row(
 
     # Fallback to package's own createdDateTime
     if not date_created:
-        pkg_created = _g(package, ['createdDateTime', 'createdDate'])
+        pkg_created = _pick(['createdDateTime', 'createdDate'])
         if pkg_created:
             date_created = _fmt_date(pkg_created)
 
     # Resolve developer name
-    dev_name_raw = _g(package, ['developer.name'])
-    app_id_for_dev = _g(package, ['appId', 'applicationId'])
+    dev_name_raw = _pick_nested(['developer'], ['name'])
+    app_id_for_dev = _pick(['appId', 'applicationId'])
     developer = resolve_agent365_developer_name(
         state, developer_name=dev_name_raw, app_id=app_id_for_dev,
         graph_request_fn=graph_request_fn,
     )
     # Fallback: try nested object access
-    if not developer and isinstance(package, dict):
-        dev_obj = package.get('developer')
-        if isinstance(dev_obj, dict) and dev_obj.get('name'):
-            developer = str(dev_obj['name'])
+    if not developer:
+        developer = str(_pick_nested(['developer'], ['name']) or '')
+
+    creator = _pick(['creator'])
+    if isinstance(creator, dict):
+        creator = _g(creator, ['displayName'])
+    creator = creator or _pick(['creatorDisplayName', 'createdByDisplayName'])
+    creator = creator or _pick_nested(['createdBy'], ['displayName']) or created_by
+    creator_id = _pick(['creatorId', 'createdById', 'createdByUserId'])
+    creator_id = creator_id or _pick_nested(['createdBy', 'creator'], ['id'])
+
+    custom_actions_list = _pick(['customActionsList', 'customActions'])
+    custom_actions_list = custom_actions_list or _pick_element(
+        ['customActionsList', 'customActions']
+    )
+    instructions = _pick(['instructions', 'systemInstructions', 'systemPrompt'])
+    instructions = instructions or _pick_element(
+        ['instructions', 'systemInstructions', 'systemPrompt']
+    )
+    groups_shared = _pick(['groupsShared', 'sharedWithGroups', 'allowedAadGroups'])
+    groups_shared = groups_shared or _pick_element(
+        ['groupsShared', 'sharedWithGroups', 'allowedAadGroups']
+    )
+    risks = _pick(['risks', 'securityRisks', 'complianceFlags'])
+    risks = risks or _pick_element(['risks', 'securityRisks', 'complianceFlags'])
+
+    entra_agent_id = ''
+    for field_name in (
+        'Entra Agent ID', 'EntraAgentId', 'Agent ID', 'Bot Id',
+        'appId', 'applicationId',
+    ):
+        candidate = _pick([field_name])
+        if candidate:
+            try:
+                from uuid import UUID
+                UUID(str(candidate).strip())
+                entra_agent_id = str(candidate).strip()
+                break
+            except (ValueError, TypeError, AttributeError):
+                continue
 
     row = {
-        'Name': _g(package, ['displayName', 'name']),
+        'Name': _pick(['displayName', 'name']),
         'Supported in': _join(
-            _g(package, ['supportedHosts', 'supportedClients']), ';'
+            _pick(['supportedHosts', 'supportedClients']), ';'
         ),
         'Date created': date_created,
         'Developer Name': developer,
-        'Type': _g(package, ['agentType', 'type']),
-        'Version': _g(package, ['version']),
-        'Availability': _g(package, ['availability', 'allowedUsersAndGroups']),
+        'Type': _pick(['agentType', 'type']),
+        'Version': _pick(['version']),
+        'Availability': _pick(['availability', 'allowedUsersAndGroups']),
         'Created by': created_by,
-        'Description': _g(package, ['description']),
-        'Created in': _g(package, ['source', 'origin', 'createdIn']),
+        'Description': _pick(['description']),
+        'Created in': _pick(['source', 'origin', 'createdIn']),
         'Last updated': _fmt_date(
-            _g(package, ['lastModifiedDateTime', 'lastUpdatedDateTime'])
+            _pick(['lastModifiedDateTime', 'lastUpdatedDateTime'])
         ),
-        'Custom actions': _g(elem, ['customActions']),
+        'Custom actions': _pick_element(['customActions']),
         'Title ID': title_id,
         'Sensitivity': _g(package, ['sensitivity']),
         'Can read OneDrive and Sharepoint items': _gb(
-            elem, ['canReadOneDriveAndSharepointItems']
+            {'value': _pick_element(['canReadOneDriveAndSharepointItems'])}, ['value']
         ),
-        'OneDrive and Sharepoint items': _g(
-            elem, ['oneDriveAndSharepointItems']
-        ),
-        'Can read OneDrive files': _gb(elem, ['canReadOneDriveFiles']),
-        'OneDrive files': _g(elem, ['oneDriveFiles']),
-        'OneDrive sites': _g(elem, ['oneDriveSites']),
+        'OneDrive and Sharepoint items': _pick_element(['oneDriveAndSharepointItems']),
+        'Can read OneDrive files': agent365_boolean_cell(_pick_element(['canReadOneDriveFiles'])),
+        'OneDrive files': _pick_element(['oneDriveFiles']),
+        'OneDrive sites': _pick_element(['oneDriveSites']),
         'Can read Sharepoint sites and files': _gb(
-            elem, ['canReadSharepointSitesAndFiles']
+            {'value': _pick_element(['canReadSharepointSitesAndFiles'])}, ['value']
         ),
-        'Sharepoint files': _g(elem, ['sharepointFiles']),
-        'Sharepoint sites': _g(elem, ['sharepointSites']),
+        'Sharepoint files': _pick_element(['sharepointFiles']),
+        'Sharepoint sites': _pick_element(['sharepointSites']),
         'Can extend to Graph connector': _gb(
-            elem, ['canExtendToGraphConnector']
+            {'value': _pick_element(['canExtendToGraphConnector'])}, ['value']
         ),
-        'Graph connector details': _g(elem, ['graphConnectorDetails']),
+        'Graph connector details': _pick_element(['graphConnectorDetails']),
         'Can generate images using user prompt': _gb(
-            elem, ['canGenerateImagesUsingUserPrompt']
+            {'value': _pick_element(['canGenerateImagesUsingUserPrompt'])}, ['value']
         ),
-        'Can use code interpreter': _gb(elem, ['canUseCodeInterpreter']),
-        'Contains uploaded files': _gb(elem, ['containsUploadedFiles']),
-        'Uploaded files': _g(elem, ['uploadedFiles']),
+        'Can use code interpreter': agent365_boolean_cell(_pick_element(['canUseCodeInterpreter'])),
+        'Contains uploaded files': agent365_boolean_cell(_pick_element(['containsUploadedFiles'])),
+        'Uploaded files': _pick_element(['uploadedFiles']),
+        'Status': _join(_pick(['status', 'packageStatus', 'lifecycleStatus', 'state']), ';'),
+        'Creator': _join(creator, ';'),
+        'Publisher': _join(_pick(['publisher', 'publisherName']), ';'),
+        'Channel': _join(_pick(['channel', 'deploymentChannel', 'distributionChannel']), ';'),
+        'Creator ID': _join(creator_id, ';'),
+        'Environment ID': _join(_pick(['environmentId', 'deploymentEnvironmentId']), ';'),
+        'Bot ID': _join(_pick(['botId', 'botApplicationId']), ';'),
+        'Custom Actions List': _join(custom_actions_list, ';'),
+        'Instructions': _join(instructions, ';'),
+        'Groups Shared': _join(groups_shared, ';'),
+        'Users Shared': '',
+        'Risks': _join(risks, ';'),
+        'Active Users': '',
+        'Total Sessions': '',
+        'Exception Rate': '',
+        'Last Activity Date': '',
+        'Entra Agent ID': entra_agent_id,
     }
 
     return row
@@ -1212,6 +1410,27 @@ def convert_to_agent365_row(
 # =============================================================================
 # Function 10: export_agent365_csv (PS: Export-Agent365Csv)
 # =============================================================================
+
+def _write_agent365_csv_atomic(
+    path: str,
+    columns: List[str],
+    rows: List[Dict[str, Any]],
+) -> None:
+    temporary_path = path + '.writing'
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    try:
+        with open(temporary_path, 'w', newline='', encoding='utf-8-sig') as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({column: row.get(column, '') for column in columns})
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.remove(temporary_path)
+        except OSError:
+            pass
+        raise
 
 def export_agent365_csv(
     rows: List[Dict[str, Any]],
@@ -1237,7 +1456,7 @@ def export_agent365_csv(
     Returns:
         Full path to written file, or None if no rows.
     """
-    if not rows and not append_agent365_info:
+    if not rows:
         logger.warning("  Agent 365: no rows to write.")
         return None
 
@@ -1258,21 +1477,28 @@ def export_agent365_csv(
                 # exposes it explicitly.
                 current_ids: set = set()
                 for r in rows:
-                    key = str(
+                    key = canonical_agent365_title_id(
                         r.get('Title ID') or r.get('AgentId') or ''
-                    ).strip()
+                    ).lower()
                     if key:
                         current_ids.add(key)
 
                 added = 0
+                target_row_count = 0
                 with open(
                     append_path, 'r', newline='', encoding='utf-8-sig'
                 ) as tf:
                     reader = csv.DictReader(tf)
+                    fieldnames = set(reader.fieldnames or [])
+                    if not ({'Title ID', 'AgentId'} & fieldnames):
+                        raise ValueError(
+                            "append catalog lacks 'Title ID' or 'AgentId'"
+                        )
                     for tr in reader:
-                        key = str(
+                        target_row_count += 1
+                        key = canonical_agent365_title_id(
                             tr.get('Title ID') or tr.get('AgentId') or ''
-                        ).strip()
+                        ).lower()
                         if not key:
                             continue
                         if key in current_ids:
@@ -1290,6 +1516,10 @@ def export_agent365_csv(
                         "departed agent row(s) from %s",
                         added, append_path,
                     )
+                if len(final_rows) < target_row_count:
+                    raise RuntimeError(
+                        'merged row count is smaller than the append target'
+                    )
             else:
                 logger.info(
                     "  Agent 365 union-merge: append target does not exist "
@@ -1297,22 +1527,18 @@ def export_agent365_csv(
                     append_path,
                 )
         except Exception as merge_err:  # noqa: BLE001
-            logger.warning(
-                "  Agent 365 union-merge failed (%s) — writing current-run "
-                "rows only.", merge_err,
+            logger.error(
+                "  Agent 365 union-merge failed (%s) — preserving the existing "
+                "target and skipping catalog publication.", merge_err,
             )
+            return None
 
     if not final_rows:
         logger.warning("  Agent 365: no rows to write after merge.")
         return None
 
     try:
-        with open(out_file, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.DictWriter(f, fieldnames=AGENT365_COLUMNS)
-            writer.writeheader()
-            for row in final_rows:
-                safe_row = {col: row.get(col, '') for col in AGENT365_COLUMNS}
-                writer.writerow(safe_row)
+        _write_agent365_csv_atomic(out_file, AGENT365_COLUMNS, final_rows)
 
         logger.info(
             f"  Agent 365 CSV written: {out_file} ({len(final_rows)} rows)"
@@ -1350,12 +1576,7 @@ def save_agent365_recovery_csv(
     out_file = os.path.join(output_path, leaf)
 
     try:
-        with open(out_file, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.DictWriter(f, fieldnames=AGENT365_COLUMNS)
-            writer.writeheader()
-            for row in rows:
-                safe_row = {col: row.get(col, '') for col in AGENT365_COLUMNS}
-                writer.writerow(safe_row)
+        _write_agent365_csv_atomic(out_file, AGENT365_COLUMNS, rows)
         state.recovery_leafs.append(leaf)
         logger.warning(
             "  Agent 365 recovery CSV written: %s (%d partial row(s))",
@@ -1368,7 +1589,7 @@ def save_agent365_recovery_csv(
 
 
 AGENT365_STATUS_COLUMNS = [
-    'TitleId', 'ListCompleteness', 'DetailCompleteness', 'RowBuildStatus'
+    'Title ID', 'List Completeness', 'Detail Completeness', 'Row Build Status'
 ]
 
 
@@ -1381,14 +1602,40 @@ def save_agent365_status_csv(
         run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     os.makedirs(output_path, exist_ok=True)
     status_path = os.path.join(output_path, f'Agent365_Status_{run_timestamp}.csv')
-    with open(status_path, 'w', newline='', encoding='utf-8-sig') as handle:
-        writer = csv.DictWriter(handle, fieldnames=AGENT365_STATUS_COLUMNS)
-        writer.writeheader()
-        for entry in entries:
-            writer.writerow({
-                column: entry.get(column, '') for column in AGENT365_STATUS_COLUMNS
-            })
+    _write_agent365_csv_atomic(status_path, AGENT365_STATUS_COLUMNS, entries)
     return status_path
+
+
+def get_agent365_column_availability_report(
+    rows: List[Dict[str, Any]],
+    authorization_restricted: bool,
+    audit_enrichment_collected: bool,
+) -> List[Dict[str, str]]:
+    columns = [
+        'Date created', 'Created by', 'Status', 'Creator', 'Publisher', 'Channel',
+        'Creator ID', 'Environment ID', 'Bot ID', 'Custom Actions List',
+        'Instructions', 'Groups Shared', 'Users Shared', 'Risks', 'Active Users',
+        'Total Sessions', 'Exception Rate', 'Last Activity Date', 'Entra Agent ID',
+    ]
+    admin_center_only = {
+        'Users Shared', 'Active Users', 'Total Sessions', 'Exception Rate',
+        'Last Activity Date',
+    }
+    audit_columns = {'Date created', 'Created by', 'Creator'}
+    report: List[Dict[str, str]] = []
+    for column in columns:
+        if any(str(row.get(column, '') or '').strip() for row in rows):
+            continue
+        if column in admin_center_only:
+            reason = 'available only from the Microsoft Admin Center Agents export'
+        elif not audit_enrichment_collected and column in audit_columns:
+            reason = 'audit enrichment was not collected for this run'
+        elif authorization_restricted:
+            reason = 'catalog authorization was restricted; verify licensing and access'
+        else:
+            reason = 'not exposed by the catalog endpoint for this run'
+        report.append({'Column': column, 'Reason': reason})
+    return report
 
 
 # =============================================================================
@@ -1501,7 +1748,7 @@ def invoke_agent365_phase(
     # existing app-only token already carries CopilotPackages.Read.All and
     # Application.Read.All as APPLICATION app-roles. See PS parity source
     # v1.11.15 L7771-7785.
-    if auth_mode == 'AppRegistration':
+    if auth_mode in ('AppRegistration', 'ManagedIdentity'):
         if state.pre_auth_completed and state.frontier_available is False:
             logger.warning(
                 "  Agent 365 phase skipped "
@@ -1515,9 +1762,13 @@ def invoke_agent365_phase(
 
     # Frontier probe
     if not test_agent365_frontier_access(state, graph_request_fn=graph_request_fn):
-        # test_agent365_frontier_access already logged the reason. A tenant
-        # that is not enrolled is NOT a gap — the phase simply has no work.
-        return empty
+        state.had_gaps = True
+        unavailable = dict(empty)
+        unavailable['ListComplete'] = False
+        unavailable['DetailComplete'] = False
+        unavailable['Reconciled'] = False
+        unavailable['ListReason'] = 'FrontierAccessUnavailable'
+        return unavailable
 
     # Audit enrichment (skipped when only_agent365_info)
     audit_enrichment = get_agent365_audit_enrichment(
@@ -1534,6 +1785,8 @@ def invoke_agent365_phase(
         now_fn=now_fn,
     )
     state.audit_enrichment = audit_enrichment
+    if not only_agent365_info and state.audit_enrichment_complete is False:
+        state.had_gaps = True
 
     # List packages (verdict + accounting).
     logger.info("  Listing Agent 365 packages...")
@@ -1588,6 +1841,13 @@ def invoke_agent365_phase(
             outcome='Success', detail=reused_details[package_id], reason='Reused'
         )
 
+    prefetch_agent365_developer_names(
+        [package for _, package in identified_packages],
+        detail_results,
+        state,
+        graph_request_fn,
+    )
+
     for idx, (pid, p) in enumerate(identified_packages, 1):
 
         detail_result = detail_results.get(
@@ -1597,9 +1857,7 @@ def invoke_agent365_phase(
             ),
         )
 
-        detail_payload: Dict[str, Any] = dict(p)
         if detail_result.outcome == 'Success' and detail_result.detail is not None:
-            detail_payload.update(detail_result.detail)
             detail_label = 'Reused' if detail_result.reason == 'Reused' else 'Retrieved'
         else:
             detail_failed += 1
@@ -1610,10 +1868,11 @@ def invoke_agent365_phase(
         row_label = 'Built'
         try:
             row = convert_to_agent365_row(
-                detail_payload,
+                p,
                 state,
                 audit_enrichment=audit_enrichment,
                 graph_request_fn=graph_request_fn,
+                detail=detail_result.detail,
             )
             rows.append(row)
         except Exception as e:  # noqa: BLE001
@@ -1623,10 +1882,10 @@ def invoke_agent365_phase(
                 "  WARNING: Row build failed for package '%s': %s", pid, e,
             )
         status_entries.append({
-            'TitleId': pid,
-            'ListCompleteness': 'Complete' if list_result.complete else 'Incomplete',
-            'DetailCompleteness': detail_label,
-            'RowBuildStatus': row_label,
+            'Title ID': canonical_agent365_title_id(pid),
+            'List Completeness': 'Complete' if list_result.complete else 'Incomplete',
+            'Detail Completeness': detail_label,
+            'Row Build Status': row_label,
         })
 
         if idx % 25 == 0:
@@ -1638,9 +1897,29 @@ def invoke_agent365_phase(
     accounted = emitted + row_build_failed + skipped_no_id
     reconciled = (accounted == listed_count)
     detail_complete = not batch_failed and detail_failed == 0
-    status_path = save_agent365_status_csv(
-        status_entries, output_path, run_timestamp
+    try:
+        status_path = save_agent365_status_csv(
+            status_entries, output_path, run_timestamp
+        )
+    except Exception as status_error:  # noqa: BLE001
+        status_path = None
+        state.had_gaps = True
+        logger.warning(
+            "  WARNING: Agent 365 status file could not be written: %s",
+            status_error,
+        )
+
+    authorization_restricted = any(
+        result.status_code in (401, 403) for result in detail_results.values()
     )
+    for availability in get_agent365_column_availability_report(
+        rows,
+        authorization_restricted=authorization_restricted,
+        audit_enrichment_collected=bool(state.audit_enrichment_complete),
+    ):
+        logger.info(
+            "    %s: %s", availability['Column'], availability['Reason']
+        )
 
     logger.info(
         "  Agent 365 reconciliation: Listed=%d Emitted=%d DetailFailed=%d "
@@ -1697,7 +1976,7 @@ def invoke_agent365_phase(
             stamp and detail_result.outcome == 'Success'
             and isinstance(detail_result.detail, dict)
         ):
-            reuse_store[package_id.strip().lower()] = {
+            reuse_store[canonical_agent365_title_id(package_id).lower()] = {
                 'changeStamp': stamp,
                 'detail': detail_result.detail,
             }
@@ -1713,6 +1992,11 @@ def invoke_agent365_phase(
         append_agent365_info=append_agent365_info,
     )
     result_dict['CsvPath'] = csv_path
+    if csv_path is None:
+        state.had_gaps = True
+        result_dict['RecoveryPath'] = save_agent365_recovery_csv(
+            rows, state, output_path, run_timestamp,
+        )
 
     if workbook_path:
         add_agent365_workbook_tab(workbook_path, rows)

@@ -2189,12 +2189,21 @@ def run(params: Optional[dict] = None) -> dict:
                 get_graph_audit_records,
                 invoke_graph_audit_query,
             )
+            import requests  # lazy
+
+            agent365_http = requests.Session()
+
+            def _refresh_agent365_http(force: bool = False) -> bool:
+                refreshed = refresh_graph_token_if_needed(force=force)
+                agent365_http.headers.update(
+                    get_current_headers(get_graph_access_token())
+                )
+                return bool(refreshed)
 
             def _agent365_graph_get(
                 method: str, url: str, payload: dict | None = None
             ) -> dict:
                 """Local HTTP adapter for Agent 365 Graph GET and batch POST."""
-                import requests  # lazy
                 if method.upper() not in {'GET', 'POST'}:
                     raise RuntimeError(
                         f"Agent 365 adapter does not support {method}"
@@ -2216,6 +2225,35 @@ def run(params: Optional[dict] = None) -> dict:
                 except ValueError:
                     return {}
 
+            def _invoke_agent365_audit_query(
+                display_name: str,
+                start_date: datetime,
+                end_date: datetime,
+                operations: list[str],
+            ) -> str | None:
+                _refresh_agent365_http()
+                return invoke_graph_audit_query(
+                    display_name,
+                    start_date,
+                    end_date,
+                    operations,
+                    http_client=agent365_http,
+                )
+
+            def _get_agent365_audit_status(query_id: str) -> dict | None:
+                _refresh_agent365_http()
+                return get_graph_audit_query_status(
+                    query_id, http_client=agent365_http
+                )
+
+            def _get_agent365_audit_records(query_id: str) -> list[dict]:
+                _refresh_agent365_http()
+                return get_graph_audit_records(
+                    query_id,
+                    http_client=agent365_http,
+                    token_refresh_fn=_refresh_agent365_http,
+                )
+
             agent365_state = Agent365State()
             ctx.agent365_state = agent365_state
             agent365_result = invoke_agent365_phase(
@@ -2229,10 +2267,10 @@ def run(params: Optional[dict] = None) -> dict:
                 start_date=config.trim_start_date_utc,
                 end_date=config.trim_end_date_utc,
                 graph_request_fn=_agent365_graph_get,
-                refresh_token_fn=refresh_graph_token_if_needed,
-                invoke_audit_query_fn=invoke_graph_audit_query,
-                get_query_status_fn=get_graph_audit_query_status,
-                get_audit_records_fn=get_graph_audit_records,
+                refresh_token_fn=_refresh_agent365_http,
+                invoke_audit_query_fn=_invoke_agent365_audit_query,
+                get_query_status_fn=_get_agent365_audit_status,
+                get_audit_records_fn=_get_agent365_audit_records,
                 sleep_fn=time.sleep,
                 now_fn=lambda: datetime.now(timezone.utc),
                 append_agent365_info=getattr(config, "append_agent365_info", None),
