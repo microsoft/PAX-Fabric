@@ -57,7 +57,9 @@ Create it once in **Entra ID → App registrations → New registration**, then:
    - `User.Read.All`
    - `Organization.Read.All`
    - `GroupMember.Read.All`
-2. **Grant admin consent** for all seven permissions.
+   - `CopilotPackages.Read.All`
+   - `Reports.Read.All`
+2. **Grant admin consent** for all nine permissions.
 3. **Certificates & secrets → New client secret** — copy the *value* (you will paste it into Key Vault).
 4. Record **Tenant ID** and **Application (client) ID**.
 
