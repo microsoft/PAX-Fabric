@@ -30,7 +30,7 @@ import json
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -589,6 +589,7 @@ def get_agent365_package_details_batched(
     max_parallel: int = 4,
     max_attempts: int = 5,
     sleep_fn: Optional[Callable[[float], None]] = None,
+    progress_fn: Optional[Callable[[int, int], None]] = None,
 ) -> tuple[Dict[str, Agent365DetailResult], int, bool]:
     results: Dict[str, Agent365DetailResult] = {}
     if not package_ids:
@@ -712,16 +713,27 @@ def get_agent365_package_details_batched(
                 )
         return group_results, group_transport_failed
 
+    completed_count = 0
+
+    def merge_group(
+        group_outcome: tuple[Dict[str, Agent365DetailResult], bool],
+    ) -> None:
+        nonlocal completed_count, transport_failed
+        group_results, group_failed = group_outcome
+        results.update(group_results)
+        transport_failed = transport_failed or group_failed
+        completed_count += len(group_results)
+        if progress_fn:
+            progress_fn(completed_count, len(package_ids))
+
     if len(package_groups) == 1 or max_parallel == 1:
-        group_outcomes = [fetch_group(group) for group in package_groups]
+        for group in package_groups:
+            merge_group(fetch_group(group))
     else:
         with ThreadPoolExecutor(max_workers=max_parallel) as executor:
             futures = [executor.submit(fetch_group, group) for group in package_groups]
-            group_outcomes = [future.result() for future in futures]
-
-    for group_results, group_failed in group_outcomes:
-        results.update(group_results)
-        transport_failed = transport_failed or group_failed
+            for future in as_completed(futures):
+                merge_group(future.result())
 
     return results, batch_count, transport_failed
 
@@ -1830,11 +1842,29 @@ def invoke_agent365_phase(
     changed_ids, reused_ids, reused_details, change_stamps = (
         select_agent365_changed_packages(package_ids, list_entries, reuse_store)
     )
+    if reused_ids:
+        logger.info(
+            "    ... %d/%d package details reused",
+            len(reused_ids), len(package_ids),
+        )
+
+    next_fetch_log = 25
+
+    def log_detail_fetch_progress(completed: int, total: int) -> None:
+        nonlocal next_fetch_log
+        if completed >= next_fetch_log or completed == total:
+            logger.info(
+                "    ... %d/%d package details fetched", completed, total,
+            )
+            while next_fetch_log <= completed:
+                next_fetch_log += 25
+
     detail_results, batch_count, batch_failed = get_agent365_package_details_batched(
         changed_ids,
         state,
         graph_request_fn,
         refresh_token_fn=refresh_token_fn,
+        progress_fn=log_detail_fetch_progress,
     )
     for package_id in reused_ids:
         detail_results[package_id] = Agent365DetailResult(
@@ -1888,9 +1918,9 @@ def invoke_agent365_phase(
             'Row Build Status': row_label,
         })
 
-        if idx % 25 == 0:
+        if idx % 25 == 0 or idx == len(identified_packages):
             logger.info(
-                "    ... %d/%d packages processed", idx, listed_count,
+                "    ... %d/%d rows built", idx, listed_count,
             )
 
     emitted = len(rows)
