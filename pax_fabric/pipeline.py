@@ -131,8 +131,13 @@ def _resolve_notebook_source_plan(config: PAXConfig) -> dict[str, Any]:
         or config.user_info_file
         or config.user_info_supplement
     )
+    # A1: -UserInfoSupplement requires a LIVE Entra pull even in PurviewInputTable
+    # (BYOD) mode — the staged Entra_Users_Raw table can't be hybrid-enriched, so we
+    # fall back to the live directory + merge (PS parity: BYOD keeps Entra live).
     live_entra_required = bool(
-        entra_requested and not config.user_info_file and not byod_table
+        entra_requested
+        and not config.user_info_file
+        and not (byod_table and not config.user_info_supplement)
     )
     agent_requested = bool(config.include_agent365_info or config.only_agent365_info)
     if source_state == "ByodActive":
@@ -2287,7 +2292,11 @@ def run(params: Optional[dict] = None) -> dict:
         if (
             source_plan["source_kind"] == "table"
             and getattr(config, "include_user_info", False)
+            and not getattr(config, "user_info_supplement", None)
         ):
+            # BYOD-table without supplement: stream Entra offline from the raw table.
+            # With -UserInfoSupplement the run falls through to the live Entra export
+            # below so the supplement can be merged (A1 / PS parity).
             entra_path, entra_count = _stage_byod_entra_table(
                 config,
                 target_schema,
