@@ -370,7 +370,7 @@ def _get_write_strategy(table_name: str) -> str:
     if table_name.endswith("_Users"):
         return "overwrite"
     # Agent 365 catalog is a point-in-time tenant snapshot (no date column).
-    if table_name == "Agent365":
+    if table_name in {"Agent365", "Agent365_Status"}:
         return "overwrite"
     if "UserStats" in table_name:
         return "overwrite"

@@ -2277,6 +2277,9 @@ def run(params: Optional[dict] = None) -> dict:
                 reuse_store_path=str(
                     Path(files_io.state_root()) / ".pax_agent365_reuse.json"
                 ),
+                retry_budget_minutes=int(
+                    getattr(config, 'max_network_outage_minutes', 30)
+                ),
             )
             ctx.metrics.agent365_had_gaps = bool(
                 agent365_state.had_gaps

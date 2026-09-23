@@ -33,6 +33,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote as url_quote
 
@@ -497,11 +498,40 @@ def get_agent365_packages(
             )
             break
 
-        if resp and resp.get('value'):
+        if not isinstance(resp, dict) or 'value' not in resp:
+            result.complete = False
+            result.reason = f'MalformedPageNoValue@{result.page_count}'
+            logger.warning(
+                "  WARNING: Agent 365 list page %d was malformed "
+                "(no result collection)", result.page_count,
+            )
+            break
+
+        if resp.get('value'):
             for p in resp['value']:
                 result.packages.append(p)
 
-        uri = resp.get('@odata.nextLink') if resp else None
+        next_link = resp.get('@odata.nextLink')
+        expected_prefix = (
+            f'https://graph.microsoft.com/'
+            f'{state.list_graph_version or "v1.0"}/'
+        )
+        if (
+            next_link
+            and not str(next_link).lower().startswith(expected_prefix.lower())
+        ):
+            result.complete = False
+            result.reason = (
+                f'CrossVersionNextLink@{result.page_count}:'
+                f'{state.list_graph_version or "v1.0"}'
+            )
+            logger.warning(
+                "  WARNING: Agent 365 list page %d supplied a paging link "
+                "outside pinned Graph version %s",
+                result.page_count, state.list_graph_version or 'v1.0',
+            )
+            break
+        uri = str(next_link) if next_link else None
 
         if result.page_count > 500:
             result.complete = False
@@ -580,6 +610,86 @@ def get_agent365_package_detail(
     return out
 
 
+def _classify_agent365_batch_subresponse(
+    subresponse: Dict[str, Any],
+) -> tuple[str, str, float, int]:
+    status = int(subresponse.get('status', 0) or 0)
+    body = subresponse.get('body') or {}
+    error = body.get('error') if isinstance(body, dict) else None
+    error = error if isinstance(error, dict) else {}
+    message = str(error.get('message') or '')
+    codes: List[str] = []
+
+    if error.get('code'):
+        codes.append(str(error['code']))
+    inner = error.get('innerError')
+    for _ in range(8):
+        if not isinstance(inner, dict):
+            break
+        if inner.get('code'):
+            codes.append(str(inner['code']))
+        inner = inner.get('innerError')
+    details = error.get('details') or []
+    if not isinstance(details, list):
+        details = [details]
+    for detail in details:
+        if isinstance(detail, dict) and detail.get('code'):
+            codes.append(str(detail['code']))
+
+    retry_after = 0.0
+    headers = subresponse.get('headers') or {}
+    if isinstance(headers, dict):
+        for key, value in headers.items():
+            if str(key).lower() == 'retry-after':
+                try:
+                    retry_after = max(0.0, float(value))
+                except (TypeError, ValueError):
+                    retry_after = 0.0
+                break
+
+    primary_code = codes[0] if codes else ''
+    reason = message or primary_code or f'HTTP {status}'
+    if 200 <= status < 300:
+        return 'Success', '', retry_after, status
+    if status == 429 or status >= 500:
+        return 'Retryable', reason, retry_after, status
+
+    normalized_codes = {code.strip().lower() for code in codes if code.strip()}
+    transient_codes = {
+        'activitylimitreached', 'requestthrottled', 'throttledrequest',
+        'toomanyrequests', 'servicenotavailable', 'serviceunavailable',
+        'unknownerror', 'generalexception', 'timeout', 'timedout',
+        'requesttimeout', 'gatewaytimeout', 'transientfailure',
+        'temporarilyunavailable', 'resourcetemporarilyunavailable',
+        'dependencythrottled', 'dependencytimeout', 'dependencyunavailable',
+    }
+    nested_throttled = False
+    if status == 424 and message.strip().startswith('{'):
+        try:
+            nested = json.loads(message)
+            nested_message = ' '.join(
+                str(nested.get('Message') or '').split()
+            ).lower()
+            nested_throttled = (
+                int(nested.get('StatusCode') or 0) == 424
+                and nested_message == 'too many requests'
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            nested_throttled = False
+    if status == 424:
+        dependency_codes = {
+            'faileddependency', 'dependencyfailed', 'failed_dependency',
+        }
+        outer_dependency = not normalized_codes or bool(
+            normalized_codes & dependency_codes
+        )
+        if normalized_codes & transient_codes or (
+            outer_dependency and nested_throttled
+        ):
+            return 'Retryable', reason, retry_after, status
+    return 'Terminal', reason, retry_after, status
+
+
 def get_agent365_package_details_batched(
     package_ids: List[str],
     state: Agent365State,
@@ -587,8 +697,10 @@ def get_agent365_package_details_batched(
     refresh_token_fn: Optional[Callable] = None,
     batch_size: int = 20,
     max_parallel: int = 4,
-    max_attempts: int = 5,
+    max_attempts: Optional[int] = None,
+    retry_budget_seconds: float = 1800.0,
     sleep_fn: Optional[Callable[[float], None]] = None,
+    clock_fn: Optional[Callable[[], float]] = None,
     progress_fn: Optional[Callable[[int, int], None]] = None,
 ) -> tuple[Dict[str, Agent365DetailResult], int, bool]:
     results: Dict[str, Agent365DetailResult] = {}
@@ -613,6 +725,10 @@ def get_agent365_package_details_batched(
     batch_count = len(package_groups)
     transport_failed = False
     sleep_fn = sleep_fn or time.sleep
+    clock_fn = clock_fn or time.monotonic
+    retry_budget_seconds = max(0.0, float(retry_budget_seconds))
+    outage_start: List[Optional[float]] = [None]
+    outage_lock = Lock()
 
     def fetch_group(
         package_slice: List[str],
@@ -625,7 +741,9 @@ def get_agent365_package_details_batched(
             except Exception:
                 pass
         pending = list(package_slice)
-        for attempt in range(1, max(1, max_attempts) + 1):
+        attempt = 0
+        while pending:
+            attempt += 1
             request_ids = {
                 str(index): package_id for index, package_id in enumerate(pending)
             }
@@ -641,9 +759,6 @@ def get_agent365_package_details_batched(
             try:
                 response = graph_request_fn('POST', batch_uri, payload) or {}
             except Exception as ex:
-                if attempt < max_attempts:
-                    sleep_fn(float(min(60, 2 ** attempt)))
-                    continue
                 group_transport_failed = True
                 for package_id in pending:
                     group_results[package_id] = Agent365DetailResult(
@@ -652,46 +767,75 @@ def get_agent365_package_details_batched(
                     )
                 break
 
+            if not isinstance(response.get('responses'), list):
+                group_transport_failed = True
+                for package_id in pending:
+                    group_results[package_id] = Agent365DetailResult(
+                        outcome='DetailFailed',
+                        reason='BatchResponseMissingSubresponses',
+                    )
+                break
+
             retry_ids: List[str] = []
             seen: set[str] = set()
             retry_after = 0.0
+            settled_one = False
+            now_tick = clock_fn()
+            with outage_lock:
+                budget_exhausted = (
+                    outage_start[0] is not None
+                    and now_tick - outage_start[0] >= retry_budget_seconds
+                )
             for subresponse in response.get('responses') or []:
                 request_id = str(subresponse.get('id', ''))
                 package_id = request_ids.get(request_id)
                 if package_id is None:
                     continue
                 seen.add(package_id)
-                status = int(subresponse.get('status', 0) or 0)
+                disposition, reason, sub_retry_after, status = (
+                    _classify_agent365_batch_subresponse(subresponse)
+                )
                 body = subresponse.get('body')
-                if 200 <= status < 300 and isinstance(body, dict):
+                if disposition == 'Success' and isinstance(body, dict):
                     group_results[package_id] = Agent365DetailResult(
                         outcome='Success', detail=body, reason='OK',
                         status_code=status,
                     )
-                elif status in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                    settled_one = True
+                elif (
+                    disposition == 'Retryable'
+                    and not budget_exhausted
+                    and (max_attempts is None or attempt < max_attempts)
+                ):
                     retry_ids.append(package_id)
-                    headers = subresponse.get('headers') or {}
-                    try:
-                        retry_after = max(
-                            retry_after,
-                            float(headers.get('Retry-After') or 0),
-                        )
-                    except (TypeError, ValueError):
-                        pass
+                    retry_after = max(retry_after, sub_retry_after)
                 else:
-                    outcome = 'FailedDependency' if status == 424 else 'DetailFailed'
+                    outcome = (
+                        'FailedDependency'
+                        if status == 424 and disposition == 'Terminal'
+                        else 'DetailFailed'
+                    )
                     group_results[package_id] = Agent365DetailResult(
-                        outcome=outcome, reason=f'HTTP {status}',
+                        outcome=outcome, reason=reason,
                         status_code=status,
                     )
             missing = [package_id for package_id in pending if package_id not in seen]
-            if attempt < max_attempts:
+            if (
+                not budget_exhausted
+                and (max_attempts is None or attempt < max_attempts)
+            ):
                 retry_ids.extend(missing)
             else:
                 for package_id in missing:
                     group_results[package_id] = Agent365DetailResult(
                         outcome='DetailFailed', reason='MissingBatchSubresponse'
                     )
+
+            with outage_lock:
+                if settled_one:
+                    outage_start[0] = None
+                elif retry_ids and outage_start[0] is None:
+                    outage_start[0] = now_tick
             pending = list(dict.fromkeys(retry_ids))
             if not pending:
                 break
@@ -700,17 +844,12 @@ def get_agent365_package_details_batched(
                     refresh_token_fn()
                 except Exception:
                     pass
-            sleep_fn(retry_after or float(min(60, 2 ** attempt)))
-
-        if pending:
-            group_transport_failed = True
-            for package_id in pending:
-                group_results.setdefault(
-                    package_id,
-                    Agent365DetailResult(
-                        outcome='DetailFailed', reason='BatchRetryExhausted'
-                    ),
-                )
+            wait_seconds = retry_after or float(min(60, 2 ** min(attempt, 6)))
+            logger.info(
+                "  Agent 365 detail batch retrying %d package(s) in %.1fs "
+                "(attempt %d)", len(pending), wait_seconds, attempt + 1,
+            )
+            sleep_fn(wait_seconds)
         return group_results, group_transport_failed
 
     completed_count = 0
@@ -897,11 +1036,18 @@ def prefetch_agent365_developer_names(
     details: Dict[str, Agent365DetailResult],
     state: Agent365State,
     graph_request_fn: Optional[Callable],
-) -> None:
-    """Resolve each unique application ID once before row construction."""
+    refresh_token_fn: Optional[Callable] = None,
+    batch_size: int = 20,
+) -> Dict[str, int]:
+    """Resolve missing developer names in bounded Graph batches."""
     if graph_request_fn is None:
-        return
-    app_ids: set[str] = set()
+        return {
+            'Requested': 0, 'Resolved': 0,
+            'ApplicationBatches': 0, 'OwnerBatches': 0,
+        }
+    batch_size = max(1, min(20, int(batch_size)))
+    app_ids: List[str] = []
+    seen: set[str] = set()
     for package in packages:
         package_id = str(package.get('id') or package.get('titleId') or '')
         detail_result = details.get(package_id)
@@ -909,19 +1055,134 @@ def prefetch_agent365_developer_names(
         for tier in (detail, package):
             if not isinstance(tier, dict):
                 continue
+            developer = tier.get('developer')
+            developer_name = (
+                str(developer.get('name') or '').strip()
+                if isinstance(developer, dict) else ''
+            )
+            developer_name = developer_name or str(
+                tier.get('developer.name') or ''
+            ).strip()
+            if developer_name:
+                break
             app_id = str(tier.get('appId') or tier.get('applicationId') or '').strip()
             if app_id:
-                app_ids.add(app_id)
+                if app_id not in state.developer_cache and app_id not in seen:
+                    seen.add(app_id)
+                    app_ids.append(app_id)
                 break
-    total_app_ids = len(app_ids)
-    for index, app_id in enumerate(sorted(app_ids), 1):
-        resolve_agent365_developer_name(
-            state, app_id=app_id, graph_request_fn=graph_request_fn
-        )
-        if index % 1500 == 0 or index == total_app_ids:
+
+    total = len(app_ids)
+    logger.info(
+        "  Agent 365 developer pre-resolution: %d application ID(s) require lookup",
+        total,
+    )
+    resolved: Dict[str, str] = {}
+    owner_candidates: List[tuple[str, str]] = []
+    application_batches = 0
+    owner_batches = 0
+    batch_uri = 'https://graph.microsoft.com/v1.0/$batch'
+
+    def send_batch(requests: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if refresh_token_fn:
+            try:
+                refresh_token_fn()
+            except Exception:
+                pass
+        try:
+            return graph_request_fn(
+                'POST', batch_uri, {'requests': requests}
+            ) or {}
+        except Exception:
+            return {}
+
+    for offset in range(0, total, batch_size):
+        app_slice = app_ids[offset:offset + batch_size]
+        slot_to_app = {
+            str(index): app_id for index, app_id in enumerate(app_slice, 1)
+        }
+        requests = [
+            {
+                'id': slot,
+                'method': 'GET',
+                'url': "/applications?$filter=appId eq '"
+                       f"{app_id}'&$select=id,displayName,publisherDomain",
+            }
+            for slot, app_id in slot_to_app.items()
+        ]
+        application_batches += 1
+        response = send_batch(requests)
+        for subresponse in response.get('responses') or []:
+            app_id = slot_to_app.get(str(subresponse.get('id', '')))
+            if app_id is None:
+                continue
+            status = int(subresponse.get('status', 0) or 0)
+            body = subresponse.get('body') or {}
+            values = body.get('value') or [] if 200 <= status < 300 else []
+            app = values[0] if values and isinstance(values[0], dict) else None
+            if app is None:
+                continue
+            name = str(
+                app.get('publisherDomain') or app.get('displayName') or ''
+            ).strip()
+            if name:
+                resolved[app_id] = name
+            elif app.get('id'):
+                owner_candidates.append((app_id, str(app['id'])))
+        completed = min(offset + len(app_slice), total)
+        if application_batches % 25 == 0 or completed == total:
             logger.info(
-                "    ... %d/%d developer names prefetched", index, total_app_ids,
+                "    ... %d/%d developer application lookups submitted",
+                completed, total,
             )
+
+    owner_total = len(owner_candidates)
+    for offset in range(0, owner_total, batch_size):
+        owner_slice = owner_candidates[offset:offset + batch_size]
+        slot_to_app = {
+            str(index): app_id
+            for index, (app_id, _) in enumerate(owner_slice, 1)
+        }
+        object_ids = {
+            str(index): object_id
+            for index, (_, object_id) in enumerate(owner_slice, 1)
+        }
+        requests = [
+            {
+                'id': slot,
+                'method': 'GET',
+                'url': f'/applications/{object_ids[slot]}/owners'
+                       '?$select=userPrincipalName,displayName',
+            }
+            for slot in slot_to_app
+        ]
+        owner_batches += 1
+        response = send_batch(requests)
+        for subresponse in response.get('responses') or []:
+            app_id = slot_to_app.get(str(subresponse.get('id', '')))
+            if app_id is None:
+                continue
+            status = int(subresponse.get('status', 0) or 0)
+            body = subresponse.get('body') or {}
+            values = body.get('value') or [] if 200 <= status < 300 else []
+            owner = values[0] if values and isinstance(values[0], dict) else None
+            if owner is not None:
+                name = str(
+                    owner.get('displayName')
+                    or owner.get('userPrincipalName') or ''
+                ).strip()
+                if name:
+                    resolved[app_id] = name
+
+    for app_id in app_ids:
+        state.developer_cache[app_id] = resolved.get(app_id, '')
+
+    return {
+        'Requested': total,
+        'Resolved': sum(bool(name) for name in resolved.values()),
+        'ApplicationBatches': application_batches,
+        'OwnerBatches': owner_batches,
+    }
 
 
 # =============================================================================
@@ -1075,13 +1336,34 @@ def get_agent365_audit_enrichment(
         return enrichment
 
     # Retrieve records
+    declared_count = None
+    if status.get('RecordCountAvailable'):
+        try:
+            candidate_count = int(status.get('RecordCount') or 0)
+            if candidate_count > 0:
+                declared_count = candidate_count
+        except (TypeError, ValueError):
+            declared_count = None
     records = []
     try:
         if get_audit_records_fn:
             records = get_audit_records_fn(query_id) or []
-    except Exception:
+    except Exception as error:
         state.audit_enrichment_complete = False
-        records = []
+        logger.warning(
+            "  WARNING: Agent 365 enrichment record retrieval failed: %s; "
+            "columns will be blank.", error,
+        )
+        return enrichment
+
+    if declared_count is not None and len(records) != declared_count:
+        state.audit_enrichment_complete = False
+        logger.warning(
+            "  WARNING: Agent 365 enrichment record retrieval was incomplete "
+            "(declared=%d, retrieved=%d); columns will be blank.",
+            declared_count, len(records),
+        )
+        return enrichment
 
     if not records:
         state.audit_enrichment_complete = True
@@ -1724,6 +2006,7 @@ def invoke_agent365_phase(
     append_agent365_info: Optional[str] = None,
     workbook_path: Optional[str] = None,
     reuse_store_path: Optional[str] = None,
+    retry_budget_minutes: int = 30,
 ) -> Dict[str, Any]:
     """Top-level orchestrator for the Agent 365 phase.
 
@@ -1869,6 +2152,9 @@ def invoke_agent365_phase(
         state,
         graph_request_fn,
         refresh_token_fn=refresh_token_fn,
+        retry_budget_seconds=float(
+            (retry_budget_minutes if retry_budget_minutes > 0 else 30) * 60
+        ),
         progress_fn=log_detail_fetch_progress,
     )
     for package_id in reused_ids:
@@ -1876,11 +2162,18 @@ def invoke_agent365_phase(
             outcome='Success', detail=reused_details[package_id], reason='Reused'
         )
 
-    prefetch_agent365_developer_names(
+    developer_result = prefetch_agent365_developer_names(
         [package for _, package in identified_packages],
         detail_results,
         state,
         graph_request_fn,
+        refresh_token_fn=refresh_token_fn,
+    )
+    logger.info(
+        "  Agent 365 developer pre-resolution complete: applicationIds=%d "
+        "resolved=%d applicationBatches=%d ownerBatches=%d",
+        developer_result['Requested'], developer_result['Resolved'],
+        developer_result['ApplicationBatches'], developer_result['OwnerBatches'],
     )
 
     for idx, (pid, p) in enumerate(identified_packages, 1):
