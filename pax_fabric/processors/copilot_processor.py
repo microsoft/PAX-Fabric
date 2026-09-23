@@ -1588,6 +1588,10 @@ def load_user_history(
         }
         if not required.issubset(set(reader.fieldnames or [])):
             raise ValueError("UserHistory target does not carry the required history columns")
+        # Accumulate allocation_key -> UserKey pairs, then seed the surrogate map
+        # in one batched write; a SQLite-backed map would otherwise pay a full
+        # transaction per row (one BEGIN/COMMIT per prior user).
+        pending: dict[str, int] = {}
         for row in reader:
             identity = (row.get("PersonId_Normalized") or "").strip().lower()
             effective = (row.get("EffectiveDate") or "").strip()
@@ -1602,16 +1606,25 @@ def load_user_history(
             if key < 1:
                 raise ValueError("UserHistory target contains an invalid UserKey")
             allocation_key = temporal_state_key(identity, has_license, license_status)
-            prior = user_key_map.get(allocation_key)
+            prior = pending.get(allocation_key)
+            if prior is None:
+                prior = user_key_map.get(allocation_key)
             if prior is not None and prior != key:
                 raise ValueError("UserHistory target maps one state to multiple UserKeys")
-            user_key_map[allocation_key] = key
+            pending[allocation_key] = key
             states.setdefault(identity, []).append({
                 "EffectiveDate": effective,
                 "Has license": has_license,
                 "License Status": license_status,
                 "UserKey": str(key),
             })
+        if pending:
+            if isinstance(user_key_map, SQLiteSurrogateMap):
+                user_key_map.store.seed_rows(
+                    user_key_map.namespace, iter(pending.items())
+                )
+            else:
+                user_key_map.update(pending)
     for identity_states in states.values():
         identity_states.sort(
             key=lambda item: temporal_effective_sort_key(item["EffectiveDate"])
