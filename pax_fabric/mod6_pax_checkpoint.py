@@ -1682,6 +1682,17 @@ def show_checkpoint_exit_message() -> None:
 _WATERMARK_STATE_FILENAME = ".pax_watermark_state.json"
 
 
+def watermark_state_filename(schema: str, dashboard_prefix: str, fact_kind: str) -> str:
+    """Per-target watermark state leaf, keyed by the audit fact-table family.
+
+    Keying by (schema + dashboard prefix + fact kind) gives each dashboard/mode
+    its own independent coverage marker, so single-dashboard runs never collide.
+    """
+    parts = [str(schema or "dbo"), str(dashboard_prefix or "shared"), str(fact_kind or "raw")]
+    key = "_".join((re.sub(r"[^A-Za-z0-9]+", "", p) or "x") for p in parts)
+    return f".pax_watermark__{key}.json"
+
+
 def _watermark_canonical_list(value: Any) -> list[str]:
     """Order-insensitive canonical form so list reordering never trips the guard."""
     if value is None:
@@ -1812,6 +1823,7 @@ def resolve_watermark_window(
     config: Any,
     running_script_version: str,
     state_root: Optional[str] = None,
+    state_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Derive the effective [start_date, end_date] window for a Watermark run.
@@ -1840,11 +1852,14 @@ def resolve_watermark_window(
     """
     append_file = getattr(config, "append_file", None)
     output_path = getattr(config, "output_path", None)
-    state_path = (
-        str(Path(state_root) / _WATERMARK_STATE_FILENAME)
-        if state_root
-        else _watermark_state_path(output_path, append_file)
-    )
+    # An explicit per-target state_path (Fabric per-fact-table keying) wins;
+    # otherwise fall back to state_root (single-file) or the CLI output-root path.
+    if not state_path:
+        state_path = (
+            str(Path(state_root) / _WATERMARK_STATE_FILENAME)
+            if state_root
+            else _watermark_state_path(output_path, append_file)
+        )
 
     # End of window = today's UTC boundary. EndDate is exclusive throughout
     # the query/trim pipeline, so this includes the most recent complete day.

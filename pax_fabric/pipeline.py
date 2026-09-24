@@ -49,6 +49,7 @@ from .mod1_pax_config import (
     COPILOT_BASE_ACTIVITY_TYPE,
     script_version_banner,
     config_from_params,
+    compute_trim_boundaries,
     initialize_config,
 )
 from .mod3_pax_logging import (
@@ -557,6 +558,28 @@ def _resolve_dashboard_prefix(config: PAXConfig) -> str:
         return "M365"
     dash = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
     return _DASHBOARD_PREFIX_MAP.get(dash, "AIO")
+
+
+def _watermark_fact_kind(config: PAXConfig) -> str:
+    """Discriminate the accumulating fact-table family for watermark state keying."""
+    if getattr(config, "include_m365_usage", False):
+        return "m365"
+    if getattr(config, "rollup_plus_raw", False):
+        return "rollupplusraw"
+    if getattr(config, "rollup", False):
+        return "rollup"
+    return "raw"
+
+
+def _watermark_state_path_for(config: PAXConfig, target_schema: str) -> str:
+    """Resolve the per-fact-table watermark state file under Files/pax/state/."""
+    from .mod6_pax_checkpoint import watermark_state_filename
+
+    prefix = _resolve_dashboard_prefix(config) or "shared"
+    leaf = watermark_state_filename(
+        target_schema, prefix, _watermark_fact_kind(config)
+    )
+    return str(Path(files_io.state_root()) / leaf)
 
 
 def _dashboard_prefix_for_name(dashboard: str) -> str:
@@ -1464,7 +1487,7 @@ def run(params: Optional[dict] = None) -> dict:
                 wm_info = resolve_watermark_window(
                     config,
                     SCRIPT_VERSION,
-                    state_root=files_io.state_root(),
+                    state_path=_watermark_state_path_for(config, target_schema),
                 )
             except ValueError as ex:
                 write_log(str(ex), level="ERROR")
@@ -1501,15 +1524,12 @@ def run(params: Optional[dict] = None) -> dict:
                 )
                 return result
 
-            # Re-run initialize_config so trim boundaries pick up the new
-            # start_date/end_date. apply_date_defaults is idempotent on
-            # explicit yyyy-MM-dd values, so this is safe to re-invoke.
-            errors = initialize_config(config)
-            if errors:
-                for err in errors:
-                    write_log(err, level="ERROR")
-                result["error"] = "; ".join(errors)
-                return result
+            # Thread A: only the date window changed, so recompute just the
+            # derived trim boundaries. Re-running full initialize_config here
+            # would re-fire the EntraUsers destination validator AFTER Rollup
+            # already auto-enabled IncludeUserInfo (but before staging paths are
+            # bound), producing a spurious "requires a destination" error.
+            compute_trim_boundaries(config)
             write_log(
                 f"Date range (post-watermark): {config.start_date} -> {config.end_date}"
             )
