@@ -14,6 +14,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote as url_quote
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,7 @@ def resolve_pax_user_scope(
     *,
     user_ids: Optional[List[str]] = None,
     group_names: Optional[List[str]] = None,
+    native_comma_group_input: Optional[str] = None,
     graph_request_fn: Optional[Callable[[str, str], Any]] = None,
     log_fn: Optional[Callable[[str, str], None]] = None,
     roster_validator: Optional[Callable[[str], bool]] = None,
@@ -206,7 +208,12 @@ def resolve_pax_user_scope(
     # --- Dedupe group_names (case-insensitive, first-seen wins) ---
     seen_groups: set = set()
     requested_groups: List[str] = []
-    for g in (group_names or []):
+    group_inputs = (
+        [native_comma_group_input]
+        if native_comma_group_input and native_comma_group_input.strip()
+        else (group_names or [])
+    )
+    for g in group_inputs:
         if g is None:
             continue
         t = str(g).strip()
@@ -217,6 +224,37 @@ def resolve_pax_user_scope(
             continue
         seen_groups.add(key)
         requested_groups.append(t)
+
+    def _canonical_user_id(user_id: str) -> str:
+        if graph_request_fn is None:
+            return user_id
+        select = '?$select=userPrincipalName'
+        try:
+            user = graph_request_fn(
+                'GET',
+                'https://graph.microsoft.com/v1.0/users/'
+                f'{url_quote(user_id, safe="")}'+ select,
+            )
+            upn = user.get('userPrincipalName') if isinstance(user, dict) else None
+            if upn and str(upn).strip():
+                return str(upn).strip()
+        except Exception:
+            pass
+        escaped = user_id.replace("'", "''")
+        try:
+            response = graph_request_fn(
+                'GET',
+                'https://graph.microsoft.com/v1.0/users?'
+                f"$filter=mail eq '{escaped}'&$select=userPrincipalName",
+            )
+            values = response.get('value') if isinstance(response, dict) else None
+            if isinstance(values, list) and len(values) == 1:
+                upn = values[0].get('userPrincipalName')
+                if upn and str(upn).strip():
+                    return str(upn).strip()
+        except Exception:
+            pass
+        return user_id
 
     # --- Roster classification (optional) ---
     matched_users: List[str] = []
@@ -231,14 +269,17 @@ def resolve_pax_user_scope(
             exists = True
         (matched_users if exists else unmatched_users).append(u)
 
-    # --- Seed final union with all explicit user_ids (parity with PS) ---
+    # Seed the effective union with canonical UPNs where Graph can resolve an
+    # object ID, UPN, or primary SMTP address. Unresolved values are retained,
+    # preserving PowerShell's safe zero-match behavior.
     final_seen: set = set()
     final_users: List[str] = []
     for u in requested_user_ids:
-        key = u.lower()
+        canonical_user = _canonical_user_id(u)
+        key = canonical_user.lower()
         if key not in final_seen:
             final_seen.add(key)
-            final_users.append(u)
+            final_users.append(canonical_user)
 
     result = UserScopeResult(
         requested_user_ids=requested_user_ids,
@@ -260,7 +301,10 @@ def resolve_pax_user_scope(
         result.final_target_users = final_users
         return result
 
-    for g in requested_groups:
+    group_index = 0
+    while group_index < len(requested_groups):
+        g = requested_groups[group_index]
+        group_index += 1
         try:
             group_id: Optional[str] = None
             group_display: Optional[str] = None
@@ -300,6 +344,17 @@ def resolve_pax_user_scope(
                     if r2 and r2.get('value'):
                         hits.extend(r2['value'])
                 if not hits:
+                    if native_comma_group_input and g == native_comma_group_input:
+                        parts = [part.strip() for part in g.split(',') if part.strip()]
+                        if len(parts) > 1:
+                            requested_groups.pop(group_index - 1)
+                            group_index -= 1
+                            for part in reversed(parts):
+                                key = part.lower()
+                                if key not in seen_groups:
+                                    seen_groups.add(key)
+                                    requested_groups.insert(group_index, part)
+                            continue
                     result.failed_groups.append(g)
                     _mark_failed('GroupNotFound')
                     continue

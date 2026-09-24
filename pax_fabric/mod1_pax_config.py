@@ -18,6 +18,7 @@ This module provides:
 
 from __future__ import annotations
 
+import csv
 import os
 import re
 import sys
@@ -368,6 +369,8 @@ class PAXConfig:
     _dashboard_explicit: bool = False
     _multi_dashboard_enabled: bool = False
     _dashboard_parse_errors: list[str] = field(default_factory=list)
+    _native_group_names_comma_input: Optional[str] = None
+    _group_names_explicit_items: bool = False
 
     # --- ExcludeCopilotInteraction/IncludeCopilotInteraction conflict flag ---
     # Set by initialize_config() (via _detect_copilot_exclude_conflict) BEFORE
@@ -404,6 +407,19 @@ def resolve_comma_separated_values(values: Optional[list[str]]) -> Optional[list
 
     # Deduplicate preserving order
     return list(dict.fromkeys(result)) or None
+
+
+def _parse_quoted_group_names(value: str) -> list[str]:
+    """Parse a pipeline GroupNames string using CSV quoting rules."""
+    try:
+        parsed = next(csv.reader([value], skipinitialspace=True, strict=True))
+    except csv.Error as ex:
+        raise ValueError(f"GroupNames has invalid quoted syntax: {ex}") from ex
+
+    names = [name.strip() for name in parsed]
+    if not names or any(not name for name in names):
+        raise ValueError("GroupNames must not contain empty group names.")
+    return list(dict.fromkeys(names))
 
 
 def normalize_record_types(record_types: Optional[list[str]]) -> Optional[list[str]]:
@@ -2049,7 +2065,12 @@ def initialize_config(config: PAXConfig) -> list[str]:
     if config.user_ids:
         config.user_ids = resolve_comma_separated_values(config.user_ids)
     if config.group_names:
-        config.group_names = resolve_comma_separated_values(config.group_names)
+        if config._group_names_explicit_items:
+            config.group_names = list(dict.fromkeys(
+                name.strip() for name in config.group_names if name and name.strip()
+            )) or None
+        else:
+            config.group_names = resolve_comma_separated_values(config.group_names)
     if config.agent_id:
         config.agent_id = resolve_comma_separated_values(config.agent_id)
 
@@ -2236,7 +2257,6 @@ def config_from_params(params: dict) -> "PAXConfig":
         ("servicetypes", "service_types"),
         ("agentid", "agent_id"),
         ("userids", "user_ids"),
-        ("groupnames", "group_names"),
     ):
         v = pick(src, dst)
         if v is not None:
@@ -2248,6 +2268,23 @@ def config_from_params(params: dict) -> "PAXConfig":
                     cfg._user_supplied_record_types = True
                 elif dst == "service_types" and coerced:
                     cfg._user_supplied_service_types = True
+
+    group_names_value = pick("groupnames", "group_names")
+    if group_names_value is not None:
+        if isinstance(group_names_value, str):
+            raw_group_names = group_names_value.strip()
+            if raw_group_names:
+                if '"' in raw_group_names:
+                    cfg.group_names = _parse_quoted_group_names(raw_group_names)
+                    cfg._group_names_explicit_items = True
+                else:
+                    cfg._native_group_names_comma_input = (
+                        raw_group_names if ',' in raw_group_names else None
+                    )
+                    cfg.group_names = [raw_group_names]
+        else:
+            cfg.group_names = _coerce_csv_list(group_names_value)
+            cfg._group_names_explicit_items = True
 
     pf = pick("promptfilter", "prompt_filter")
     if pf is not None:

@@ -1777,6 +1777,12 @@ def run(params: Optional[dict] = None) -> dict:
                     config.user_ids = list(cp_params["userIds"])
                 if cp_params.get("groupNames") and not _group_names_overridden:
                     config.group_names = list(cp_params["groupNames"])
+                    config._native_group_names_comma_input = cp_params.get(
+                        "nativeGroupNamesCommaInput"
+                    )
+                    config._group_names_explicit_items = bool(
+                        cp_params.get("groupNamesExplicitItems")
+                    )
                 if _user_ids_overridden:
                     write_log(f"  [RESUME] -UserIds override applied (checkpoint scope replaced): {config.user_ids}")
                 if _group_names_overridden:

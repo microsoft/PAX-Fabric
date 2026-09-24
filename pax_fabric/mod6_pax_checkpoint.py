@@ -627,6 +627,12 @@ def initialize_checkpoint_for_new_run(
             "serviceTypes": list(all_parameters.get("ServiceTypes") or []),
             "userIds": list(all_parameters.get("UserIds") or []),
             "groupNames": list(all_parameters.get("GroupNames") or []),
+            "nativeGroupNamesCommaInput": (
+                all_parameters.get("NativeGroupNamesCommaInput") or None
+            ),
+            "groupNamesExplicitItems": bool(
+                all_parameters.get("GroupNamesExplicitItems")
+            ),
             # Agent filtering
             "agentId": list(all_parameters.get("AgentId") or []) if all_parameters.get("AgentId") else [],
             "agentsOnly": bool(all_parameters.get("AgentsOnly")),
