@@ -1468,6 +1468,29 @@ def _load_replay_csv(ctx: 'PAXRunContext', start_ns: int) -> int:
     )
 
 
+def _expand_graph_service_partitions(
+    partitions: list[tuple[datetime, datetime, int]],
+    service_types: list[str] | None,
+    *,
+    use_eom: bool,
+) -> tuple[list[tuple[datetime, datetime, int]], dict[int, str | None]]:
+    """Create one checkpoint-addressable Graph partition per service filter."""
+    services = [service for service in (service_types or []) if service]
+    if use_eom or len(services) <= 1:
+        selected = services[0] if services and not use_eom else None
+        return partitions, {partition[2]: selected for partition in partitions}
+
+    expanded: list[tuple[datetime, datetime, int]] = []
+    service_by_partition: dict[int, str | None] = {}
+    next_index = 0
+    for service in services:
+        for partition_start, partition_end, _ in partitions:
+            next_index += 1
+            expanded.append((partition_start, partition_end, next_index))
+            service_by_partition[next_index] = service
+    return expanded, service_by_partition
+
+
 def _run_query_phase(ctx: PAXRunContext) -> int:
     """Execute query orchestration. Returns elapsed ms."""
     import requests
@@ -1538,6 +1561,12 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             "ServiceTypes": config.service_types,
             "UserIds": config.user_ids,
             "GroupNames": config.group_names,
+            "NativeGroupNamesCommaInput": getattr(
+                config, '_native_group_names_comma_input', None
+            ),
+            "GroupNamesExplicitItems": getattr(
+                config, '_group_names_explicit_items', False
+            ),
             "AgentId": config.agent_id,
             "AgentsOnly": getattr(config, 'agents_only', False),
             "ExcludeAgents": getattr(config, 'exclude_agents', False),
@@ -1638,6 +1667,9 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         _scope = resolve_pax_user_scope(
             user_ids=_requested_user_ids,
             group_names=_requested_group_names,
+            native_comma_group_input=getattr(
+                config, '_native_group_names_comma_input', None
+            ),
             graph_request_fn=_scope_graph_get,
             log_fn=lambda msg, lvl='info': write_log(msg, level=str(lvl).upper()),
         )
@@ -2001,7 +2033,18 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             status = getattr(response, "status_code", None) if response is not None else None
         return status == 429
 
-    def _query_fn(block_start, block_end, activity_type, result_size, user_ids, use_eom_mode, log_ctx=None, *, page_callback=None):
+    def _query_fn(
+        block_start,
+        block_end,
+        activity_type,
+        result_size,
+        user_ids,
+        use_eom_mode,
+        log_ctx=None,
+        *,
+        page_callback=None,
+        service_types_override=None,
+    ):
         """Submit Graph audit query, poll, retrieve and normalize records.
 
         When ``page_callback`` is set the records are flushed to disk per page
@@ -2040,14 +2083,29 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         else:
             operations_list = [activity_type] if activity_type else None
 
-        display_name = f"PAX_{operations_list[0] if operations_list else 'Query'}_{block_start.strftime('%Y%m%d%H%M')}"
+        selected_services = (
+            service_types_override
+            if service_types_override is not None
+            else config.service_types
+        )
+        service_suffix = f"_{selected_services[0]}" if selected_services else ""
+        display_name = (
+            f"PAX_{operations_list[0] if operations_list else 'Query'}"
+            f"{service_suffix}_{block_start.strftime('%Y%m%d%H%M')}"
+        )
 
         # v1.11.15 parity: hardened / duplicate-safe create — refuse to blindly
         # resubmit a partition that has an unresolved uncertain-create contract
         # from a prior interrupted run. The operator must clear it via
         # -ClearUncertainCreate / -ClearUncertainContract before a fresh query
         # is attempted (avoids risking a duplicate server-side query).
-        _submit_fp = compute_partition_fingerprint(activity_type, block_start, block_end)
+        fingerprint_extra = selected_services[0] if selected_services else ""
+        _submit_fp = compute_partition_fingerprint(
+            activity_type,
+            block_start,
+            block_end,
+            fingerprint_extra,
+        )
         for _uncertain_entry in get_uncertain_partitions():
             if _uncertain_entry.get("index") == p_idx and _uncertain_entry.get("fingerprint") == _submit_fp:
                 _record_data_loss(
@@ -2088,7 +2146,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     end_date=block_end,
                     operations=operations_list,
                     record_types=config.record_types,
-                    service_types=config.service_types,
+                    service_types=selected_services,
                     user_principal_names=None,
                     http_client=http,
                     api_version=api_version,
@@ -2156,7 +2214,13 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 # response, etc.) — we cannot tell whether the server actually
                 # created the query. Mark it durably uncertain rather than
                 # silently losing track of it (v1.11.15 hardened-create parity).
-                mark_partition_uncertain(p_idx, activity_type, block_start, block_end)
+                mark_partition_uncertain(
+                    p_idx,
+                    activity_type,
+                    block_start,
+                    block_end,
+                    fingerprint_extra,
+                )
                 _record_data_loss(
                     phase="submit",
                     partition_index=p_idx,
@@ -2717,6 +2781,16 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             p_end = query_end if pi == num_partitions - 1 else query_start + timedelta(hours=slice_hours * (pi + 1))
             partitions.append((p_start, p_end, pi + 1))
 
+        # Graph accepts one serviceFilter value per query. Expand the work plan
+        # so every requested service receives the complete time partition set
+        # and a unique checkpoint index, matching PowerShell's service runs.
+        partitions, partition_service_by_index = _expand_graph_service_partitions(
+            partitions,
+            config.service_types,
+            use_eom=use_eom,
+        )
+        num_partitions = len(partitions)
+
         # --- Update checkpoint with total partition count ---
         # PS L22501-22505: Only update total for fresh runs; on resume, total
         # is already set from the original checkpoint.
@@ -2822,6 +2896,13 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 #                       total_pages, total_raw, total_kept]
                 filter_stats = [0, 0, 0, 0, 0, 0]
                 _FILTER_LOG_EVERY = 100
+                selected_service = partition_service_by_index.get(p_idx)
+
+                def _partition_query_fn(*args, **kwargs):
+                    kwargs["service_types_override"] = (
+                        [selected_service] if selected_service else None
+                    )
+                    return _query_fn(*args, **kwargs)
 
                 def _emit_filter_summary(_p=p_idx, _pt=p_total, _fs=filter_stats):
                     if not target_users_set_lower or _fs[3] <= 0:
@@ -2921,7 +3002,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                         activity_type=act,
                         start_date=p_start,
                         end_date=p_end,
-                        query_fn=_query_fn,
+                        query_fn=_partition_query_fn,
                         partition_index=p_idx,
                         total_partitions=p_total,
                         use_eom_mode=True,
@@ -2958,7 +3039,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                         activity_type=act,
                         start_date=p_start,
                         end_date=p_end,
-                        query_fn=_query_fn,
+                        query_fn=_partition_query_fn,
                         partition_index=p_idx,
                         total_partitions=p_total,
                         backoff_base_seconds=config.backoff_base_seconds,
@@ -3135,6 +3216,9 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 for parent_idx, sub_windows in pending_subdivisions:
                     for sw_start, sw_end in sub_windows:
                         next_partition_idx += 1
+                        partition_service_by_index[next_partition_idx] = (
+                            partition_service_by_index.get(parent_idx)
+                        )
                         pass_partitions.append((sw_start, sw_end, next_partition_idx))
                         write_log(
                             f"  [SUBDIVISION] Parent {parent_idx} -> "
@@ -3195,6 +3279,9 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                                 # this index "failed" so we don't lose the work.
                                 for sw_start, sw_end in retry_count.sub_windows:
                                     next_partition_idx += 1
+                                    partition_service_by_index[next_partition_idx] = (
+                                        partition_service_by_index.get(p_idx)
+                                    )
                                     still_failed.append((sw_start, sw_end, next_partition_idx))
                                     write_log(
                                         f"  [RETRY-SUBDIVISION] Partition {p_idx} -> "
@@ -4027,6 +4114,9 @@ def _scope_entra_users(
         scope = resolve_pax_user_scope(
             user_ids=requested_user_ids,
             group_names=requested_group_names,
+            native_comma_group_input=getattr(
+                config, '_native_group_names_comma_input', None
+            ),
             graph_request_fn=_scope_graph_get,
             roster_validator=lambda user_id: user_id.strip().lower() in roster_upns,
             log_fn=lambda msg, lvl='info': write_log(msg, level=str(lvl).upper()),
