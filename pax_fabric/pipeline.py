@@ -560,6 +560,36 @@ def _resolve_dashboard_prefix(config: PAXConfig) -> str:
     return _DASHBOARD_PREFIX_MAP.get(dash, "AIO")
 
 
+def _run_consumes_agent365(config: PAXConfig) -> bool:
+    """PS ``ConsumesAgent365`` parity: only AIO / ValueLens dashboards receive
+    the Agent 365 catalog; the M365 dashboard never does.
+
+    Governs whether the mandatory empty Agent365 Delta table is ensured on the
+    drain. Returns True (current behavior) for every case except an M365-only
+    run, so AIO / ValueLens / standalone-Agent365 parity is byte-identical.
+    """
+    # An explicit Agent 365 request always produces the catalog.
+    if getattr(config, "only_agent365_info", False) or getattr(
+        config, "include_agent365_info", False
+    ):
+        return True
+    # Multi-dashboard: consume if any AIO / ValueLens pass is in the set.
+    # (Dashboard=M365 auto-enables include_m365_usage even in AIO+M365 runs, so
+    # the requested-set check MUST precede the include_m365_usage check below.)
+    if getattr(config, "_multi_dashboard_enabled", False):
+        requested = [
+            str(name).upper()
+            for name in (getattr(config, "requested_dashboards", None) or [])
+        ]
+        return any(name in ("AIO", "VALUELENS") for name in requested)
+    # Single-dashboard / bundle. An M365-only run (Dashboard=M365 or a bare
+    # IncludeM365Usage) does not receive Agent 365.
+    if getattr(config, "include_m365_usage", False):
+        return False
+    dash = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
+    return dash in ("AIO", "VALUELENS")
+
+
 def _watermark_fact_kind(config: PAXConfig) -> str:
     """Discriminate the accumulating fact-table family for watermark state keying."""
     if getattr(config, "include_m365_usage", False):
@@ -2419,6 +2449,10 @@ def run(params: Optional[dict] = None) -> dict:
             # loss instead of raising past pipeline.run()'s accounting.
             # CSVs remain on disk under csv_root for re-drain.
             delta_results: list = []
+            # PS ConsumesAgent365 parity: the mandatory empty Agent365 table is
+            # ensured only for runs whose dashboard consumes the catalog
+            # (AIO / ValueLens / explicit Agent365 request), never for M365-only.
+            ensure_agent365 = _run_consumes_agent365(config)
             try:
                 strategy_overrides = {}
                 if (
@@ -2455,6 +2489,7 @@ def run(params: Optional[dict] = None) -> dict:
                         dashboard_prefix=shared_input_prefix,
                         run_deidentified=bool(getattr(config, "deidentify", False)),
                         excluded_csv_paths=excluded_shared_csvs,
+                        ensure_agent365_table=ensure_agent365,
                     )
                     for drain in multi_dashboard_drains:
                         per_dashboard_strategy = {}
@@ -2473,6 +2508,7 @@ def run(params: Optional[dict] = None) -> dict:
                             dashboard_prefix=drain["prefix"],
                             strategy_overrides=per_dashboard_strategy,
                             run_deidentified=bool(getattr(config, "deidentify", False)),
+                            ensure_agent365_table=False,
                         )
                         delta_results.extend(
                             entry for entry in dashboard_results
@@ -2489,6 +2525,7 @@ def run(params: Optional[dict] = None) -> dict:
                         dashboard_prefix=drain_prefix,
                         strategy_overrides=strategy_overrides,
                         run_deidentified=bool(getattr(config, "deidentify", False)),
+                        ensure_agent365_table=ensure_agent365,
                     )
             except Exception as ex:
                 write_log(

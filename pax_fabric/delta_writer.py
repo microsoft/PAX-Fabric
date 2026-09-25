@@ -195,6 +195,7 @@ def csv_dir_to_delta(
     strategy_overrides: Optional[dict[str, str]] = None,
     run_deidentified: Optional[bool] = None,
     excluded_csv_paths: Optional[set[str]] = None,
+    ensure_agent365_table: bool = True,
 ) -> list[dict]:
     """Drain every ``*.csv`` in ``csv_dir`` into a Delta table (append mode).
 
@@ -234,10 +235,17 @@ def csv_dir_to_delta(
             Delta writes reject an existing table with the opposite state.
         excluded_csv_paths: Exact CSV paths to leave in scratch without
             publishing during this drain.
+        ensure_agent365_table: When True (default), the mandatory empty
+            Agent365 Delta table is ensured after the CSV loop. Set False for
+            drains whose dashboard does not consume the Agent 365 catalog
+            (the M365 dashboard — PS ``ConsumesAgent365 = $false``).
 
     Returns:
         List of dicts, one per written CSV, plus an initialization entry when
-        the mandatory empty Agent365 table is created. Empty CSVs are skipped.
+        the mandatory empty Agent365 table is created (only when
+        ``ensure_agent365_table`` is set — the M365 dashboard does not consume
+        the Agent 365 catalog, matching PS ``ConsumesAgent365``). Empty CSVs
+        are skipped.
         Drift-rejected or retry-exhausted CSVs are skipped with a WARN-
         level log message and excluded from the return list (matches
         v1.11.1 fail-soft per-table behavior).
@@ -392,11 +400,18 @@ def csv_dir_to_delta(
             }
         )
 
-    # Agent365 is optional to collect but mandatory for the Power BI model.
-    # Ensure its table contract on every Delta drain, even when the feature
-    # was never requested, the tenant is not enrolled, or the pull returned
-    # no rows. Running this after the CSV loop means a successful populated
-    # write is preserved; an existing table is never overwritten or altered.
+    # Agent365 is optional to collect but mandatory for the Power BI model of
+    # the dashboards that consume it (AIO / ValueLens). Ensure its table
+    # contract on every such Delta drain, even when the feature was never
+    # requested, the tenant is not enrolled, or the pull returned no rows.
+    # The M365 dashboard does not receive an Agent 365 catalog (PS parity:
+    # ConsumesAgent365 = $false), so callers pass ensure_agent365_table=False
+    # for M365-only drains. Running this after the CSV loop means a successful
+    # populated write is preserved; an existing table is never overwritten or
+    # altered.
+    if not ensure_agent365_table:
+        return results
+
     from .mod12_pax_agent365 import AGENT365_COLUMNS  # noqa: WPS433
 
     agent365_path = (
