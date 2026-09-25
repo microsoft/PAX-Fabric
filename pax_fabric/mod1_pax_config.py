@@ -1657,6 +1657,16 @@ def validate_config(config: PAXConfig) -> list[str]:
                 "supply StartDate/EndDate."
             )
 
+        # Fabric v1 limitation: watermark state is keyed per audit fact table,
+        # so one run writing several dashboards' fact tables isn't supported yet
+        # (PS handles this as one atomic multi-dashboard watermark).
+        if getattr(config, "_multi_dashboard_enabled", False):
+            errors.append(
+                "Watermark is not supported for multi-dashboard runs "
+                f"({', '.join(config.requested_dashboards)}). Run one dashboard "
+                "at a time with Watermark, or drop Watermark for the combined run."
+            )
+
     # PS L19228 / L23956: [ValidateSet('Off','On')] on -UserHistory.
     uh_raw = str(getattr(config, "user_history", "Off") or "Off")
     if uh_raw not in ("Off", "On"):

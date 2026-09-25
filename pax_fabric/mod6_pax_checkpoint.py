@@ -1682,15 +1682,68 @@ def show_checkpoint_exit_message() -> None:
 _WATERMARK_STATE_FILENAME = ".pax_watermark_state.json"
 
 
+def watermark_state_filename(schema: str, dashboard_prefix: str, fact_kind: str) -> str:
+    """Per-target watermark state leaf, keyed by the audit fact-table family.
+
+    Keying by (schema + dashboard prefix + fact kind) gives each dashboard/mode
+    its own independent coverage marker, so single-dashboard runs never collide.
+    """
+    parts = [str(schema or "dbo"), str(dashboard_prefix or "shared"), str(fact_kind or "raw")]
+    key = "_".join((re.sub(r"[^A-Za-z0-9]+", "", p) or "x") for p in parts)
+    return f".pax_watermark__{key}.json"
+
+
+def _watermark_canonical_list(value: Any) -> list[str]:
+    """Order-insensitive canonical form so list reordering never trips the guard."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return sorted(str(x).strip() for x in value)
+    return [str(value).strip()]
+
+
 def _watermark_contract_fingerprint(config: Any) -> str:
-    """Hash the query/output semantics that must remain stable across advances."""
-    fields = (
-        "activity_types", "record_types", "service_types", "user_ids",
-        "group_names", "agent_id", "agents_only", "exclude_agents",
-        "prompt_filter", "include_m365_usage", "explode_arrays", "explode_deep",
-        "deidentify", "dashboard", "user_history",
-    )
-    contract = {name: getattr(config, name, None) for name in fields}
+    """
+    Hash the settings that change what a collected day contains, so an advance
+    is refused if any of them change between watermark runs. Field set mirrors
+    the PS ``$paxWatermarkContract`` (L37858). Script-derived fields not present
+    on the Fabric ``PAXConfig`` (hierarchyFill*, rollupDashboard, processorMode,
+    processor versions, publicationContract) are omitted; ``user_history`` is
+    excluded to match PS (it is a merge-time enrichment, not day content).
+    """
+    def g(name: str) -> Any:
+        return getattr(config, name, None)
+
+    contract = {
+        "activityTypes": _watermark_canonical_list(g("activity_types")),
+        "recordTypes": _watermark_canonical_list(g("record_types")),
+        "serviceTypes": _watermark_canonical_list(g("service_types")),
+        "includeCopilotInteraction": bool(g("include_copilot_interaction")),
+        "excludeCopilotInteraction": bool(g("exclude_copilot_interaction")),
+        "includeM365Usage": bool(g("include_m365_usage")),
+        "userIdsIntent": _watermark_canonical_list(g("user_ids")),
+        "groupNamesIntent": _watermark_canonical_list(g("group_names")),
+        "agentId": _watermark_canonical_list(g("agent_id")),
+        "agentsOnly": bool(g("agents_only")),
+        "excludeAgents": bool(g("exclude_agents")),
+        "promptFilter": str(g("prompt_filter") or ""),
+        "explodeArrays": bool(g("explode_arrays")),
+        "explodeDeep": bool(g("explode_deep")),
+        "flatDepth": int(g("flat_depth") or 0),
+        "streamingSchemaSample": int(g("streaming_schema_sample") or 0),
+        "streamingChunkSize": int(g("streaming_chunk_size") or 0),
+        "combineOutput": bool(g("combine_output")),
+        "rollup": bool(g("rollup")),
+        "rollupPlusRaw": bool(g("rollup_plus_raw")),
+        "dashboard": str(g("dashboard") or ""),
+        "includeUserInfo": bool(g("include_user_info")),
+        "appendUserInfoRequested": bool(g("append_user_info")),
+        "userInfoFile": str(g("user_info_file") or ""),
+        "userInfoSupplement": str(g("user_info_supplement") or ""),
+        "includeAgent365Info": bool(g("include_agent365_info")),
+        "appendAgent365Requested": bool(g("append_agent365_info")),
+        "deidentify": bool(g("deidentify")),
+    }
     payload = json.dumps(
         contract, sort_keys=True, separators=(",", ":"), default=str
     ).encode("utf-8")
@@ -1770,15 +1823,18 @@ def resolve_watermark_window(
     config: Any,
     running_script_version: str,
     state_root: Optional[str] = None,
+    state_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Derive the effective [start_date, end_date] window for a Watermark run.
 
-    Mirrors PS ``Initialize-PaxWatermarkRun`` (L37744) minimally: the notebook
-    run path only needs (a) the derived catch-up window, and (b) a short-circuit
-    signal when there are no new full UTC days to collect. Contract-hash
-    guarding (PS ``$paxWatermarkContract``) is intentionally NOT ported yet —
-    the CLI ships that; the Fabric surface targets minimum viable parity.
+    Mirrors PS ``Initialize-PaxWatermarkRun`` (L37744): the notebook run path
+    derives the catch-up window, short-circuits when there are no new full UTC
+    days, and enforces the query-contract guard (see
+    ``_watermark_contract_fingerprint``) so an advance is refused if the
+    collection settings change between runs. The remote publication-state
+    machinery (PS PUBSTATE admit/restore, pending-remote) is not part of this
+    local-state Fabric surface by design.
 
     Called ONLY when ``config.watermark is True and config.resume is None``.
     Mutates ``config.start_date`` and ``config.end_date`` on the return path.
@@ -1796,11 +1852,14 @@ def resolve_watermark_window(
     """
     append_file = getattr(config, "append_file", None)
     output_path = getattr(config, "output_path", None)
-    state_path = (
-        str(Path(state_root) / _WATERMARK_STATE_FILENAME)
-        if state_root
-        else _watermark_state_path(output_path, append_file)
-    )
+    # An explicit per-target state_path (Fabric per-fact-table keying) wins;
+    # otherwise fall back to state_root (single-file) or the CLI output-root path.
+    if not state_path:
+        state_path = (
+            str(Path(state_root) / _WATERMARK_STATE_FILENAME)
+            if state_root
+            else _watermark_state_path(output_path, append_file)
+        )
 
     # End of window = today's UTC boundary. EndDate is exclusive throughout
     # the query/trim pipeline, so this includes the most recent complete day.

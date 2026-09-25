@@ -49,6 +49,7 @@ from .mod1_pax_config import (
     COPILOT_BASE_ACTIVITY_TYPE,
     script_version_banner,
     config_from_params,
+    compute_trim_boundaries,
     initialize_config,
 )
 from .mod3_pax_logging import (
@@ -557,6 +558,58 @@ def _resolve_dashboard_prefix(config: PAXConfig) -> str:
         return "M365"
     dash = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
     return _DASHBOARD_PREFIX_MAP.get(dash, "AIO")
+
+
+def _run_consumes_agent365(config: PAXConfig) -> bool:
+    """PS ``ConsumesAgent365`` parity: only AIO / ValueLens dashboards receive
+    the Agent 365 catalog; the M365 dashboard never does.
+
+    Governs whether the mandatory empty Agent365 Delta table is ensured on the
+    drain. Returns True (current behavior) for every case except an M365-only
+    run, so AIO / ValueLens / standalone-Agent365 parity is byte-identical.
+    """
+    # An explicit Agent 365 request always produces the catalog.
+    if getattr(config, "only_agent365_info", False) or getattr(
+        config, "include_agent365_info", False
+    ):
+        return True
+    # Multi-dashboard: consume if any AIO / ValueLens pass is in the set.
+    # (Dashboard=M365 auto-enables include_m365_usage even in AIO+M365 runs, so
+    # the requested-set check MUST precede the include_m365_usage check below.)
+    if getattr(config, "_multi_dashboard_enabled", False):
+        requested = [
+            str(name).upper()
+            for name in (getattr(config, "requested_dashboards", None) or [])
+        ]
+        return any(name in ("AIO", "VALUELENS") for name in requested)
+    # Single-dashboard / bundle. An M365-only run (Dashboard=M365 or a bare
+    # IncludeM365Usage) does not receive Agent 365.
+    if getattr(config, "include_m365_usage", False):
+        return False
+    dash = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
+    return dash in ("AIO", "VALUELENS")
+
+
+def _watermark_fact_kind(config: PAXConfig) -> str:
+    """Discriminate the accumulating fact-table family for watermark state keying."""
+    if getattr(config, "include_m365_usage", False):
+        return "m365"
+    if getattr(config, "rollup_plus_raw", False):
+        return "rollupplusraw"
+    if getattr(config, "rollup", False):
+        return "rollup"
+    return "raw"
+
+
+def _watermark_state_path_for(config: PAXConfig, target_schema: str) -> str:
+    """Resolve the per-fact-table watermark state file under Files/pax/state/."""
+    from .mod6_pax_checkpoint import watermark_state_filename
+
+    prefix = _resolve_dashboard_prefix(config) or "shared"
+    leaf = watermark_state_filename(
+        target_schema, prefix, _watermark_fact_kind(config)
+    )
+    return str(Path(files_io.state_root()) / leaf)
 
 
 def _dashboard_prefix_for_name(dashboard: str) -> str:
@@ -1464,7 +1517,7 @@ def run(params: Optional[dict] = None) -> dict:
                 wm_info = resolve_watermark_window(
                     config,
                     SCRIPT_VERSION,
-                    state_root=files_io.state_root(),
+                    state_path=_watermark_state_path_for(config, target_schema),
                 )
             except ValueError as ex:
                 write_log(str(ex), level="ERROR")
@@ -1501,15 +1554,12 @@ def run(params: Optional[dict] = None) -> dict:
                 )
                 return result
 
-            # Re-run initialize_config so trim boundaries pick up the new
-            # start_date/end_date. apply_date_defaults is idempotent on
-            # explicit yyyy-MM-dd values, so this is safe to re-invoke.
-            errors = initialize_config(config)
-            if errors:
-                for err in errors:
-                    write_log(err, level="ERROR")
-                result["error"] = "; ".join(errors)
-                return result
+            # Thread A: only the date window changed, so recompute just the
+            # derived trim boundaries. Re-running full initialize_config here
+            # would re-fire the EntraUsers destination validator AFTER Rollup
+            # already auto-enabled IncludeUserInfo (but before staging paths are
+            # bound), producing a spurious "requires a destination" error.
+            compute_trim_boundaries(config)
             write_log(
                 f"Date range (post-watermark): {config.start_date} -> {config.end_date}"
             )
@@ -2399,6 +2449,10 @@ def run(params: Optional[dict] = None) -> dict:
             # loss instead of raising past pipeline.run()'s accounting.
             # CSVs remain on disk under csv_root for re-drain.
             delta_results: list = []
+            # PS ConsumesAgent365 parity: the mandatory empty Agent365 table is
+            # ensured only for runs whose dashboard consumes the catalog
+            # (AIO / ValueLens / explicit Agent365 request), never for M365-only.
+            ensure_agent365 = _run_consumes_agent365(config)
             try:
                 strategy_overrides = {}
                 if (
@@ -2435,6 +2489,7 @@ def run(params: Optional[dict] = None) -> dict:
                         dashboard_prefix=shared_input_prefix,
                         run_deidentified=bool(getattr(config, "deidentify", False)),
                         excluded_csv_paths=excluded_shared_csvs,
+                        ensure_agent365_table=ensure_agent365,
                     )
                     for drain in multi_dashboard_drains:
                         per_dashboard_strategy = {}
@@ -2453,6 +2508,7 @@ def run(params: Optional[dict] = None) -> dict:
                             dashboard_prefix=drain["prefix"],
                             strategy_overrides=per_dashboard_strategy,
                             run_deidentified=bool(getattr(config, "deidentify", False)),
+                            ensure_agent365_table=False,
                         )
                         delta_results.extend(
                             entry for entry in dashboard_results
@@ -2469,6 +2525,7 @@ def run(params: Optional[dict] = None) -> dict:
                         dashboard_prefix=drain_prefix,
                         strategy_overrides=strategy_overrides,
                         run_deidentified=bool(getattr(config, "deidentify", False)),
+                        ensure_agent365_table=ensure_agent365,
                     )
             except Exception as ex:
                 write_log(
@@ -2704,11 +2761,17 @@ def run(params: Optional[dict] = None) -> dict:
         # v1.11.16: advance watermark state on successful completion so the
         # next run picks up from the day after covered_end. Failure to persist
         # is non-fatal — the run already produced its data.
-        if (
-            result.get("success")
-            and watermark_state_path
-            and watermark_covered_end
-        ):
+        #
+        # PS parity: the watermark advances ONLY when the run actually collected
+        # records for the window. A 0-record window HOLDS the watermark so the
+        # same window is re-collected next run, which protects against
+        # late-arriving Purview audit data (matches PS "RollupFact not published
+        # -> watermark not advanced / completed with gaps").
+        _wm_active = bool(
+            result.get("success") and watermark_state_path and watermark_covered_end
+        )
+        _wm_records = int(getattr(ctx.metrics, "total_records_fetched", 0) or 0)
+        if _wm_active and _wm_records > 0:
             try:
                 if save_watermark_state(
                     watermark_state_path,
@@ -2735,6 +2798,21 @@ def run(params: Optional[dict] = None) -> dict:
                 result["exit_code"] = EXIT_ERROR
                 result["error"] = f"Watermark advance failed: {_wm_exc}"
                 write_log(result["error"], level="ERROR")
+        elif _wm_active and _wm_records == 0:
+            # PS-parity hold: nothing collected/published this window -> do not
+            # advance; the same window is re-collected on the next run.
+            result["watermark_held"] = True
+            result["watermark_hold_reason"] = (
+                "no records collected for the watermark window; the window will "
+                "be re-collected on the next run"
+            )
+            write_log(
+                "Watermark: NOT advanced (0 records collected for "
+                f"[{result.get('watermark_window_start')} .. {watermark_covered_end})). "
+                "The window will be re-collected next run - this protects against "
+                "late-arriving Purview audit data.",
+                level="WARN",
+            )
         # BYOD / OnlyUserInfo disable checkpointing outright — nothing was ever written to preserve.
         if ctx.script_completed and is_checkpoint_enabled():
             cp_data_final = get_checkpoint_data() or {}
