@@ -2724,11 +2724,17 @@ def run(params: Optional[dict] = None) -> dict:
         # v1.11.16: advance watermark state on successful completion so the
         # next run picks up from the day after covered_end. Failure to persist
         # is non-fatal — the run already produced its data.
-        if (
-            result.get("success")
-            and watermark_state_path
-            and watermark_covered_end
-        ):
+        #
+        # PS parity: the watermark advances ONLY when the run actually collected
+        # records for the window. A 0-record window HOLDS the watermark so the
+        # same window is re-collected next run, which protects against
+        # late-arriving Purview audit data (matches PS "RollupFact not published
+        # -> watermark not advanced / completed with gaps").
+        _wm_active = bool(
+            result.get("success") and watermark_state_path and watermark_covered_end
+        )
+        _wm_records = int(getattr(ctx.metrics, "total_records_fetched", 0) or 0)
+        if _wm_active and _wm_records > 0:
             try:
                 if save_watermark_state(
                     watermark_state_path,
@@ -2755,6 +2761,21 @@ def run(params: Optional[dict] = None) -> dict:
                 result["exit_code"] = EXIT_ERROR
                 result["error"] = f"Watermark advance failed: {_wm_exc}"
                 write_log(result["error"], level="ERROR")
+        elif _wm_active and _wm_records == 0:
+            # PS-parity hold: nothing collected/published this window -> do not
+            # advance; the same window is re-collected on the next run.
+            result["watermark_held"] = True
+            result["watermark_hold_reason"] = (
+                "no records collected for the watermark window; the window will "
+                "be re-collected on the next run"
+            )
+            write_log(
+                "Watermark: NOT advanced (0 records collected for "
+                f"[{result.get('watermark_window_start')} .. {watermark_covered_end})). "
+                "The window will be re-collected next run - this protects against "
+                "late-arriving Purview audit data.",
+                level="WARN",
+            )
         # BYOD / OnlyUserInfo disable checkpointing outright — nothing was ever written to preserve.
         if ctx.script_completed and is_checkpoint_enabled():
             cp_data_final = get_checkpoint_data() or {}
