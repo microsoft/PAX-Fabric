@@ -3416,6 +3416,12 @@ def _run_rollup_processors(
       - On processor SUCCESS + -Rollup  → delete raw Purview CSV + Entra CSV
       - On processor SUCCESS + -RollupPlusRaw → keep everything
       - On processor FAILURE (any mode) → always preserve raw CSV(s)
+
+    Note: the M365Bundle branch below never adds the Entra CSV to
+    ``always_delete_list`` — that list is only populated by the
+    CopilotInteraction (AIO/ValueLens) branch, where the Entra CSV really is
+    just an internal join input. For an M365-only single-dashboard run the
+    Entra CSV is itself the dashboard's user output and is always retained.
     """
     config = ctx.config
     rollup_success = False

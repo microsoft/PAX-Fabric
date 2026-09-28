@@ -372,6 +372,14 @@ class PAXConfig:
     _native_group_names_comma_input: Optional[str] = None
     _group_names_explicit_items: bool = False
 
+    # PS $PSBoundParameters.ContainsKey('IncludeUserInfo') parity: True only when
+    # the caller explicitly passed IncludeUserInfo, as opposed to it being turned
+    # on by an auto-enable side-effect (e.g. Dashboard=M365, -Rollup with a
+    # CopilotInteraction-only run). Distinguishes "explicitly requested" from
+    # "collected as a side-effect" for callers that need to tell the two apart
+    # (e.g. multi-dashboard Entra publication).
+    _include_user_info_explicit: bool = False
+
     # --- ExcludeCopilotInteraction/IncludeCopilotInteraction conflict flag ---
     # Set by initialize_config() (via _detect_copilot_exclude_conflict) BEFORE
     # resolve_activity_types() overwrites activity_types, so validate_config()

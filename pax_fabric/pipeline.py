@@ -590,6 +590,35 @@ def _run_consumes_agent365(config: PAXConfig) -> bool:
     return dash in ("AIO", "VALUELENS")
 
 
+def _should_publish_shared_entra(config: PAXConfig) -> bool:
+    """Return True when the shared raw Entra CSV must be published as
+    ``Entra_Users_Raw`` for a multi-dashboard run.
+
+    The M365 dashboard has no Users-shaped output of its own — unlike AIO /
+    ValueLens (which fold Entra data into ``AIO_Users`` / ``ValueLens_Users``),
+    M365's user data IS the shared ``Entra_Users_Raw`` table. So whenever
+    M365 is part of the requested dashboard set and Entra user data was
+    collected for this run — whether the caller explicitly passed
+    ``IncludeUserInfo=True`` or it was auto-enabled because ``Dashboard``
+    included ``M365`` — the raw Entra CSV must be retained and drained
+    instead of being treated as a purely internal join input for the
+    Copilot dashboards.
+
+    Deliberately does NOT consult ``_include_user_info_explicit``: that flag
+    only distinguishes *why* ``include_user_info`` is True, not whether Entra
+    data actually exists on disk for this run. Requiring it caused M365 runs
+    that relied on the Dashboard=M365 auto-enable (the common case) to silently
+    drop their Users table.
+    """
+    requested = [
+        str(name).upper()
+        for name in (getattr(config, "requested_dashboards", None) or [])
+    ]
+    if "M365" not in requested:
+        return False
+    return bool(getattr(config, "include_user_info", False))
+
+
 def _watermark_fact_kind(config: PAXConfig) -> str:
     """Discriminate the accumulating fact-table family for watermark state keying."""
     if getattr(config, "include_m365_usage", False):
@@ -618,29 +647,54 @@ def _dashboard_prefix_for_name(dashboard: str) -> str:
 
 
 def _finalize_multi_dashboard_inputs(ctx: PAXRunContext) -> None:
-    """Apply shared-input retention only after every dashboard pass succeeds."""
-    config = ctx.config
-    paths = [ctx.output_file, getattr(ctx, "_entra_csv_path", "") or ""]
-    paths = list(dict.fromkeys(path for path in paths if path))
-    if getattr(config, "rollup", False) and not getattr(
-        config, "rollup_plus_raw", False
-    ):
-        for path in paths:
-            candidate = Path(path)
-            if candidate.exists():
-                candidate.unlink()
-                write_log(
-                    f"Multi-dashboard: deleted shared input (per Rollup): {path}"
-                )
-    elif getattr(config, "rollup_plus_raw", False) and getattr(
-        config, "deidentify", False
-    ):
-        from .mod18_pax_deidentify import PaxDeidentifier
+    """Apply shared-input retention only after every dashboard pass succeeds.
 
-        deidentifier = PaxDeidentifier()
-        for path in paths:
-            deidentifier.deidentify_csv(path)
-            write_log(f"Multi-dashboard: deidentified retained shared input: {path}")
+    The shared raw Purview CSV always follows plain ``-Rollup``/
+    ``-RollupPlusRaw`` semantics — it is purely an internal join input once
+    every dashboard pass has consumed it.
+
+    The shared raw Entra CSV is handled differently: whenever
+    :func:`_should_publish_shared_entra` says M365 needs it (M365 is in the
+    requested dashboard set and Entra data was actually collected this run),
+    that CSV is itself the M365 dashboard's user *output* — not merely an
+    internal join input for AIO/ValueLens — so it is always retained,
+    independent of ``-Rollup``/``-RollupPlusRaw``, exactly mirroring the
+    Delta-publish decision already made for the ``Entra_Users_Raw`` table.
+    """
+    config = ctx.config
+    purview_csv = ctx.output_file or ""
+    entra_csv = getattr(ctx, "_entra_csv_path", "") or ""
+    entra_is_m365_output = bool(entra_csv) and _should_publish_shared_entra(config)
+
+    rollup_only = getattr(config, "rollup", False) and not getattr(
+        config, "rollup_plus_raw", False
+    )
+    delete_paths = []
+    if rollup_only:
+        if purview_csv:
+            delete_paths.append(purview_csv)
+        if entra_csv and not entra_is_m365_output:
+            delete_paths.append(entra_csv)
+    for path in delete_paths:
+        candidate = Path(path)
+        if candidate.exists():
+            candidate.unlink()
+            write_log(f"Multi-dashboard: deleted shared input (per Rollup): {path}")
+
+    if getattr(config, "deidentify", False):
+        retained_paths = []
+        if getattr(config, "rollup_plus_raw", False) and purview_csv:
+            retained_paths.append(purview_csv)
+        if entra_csv and (entra_is_m365_output or getattr(config, "rollup_plus_raw", False)):
+            retained_paths.append(entra_csv)
+        retained_paths = list(dict.fromkeys(retained_paths))
+        if retained_paths:
+            from .mod18_pax_deidentify import PaxDeidentifier
+
+            deidentifier = PaxDeidentifier()
+            for path in retained_paths:
+                deidentifier.deidentify_csv(path)
+                write_log(f"Multi-dashboard: deidentified retained shared input: {path}")
 
 
 def _run_multi_dashboard_rollups(
@@ -2471,11 +2525,7 @@ def run(params: Optional[dict] = None) -> dict:
                     if not getattr(config, "rollup_plus_raw", False):
                         if ctx.output_file:
                             excluded_shared_csvs.add(str(ctx.output_file))
-                        publish_m365_entra = bool(
-                            "M365" in config.requested_dashboards
-                            and getattr(config, "include_user_info", False)
-                            and getattr(config, "_include_user_info_explicit", False)
-                        )
+                        publish_m365_entra = _should_publish_shared_entra(config)
                         entra_csv = getattr(ctx, "_entra_csv_path", "") or ""
                         if entra_csv and not publish_m365_entra:
                             excluded_shared_csvs.add(str(entra_csv))
