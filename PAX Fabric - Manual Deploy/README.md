@@ -32,7 +32,7 @@ them to Delta tables in the Lakehouse.
 | ----------------------------------------------- | --------------------------------------- |
 | PowerShell **7.0+**                             | `pwsh --version`                        |
 | Azure CLI **2.55+** *(or Az PowerShell module)* | For token acquisition                   |
-| Network reach to `api.fabric.microsoft.com`     |                                         |
+| Network reach to `app.fabric.microsoft.com`     |                                         |
 
 Install Az CLI: <https://learn.microsoft.com/cli/azure/install-azure-cli>
 
