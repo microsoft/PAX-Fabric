@@ -590,6 +590,35 @@ def _run_consumes_agent365(config: PAXConfig) -> bool:
     return dash in ("AIO", "VALUELENS")
 
 
+def _should_publish_shared_entra(config: PAXConfig) -> bool:
+    """Return True when the shared raw Entra CSV must be published as
+    ``Entra_Users_Raw`` for a multi-dashboard run.
+
+    The M365 dashboard has no Users-shaped output of its own — unlike AIO /
+    ValueLens (which fold Entra data into ``AIO_Users`` / ``ValueLens_Users``),
+    M365's user data IS the shared ``Entra_Users_Raw`` table. So whenever
+    M365 is part of the requested dashboard set and Entra user data was
+    collected for this run — whether the caller explicitly passed
+    ``IncludeUserInfo=True`` or it was auto-enabled because ``Dashboard``
+    included ``M365`` — the raw Entra CSV must be retained and drained
+    instead of being treated as a purely internal join input for the
+    Copilot dashboards.
+
+    Deliberately does NOT consult ``_include_user_info_explicit``: that flag
+    only distinguishes *why* ``include_user_info`` is True, not whether Entra
+    data actually exists on disk for this run. Requiring it caused M365 runs
+    that relied on the Dashboard=M365 auto-enable (the common case) to silently
+    drop their Users table.
+    """
+    requested = [
+        str(name).upper()
+        for name in (getattr(config, "requested_dashboards", None) or [])
+    ]
+    if "M365" not in requested:
+        return False
+    return bool(getattr(config, "include_user_info", False))
+
+
 def _watermark_fact_kind(config: PAXConfig) -> str:
     """Discriminate the accumulating fact-table family for watermark state keying."""
     if getattr(config, "include_m365_usage", False):
@@ -2471,11 +2500,7 @@ def run(params: Optional[dict] = None) -> dict:
                     if not getattr(config, "rollup_plus_raw", False):
                         if ctx.output_file:
                             excluded_shared_csvs.add(str(ctx.output_file))
-                        publish_m365_entra = bool(
-                            "M365" in config.requested_dashboards
-                            and getattr(config, "include_user_info", False)
-                            and getattr(config, "_include_user_info_explicit", False)
-                        )
+                        publish_m365_entra = _should_publish_shared_entra(config)
                         entra_csv = getattr(ctx, "_entra_csv_path", "") or ""
                         if entra_csv and not publish_m365_entra:
                             excluded_shared_csvs.add(str(entra_csv))
