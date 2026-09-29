@@ -21,10 +21,11 @@ Behavior notes:
     * Same-shape CSVs from different runs land in the **same** Delta table.
       Dashboard-shaped outputs are namespaced by a short prefix
       (``AIO_`` / ``ValueLens_`` / ``M365_`` / ``AISID_``); dashboard-agnostic
-      tables (``CopilotInteractions_Raw``, ``Entra_Users_Raw``, ``Audit_Raw``,
-    ``Agent365``, ``Agent365_Status``) stay shared. Same-run appends match
-    v1.11.1 PowerShell semantics so downstream Power BI / SQL endpoint
-    consumers see a single accumulating table per logical dataset.
+      tables (``CopilotInteractions_Raw``, ``CombinedActivityTypes``,
+      ``Entra_Users_Raw``, ``Audit_Raw``, ``Agent365``, ``Agent365_Status``)
+      stay shared. Same-run appends match
+      v1.11.1 PowerShell semantics so downstream Power BI / SQL endpoint
+      consumers see a single accumulating table per logical dataset.
     * Delegates the actual Delta write to
       :func:`pax_fabric.mod16_pax_delta.write_delta_append`, which provides:
         - Column-name sanitization (Delta-forbidden chars → ``_``).
@@ -58,6 +59,7 @@ _TS_RE = r"\d{8}_\d{6}"
 # prefix even when one is resolved for the run.
 SHARED_TABLES: frozenset[str] = frozenset({
     "CopilotInteractions_Raw",
+    "CombinedActivityTypes",
     "Entra_Users_Raw",
     "Audit_Raw",
     "Agent365",
@@ -75,7 +77,7 @@ _BASE_ALIASES: dict[str, str] = {
     "CopilotInteraction_LicensedUserRankings_Rollup": "LicensedRankings",
     "CopilotInteraction_UnlicensedUserRankings_Rollup": "UnlicensedRankings",
     "CopilotInteraction_LicensedUserSummary_Rollup": "LicensedSummary",
-    "CombinedActivityTypes_Raw": "Raw",
+    "CombinedActivityTypes_Raw": "CombinedActivityTypes",
     "CombinedActivityTypes_Rollup_Rollup": "Rollup",
     "CombinedActivityTypes_UserStats_Rollup": "UserStats",
     "CombinedActivityTypes_SessionCohort_Rollup": "SessionCohort",
