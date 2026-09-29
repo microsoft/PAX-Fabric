@@ -357,7 +357,13 @@ def _get_write_strategy(table_name: str) -> str:
     """Determine the Delta write strategy based on the table name pattern.
 
     Returns one of:
-        'overwrite'           — snapshot/aggregation tables (replace entirely)
+        'overwrite'           — snapshot/aggregation tables (replace entirely).
+                                For ``*_Users`` tables specifically, this is a
+                                provisional baseline: ``write_delta_append``
+                                reclassifies it to ``'user_history_union'`` or
+                                ``'user_completeness_merge'`` once the
+                                incoming CSV's shape is known, so Users rows
+                                are always merged rather than blindly replaced.
         'delete_date_append'  — time-series tables (delete matching date range, then append)
         'append'              — unknown tables (safe fallback, blind append)
     """
@@ -560,6 +566,98 @@ def _merge_user_history(
     # when_not_matched_insert_all() schema evolution (raises "Duplicate field
     # name"). Pre-evolve the target with any new source columns via a zero-row
     # schema-merge append so the merge runs against a complete, stable schema.
+    new_columns = [column for column in source_columns if column not in target_columns]
+    if new_columns:
+        _write_arrow_table(target_uri, table.slice(0, 0), storage_options)
+        delta_table = DeltaTable(target_uri, storage_options=storage_options)
+        target_columns = [field.name for field in delta_table.schema().fields]
+    table = _align_source_to_target(table, target_columns)
+    update_columns = [
+        column
+        for column in source_columns
+        if column not in preserved_columns
+    ]
+    updates = {
+        column: _delta_value("source", column)
+        for column in update_columns
+    }
+    metrics = (
+        delta_table.merge(
+            source=table,
+            predicate=_delta_key_predicate(
+                key_columns,
+                folded_columns=key_columns,
+            ),
+            source_alias="source",
+            target_alias="target",
+            merge_schema=True,
+        )
+        .when_matched_update(updates)
+        .when_not_matched_insert_all()
+        .execute()
+    )
+    return {
+        "rows_written": table.num_rows,
+        "columns": len(table.column_names),
+        "target_uri": target_uri,
+        "merge_metrics": metrics,
+    }
+
+
+def _merge_users_completeness(
+    input_csv: str,
+    target_uri: str,
+    table_name: str,
+    *,
+    storage_options: dict | None,
+) -> dict:
+    """Union-merge a legacy-shaped ``_Users`` CSV into its Delta table by
+    ``PersonId_Normalized`` instead of blindly overwriting it.
+
+    Fixes a completeness gap versus the PowerShell ``-AppendFile`` /
+    ``-AppendUserInfo`` path: a plain ``mode='overwrite'`` replaces the whole
+    table with only this run's freshly-built CSV (fresh Entra directory rows
+    + audit-only identities detected as unmatched during *this run's own*
+    explode pass). Any identity that was stubbed into the table by an earlier
+    run (real or audit-only) but has zero activity in the current run's
+    collection window is silently dropped, orphaning older Fact rows that
+    still reference its ``UserKey``.
+
+    PowerShell never loses these because ``-AppendFile``/``-AppendUserInfo``
+    re-validates Users completeness against the *entire cumulative* fact
+    history on every append (seeding audit-only UserKeys straight from the
+    prior run's Fact CSV), not just the current run's fetch.
+
+    This merge closes that gap the same way :func:`_merge_user_history` does
+    for the temporal-history shape: existing target rows are never deleted
+    outright, so any identity previously known (including inactive-this-run
+    audit-only stubs) survives every append. ``UserKey`` is deliberately never
+    overwritten from source for an already-matched row, keeping the resolved
+    surrogate stable even if the same PersonId is minted a different (but
+    equally valid) key during a fresh Entra fetch race.
+    """
+    from deltalake import DeltaTable
+
+    table, source_columns = _read_csv_as_arrow(input_csv)
+    key_columns = ("PersonId_Normalized",)
+    preserved_columns = ("UserKey",)
+    missing = [column for column in key_columns if column not in source_columns]
+    if missing:
+        raise ValueError(
+            f"Delta users-completeness merge for '{table_name}' is missing "
+            "key column(s): " + ", ".join(missing)
+        )
+
+    try:
+        delta_table = DeltaTable(target_uri, storage_options=storage_options)
+    except Exception:
+        return _write_arrow_table(target_uri, table, storage_options)
+
+    target_columns = [field.name for field in delta_table.schema().fields]
+    # Pre-evolve the target with any brand-new source columns via a zero-row
+    # schema-merge append — deltalake's MERGE cannot add a new column during
+    # when_not_matched_insert_all() schema evolution (raises "Duplicate field
+    # name"). Mirrors _merge_user_history's handling.
     new_columns = [column for column in source_columns if column not in target_columns]
     if new_columns:
         _write_arrow_table(target_uri, table.slice(0, 0), storage_options)
@@ -1395,8 +1493,13 @@ def write_delta_append(
     """Append CSV to Delta table, creating if needed. Rejects destructive schema drift.
 
     Write strategy is determined by the table name pattern:
-      - Snapshot/aggregation tables (Entra, UserStats, SessionCohort):
+      - ``Entra_*`` / snapshot-aggregation tables (UserStats, SessionCohort):
         Overwrite the entire table on each run.
+      - ``*_Users`` tables: union-merged by ``PersonId_Normalized`` (or, in
+        UserHistory mode, by the temporal key) so an identity stubbed in by
+        an earlier run — real or audit-only — is never dropped just because
+        it has no activity in the current run's collection window. See
+        :func:`_merge_users_completeness` / :func:`_merge_user_history`.
       - Time-series tables (Raw, Rollup):
         Delete existing rows matching the source CSV's CreationDate range,
         then append. This makes re-runs idempotent without scanning the
@@ -1511,6 +1614,13 @@ def write_delta_append(
                     )
             if source_shape == "history":
                 strategy = "user_history_union"
+            else:
+                # Legacy/empty (non-temporal) Users shape: union-merge by
+                # PersonId_Normalized instead of a blind table replace, so an
+                # identity stubbed in by an earlier run (real or audit-only)
+                # that has no activity in *this* run's collection window is
+                # never silently dropped. See _merge_users_completeness.
+                strategy = "user_completeness_merge"
         except Exception as shape_exc:
             error = (
                 f"[USER_HISTORY_SHAPE_MISMATCH] UserHistory shape mismatch for "
@@ -1532,7 +1642,8 @@ def write_delta_append(
             }
 
     if strategy not in {
-        "overwrite", "user_history_union", "delete_date_append", "append",
+        "overwrite", "user_history_union", "user_completeness_merge",
+        "delete_date_append", "append",
     }:
         raise ValueError(f"Unsupported Delta write strategy: {strategy!r}")
 
@@ -1659,6 +1770,10 @@ def write_delta_append(
         """
         if strategy == "user_history_union":
             return _merge_user_history(
+                input_csv, target_uri, table_name, storage_options=opts,
+            )
+        if strategy == "user_completeness_merge":
+            return _merge_users_completeness(
                 input_csv, target_uri, table_name, storage_options=opts,
             )
         if is_init:
