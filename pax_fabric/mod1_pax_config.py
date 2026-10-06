@@ -379,6 +379,7 @@ class PAXConfig:
     # "collected as a side-effect" for callers that need to tell the two apart
     # (e.g. multi-dashboard Entra publication).
     _include_user_info_explicit: bool = False
+    _filler_label_explicit: bool = False
 
     # --- ExcludeCopilotInteraction/IncludeCopilotInteraction conflict flag ---
     # Set by initialize_config() (via _detect_copilot_exclude_conflict) BEFORE
@@ -390,6 +391,7 @@ class PAXConfig:
         """Auto-detect whether dates were explicitly set at construction time."""
         self._start_date_explicit = self.start_date is not None
         self._end_date_explicit = self.end_date is not None
+        self._filler_label_explicit = self.filler_label is not None
 
 
 # ===========================================================================
@@ -995,6 +997,7 @@ def validate_config(config: PAXConfig) -> list[str]:
     # stores the canonical mode, per PS L25544/L34094) passes re-validation.
     filler = getattr(config, "filler_label", None)
     filler_text = getattr(config, "filler_label_text", None)
+    filler_explicit = bool(getattr(config, "_filler_label_explicit", False))
     _filler_accepted = {
         "null", "blank", "none",          # -> mode 'none'
         "self",                            # -> mode 'self'
@@ -1003,30 +1006,33 @@ def validate_config(config: PAXConfig) -> list[str]:
     }
     if filler:
         fl_lc = str(filler).lower().strip()
+        filler_mode = canonical_filler_mode(filler)
         if fl_lc not in _filler_accepted:
             errors.append(
                 "FillerLabel must be one of: null, Blank, Self, RepeatManager, "
                 "or Fixed (with FillerLabelText '<text>')."
             )
-        # PS L8227-8231: -FillerLabel requires -Rollup or -RollupPlusRaw.
-        if not (getattr(config, "rollup", False) or getattr(config, "rollup_plus_raw", False)):
-            errors.append(
-                "FillerLabel requires Rollup or RollupPlusRaw — it only affects "
-                "the rolled-up AI-in-One / ValueLens Users output."
-            )
-        # PS L8232-8235: -FillerLabel is not valid with the M365 dashboard.
-        _dash_uc = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
-        if getattr(config, "include_m365_usage", False) or _dash_uc == "M365":
-            errors.append(
-                "FillerLabel is not valid with the M365 dashboard "
-                "(IncludeM365Usage or Dashboard='M365'). The org / manager "
-                "hierarchy is produced only for the AI-in-One and ValueLens dashboards."
-            )
+        filler_requested = filler_explicit or filler_mode != "none"
+        if filler_requested:
+            # PS L8227-8231: -FillerLabel requires -Rollup or -RollupPlusRaw.
+            if not (getattr(config, "rollup", False) or getattr(config, "rollup_plus_raw", False)):
+                errors.append(
+                    "FillerLabel requires Rollup or RollupPlusRaw — it only affects "
+                    "the rolled-up AI-in-One / ValueLens Users output."
+                )
+            # PS L8232-8235: -FillerLabel is not valid with the M365 dashboard.
+            _dash_uc = str(getattr(config, "dashboard", "AIO") or "AIO").upper()
+            if getattr(config, "include_m365_usage", False) or _dash_uc == "M365":
+                errors.append(
+                    "FillerLabel is not valid with the M365 dashboard "
+                    "(IncludeM365Usage or Dashboard='M365'). The org / manager "
+                    "hierarchy is produced only for the AI-in-One and ValueLens dashboards."
+                )
         # PS L8249-8253: Fixed requires non-empty FillerLabelText.
-        if fl_lc == "fixed" and not str(filler_text or "").strip():
+        if filler_mode == "fixed" and not str(filler_text or "").strip():
             errors.append("FillerLabelText is required when FillerLabel is 'Fixed'.")
         # PS L8256-8258: FillerLabelText is only valid with Fixed.
-        if fl_lc != "fixed" and str(filler_text or "").strip():
+        if filler_mode != "fixed" and str(filler_text or "").strip():
             errors.append(
                 f"FillerLabelText is only valid with FillerLabel='Fixed' "
                 f"(not with '{filler}')."
@@ -2422,6 +2428,10 @@ def config_from_params(params: dict) -> "PAXConfig":
             if isinstance(v, (list, tuple)):
                 setattr(cfg, dst, ",".join(str(item) for item in v))
                 continue
+        if dst == "filler_label":
+            if not str(v).strip():
+                continue
+            cfg._filler_label_explicit = True
         setattr(cfg, dst, str(v))
 
     for src, dst, caster in (

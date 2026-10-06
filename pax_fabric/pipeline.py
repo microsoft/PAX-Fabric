@@ -1967,6 +1967,7 @@ def run(params: Optional[dict] = None) -> dict:
                 _cp_filler = cp_params.get("fillerLabelMode") or cp_params.get("fillerLabel")
                 if _cp_filler:
                     config.filler_label = str(_cp_filler)
+                    config._filler_label_explicit = False
                 if cp_params.get("fillerLabelText"):
                     config.filler_label_text = str(cp_params["fillerLabelText"])
                 if cp_params.get("deidentify"):
