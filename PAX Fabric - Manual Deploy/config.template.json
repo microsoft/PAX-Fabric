@@ -29,6 +29,6 @@
     "KeepScratch":    false,
     "MaxConcurrency": 10,
     "PartitionHours": 12,
-    "RetentionDays":  90
+    "RetentionDays":  0
   }
 }

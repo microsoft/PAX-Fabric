@@ -11,6 +11,6 @@
     { "name": "KeepScratch",    "type": "Boolean", "value": false },
     { "name": "MaxConcurrency", "type": "Integer", "value": 10 },
     { "name": "PartitionHours", "type": "Integer", "value": 12 },
-    { "name": "RetentionDays",  "type": "Integer", "value": 90 }
+    { "name": "RetentionDays",  "type": "Integer", "value": 0 }
   ]
 }

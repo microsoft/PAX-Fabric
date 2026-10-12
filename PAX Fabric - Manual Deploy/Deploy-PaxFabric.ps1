@@ -343,7 +343,7 @@ $pl = Get-FabricItem -Type 'DataPipeline' -Name $cfg.PipelineName
 if ($pl) {
     Write-Host "  Exists - reusing id=$($pl.id)"
     Write-Host "  NOTE: Existing pipeline definitions are not updated by this script." -ForegroundColor Yellow
-    Write-Host "        Ensure the pipeline has a string Dashboard parameter (default empty)" -ForegroundColor Yellow
+    Write-Host "        Ensure the pipeline has a string Dashboard parameter (default AIO)" -ForegroundColor Yellow
     Write-Host "        forwarded to the notebook as @pipeline().parameters.Dashboard." -ForegroundColor Yellow
 } else {
     $pipelineTemplate = Get-Content (Join-Path $ArtifactsPath 'pipeline-content.json') -Raw
