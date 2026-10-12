@@ -51,17 +51,24 @@ Create it once in **Entra ID → App registrations → New registration**, then:
 
 1. **API permissions → Add → Microsoft Graph → Application permissions**:
    - `AuditLogsQuery.Read.All`
-   - `AuditLogsQuery-Exchange.Read.All`
-   - `AuditLogsQuery-OneDrive.Read.All`
-   - `AuditLogsQuery-SharePoint.Read.All`
    - `User.Read.All`
    - `Organization.Read.All`
    - `GroupMember.Read.All`
    - `CopilotPackages.Read.All`
-   - `Reports.Read.All`
-2. **Grant admin consent** for all nine permissions.
+2. **Grant admin consent** for all five permissions.
 3. **Certificates & secrets → New client secret** — copy the *value* (you will paste it into Key Vault).
 4. Record **Tenant ID** and **Application (client) ID**.
+
+`AuditLogsQuery.Read.All` is the umbrella permission used by this pipeline.
+Replace it only for a deployment restricted to these workloads:
+
+- `AuditLogsQuery-Exchange.Read.All` — add only when querying Exchange audit records.
+- `AuditLogsQuery-OneDrive.Read.All` — add only when querying OneDrive audit records.
+- `AuditLogsQuery-SharePoint.Read.All` — add only when querying SharePoint audit records.
+
+These restricted permissions do not cover Copilot or Teams. See the
+[Microsoft Graph permissions reference](https://learn.microsoft.com/graph/permissions-reference#auditlogsqueryreadall)
+for the permission descriptions.
 
 ### 1.4 Azure Key Vault
 
