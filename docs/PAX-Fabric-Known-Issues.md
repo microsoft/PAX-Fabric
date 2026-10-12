@@ -9,12 +9,12 @@ This is a short list of known defects in the current release of PAX Fabric. They
 
 ## X5 — Security Copilot activity
 
-- **What happens:** `pax_fabric` has no Security Copilot handling, so Security Copilot records are processed like other Copilot Chat records.
+- **What happens:** `pax_fabric` has no Security Copilot handling, so Security Copilot records are processed like other Copilot Chat records.The PowerShell tool at v1.11.16 (the version Fabric matches) behaves the same way: its Copilot data includes Security Copilot and its environment logic has no Security Copilot case.
 - **Fix needed:** port the Security Copilot trimming from PAX v2.0.0 to the Fabric processors, then re-validate against the same input.
 
 ## X6 — Agent 365 `Description` and `Created in`
 
-- **What happens:** in `mod12_pax_agent365.py`, `Description` is read from a field named `description`, and `Created in` is read from `source`, `origin` or `createdIn`. The Agent 365 catalog returns `shortDescription` / `longDescription` and `platform` instead, so both columns stay blank.
+- **What happens:** in `mod12_pax_agent365.py`, `Description` is read from a field named `description`, and `Created in` is read from `source`, `origin` or `createdIn`. The Agent 365 catalog returns `shortDescription` / `longDescription` and `platform` instead, so both columns stay blank.The PowerShell tool at v1.11.16 uses the same mapping. The Agent 365 catalog returns shortDescription / longDescription and platform instead, so both columns stay blank.
 - **Fix needed:** port the Agent 365 changes from PAX v2.0.0 prerelease 09 and 10 to `mod12_pax_agent365.py`. The Agent 365 lookups need `Application.Read.All`, which the Setup Guide already lists.
 
 No code change is planned on the MAQ side for either item.
