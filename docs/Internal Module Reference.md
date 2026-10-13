@@ -452,3 +452,11 @@ These pre-computed outputs allow Power Query to join results directly rather tha
 | **No circular imports** | Modules receive a `PAXRunContext` instead of importing one another. Cross-module callbacks (for example a `profile_fn` from `mod4` injected into `mod9`) are wired at startup. |
 | **Local-development fallback** | `files_io` falls back to `./out/` and `tables_root_abfss` returns `None` outside Fabric, so that the package can be unit-tested offline against local Delta tables. |
 | **Streaming everywhere** | Scratch tabular writes are line-by-line, Delta writes go through `pyarrow.RecordBatch`, retention reads go through `to_pyarrow_dataset`, and the recompute helper streams a Rollup Delta back through the M365 processor. No multi-million-row file is ever materialized in memory on the hot path. |
+
+---
+
+PAX Fabric provides a modular, scalable, and supportable end-to-end processing solution for Microsoft Fabric, covering configuration, collection, transformation, storage, and reporting.
+
+This reference explains how the components work together and complements deployment, configuration, and operational documentation.
+
+It will be updated as the solution evolves, reflecting key changes to module responsibilities, processing behavior, and supported capabilities.
