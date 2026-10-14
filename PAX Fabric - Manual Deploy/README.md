@@ -13,14 +13,14 @@ The deployment provisions four Fabric items:
 
 | Item              | Purpose                                                            |
 | ----------------- | ------------------------------------------------------------------ |
-| Lakehouse         | Stores Delta tables (`CopilotInteraction_*`, `Entra_Users`, etc.)  |
-| Variable Library  | Holds tenant / auth / date / behavior configuration                |
+| Lakehouse         | Stores Delta tables (`AIO_CopilotInteractions`, `AIO_Users`, etc.) |
+| Variable Library  | Holds tenant, authentication, and runtime configuration             |
 | Notebook          | Runs the `pax_fabric` Python package (cloned from GitHub at run)   |
 | Data Pipeline     | Wraps the Notebook so you can schedule daily runs                  |
 
-The pipeline pulls **Microsoft Graph Security Audit Log**, **M365 Usage Reports**,
-and optional **Microsoft Agent 365** catalog data, normalises them, and writes
-them to Delta tables in the Lakehouse.
+The pipeline pulls **Microsoft Graph Security Audit Log** and optional
+**Microsoft Agent 365** catalog data, normalises them, and writes them to Delta
+tables in the Lakehouse. The M365 dashboard is built from audit-log data.
 
 ---
 
@@ -78,25 +78,24 @@ Vault. You will need:
 1. A Key Vault (existing or new) in the same tenant.
 2. A **secret** in that vault (e.g. `PAXClientSecret`) whose value is the client
    secret from step 1.3 (3).
-3. **RBAC role assignment on the vault**: `Key Vault Secrets User` → the
-   **user running this deployment** (so the deployment/verification steps and
-   the `az keyvault secret ...` commands in Section 4.3 can read the secret). The
-   App Registration itself does **not** need any Key Vault RBAC role — the
-   pipeline reaches the vault via the Fabric workspace over the Managed
-   Private Endpoint.
+3. **RBAC role assignment on the vault**: `Key Vault Secrets User` → every
+   **identity that runs the pipeline**. This includes the user who starts a
+   manual run and the owner of any pipeline schedule. The App Registration
+   itself does **not** need a Key Vault role.
 4. **Network access from Fabric to the vault** — a **Managed Private Endpoint
    (MPE)** created in the Fabric workspace that targets the Key Vault. Fabric
    raises a private endpoint connection request against the vault; the Key
    Vault administrator must **Approve** it before Fabric can reach the vault
    (see Section 4.2). Public network access on the vault can remain disabled.
 
-### 1.5 GitHub repo hosting the `pax_fabric` Python package
+### 1.5 GitHub source for the `pax_fabric` Python package
 
-The notebook `pip install`s the pipeline code from your repo at runtime. You need:
+The notebook clones the public
+[`microsoft/PAX-Fabric`](https://github.com/microsoft/PAX-Fabric) repository at
+runtime. Use these values for this deployment package:
 
-- Repo URL (`https://github.com/<org>/<repo>.git`) — public, or reachable from the
-  Fabric Spark environment.
-- Ref — use `main` for the latest code, or pin to a specific commit hash (e.g. `a1b2c3d4e5f6...`) for a reproducible production build.
+- Repo URL: `https://github.com/microsoft/PAX-Fabric.git`
+- Ref: `8b99d4936302f319d27b2fdc5b794b8cd692fe10`
 
 ---
 
@@ -137,10 +136,10 @@ Populate every `<...>` placeholder. Minimum required:
 | `AppRegistration.ClientId`       | The App Registration client ID from Section 1.3                |
 | `KeyVault.KeyVaultUri`           | `https://contoso-kv.vault.azure.net/`                          |
 | `KeyVault.KeyVaultSecret`        | `PAXClientSecret`                                              |
-| `GitHub.GitHubRepoUrl`           | `https://github.com/contoso/pax-fabric.git`                    |
-| `GitHub.GitHubRef`               | `main` or a commit hash (e.g. `a1b2c3d4e5f6...`)               |
-| `Defaults.StartDate` / `EndDate` | `2026-07-01` / `2026-07-04` (initial backfill window)          |
+| `GitHub.GitHubRepoUrl`           | `https://github.com/microsoft/PAX-Fabric.git`                  |
+| `GitHub.GitHubRef`               | `8b99d4936302f319d27b2fdc5b794b8cd692fe10`                    |
 | `Defaults.MaxConcurrency`        | Default `10`. Reduce (e.g. `2`–`5`) when pulling large windows or if you see Graph `HTTP 429` throttling in the run log. |
+| `Defaults.RetentionDays`         | Default `0` (retention-based deletion is disabled).            |
 
 ### Step 2 — Run the deployment
 
@@ -231,7 +230,11 @@ Do this in the Azure portal:
 4. **Secret value**: paste the client secret value copied from the App Registration in Section 1.3 (3).
 5. Leave content type / expiration as required by your organisation → **Create**.
 
-The user performing this step needs `Key Vault Secrets Officer` (write) on the vault. The pipeline itself reads the secret via the Fabric Managed Private Endpoint approved in Section 4.1 — the App Registration does not need any Key Vault role.
+The user performing this step needs `Key Vault Secrets Officer` (write) on the
+vault. Every identity that runs the pipeline needs `Key Vault Secrets User`
+(read), including the owner of a pipeline schedule. The pipeline reaches the
+vault through the Fabric Managed Private Endpoint approved in Section 4.1. The
+App Registration does not need a Key Vault role.
 
 ### 4.3 First pipeline run (interactive)
 
@@ -254,7 +257,9 @@ This is the same code path a scheduled run will take.
     - `[SQLITE] State summary users=... threads=... messages=... rollupRows=...`
        followed by `[SQLITE] Removed driver-local state ...`.
 5. Verify Delta tables in the Lakehouse Explorer, e.g.
-   `CopilotInteraction_Interactions_Rollup`, `Entra_Users`.
+   `AIO_CopilotInteractions`, `AIO_Users`, and the shared
+   `CopilotInteractions_Raw` table. A different dashboard selection uses its
+   corresponding table prefix.
 
 Copilot surrogate maps, fact rollup state, and ValueLens distinct aggregates
 use a temporary SQLite database on the notebook driver. The database is rebuilt
@@ -273,9 +278,10 @@ Once Section 4.3 succeeds, put the pipeline on a recurring schedule:
 2. **Schedule** → **On** → set frequency (typically daily, 02:00 local).
 3. **Save**.
 
-The pipeline calls the notebook with parameters from `<VarLibName>`. Change
-date ranges by editing **`<VarLibName>` → StartDate / EndDate** in the Fabric
-UI and saving — no redeploy required.
+The pipeline calls the notebook with its `StartDate` and `EndDate` parameters.
+To change the date range, open `<PipelineName>` in the Fabric UI, edit those
+values under **Parameters** at the pipeline canvas level, and save. The next
+run uses the saved values.
 
 ### 4.5 v1.11.16 optional features (all default-off)
 
@@ -340,10 +346,10 @@ six automatically.
 | `Failed to acquire Fabric access token`                              | The in-script `az login` was cancelled, or the signed-in account has no access to the tenant in `config.json`. Re-run and pick the correct account in the browser prompt. |
 | `Cannot read workspace ...`                                          | You are not Workspace Admin on that workspace. Add your account under **Workspace → Manage access**.                   |
 | `Failed to create Lakehouse: ... 401`                                | Capacity is not an F-SKU, or the workspace has no capacity assigned. Only F-SKU capacities are supported.              |
-| Pipeline job: `KV secret retrieved: False`                           | The Managed Private Endpoint has not been approved on the vault, or the secret name in `<VarLibName>` doesn't match the one in Key Vault. See Section 4.1, Section 4.2. |
-| Pipeline job: hundreds of `HTTP 429` in log, run > 2× expected time  | Graph audit-log endpoint throttling. Reduce `MaxConcurrency` (default `10`) on the pipeline — try `5`, then `2` for very large backfills.                    |
+| Pipeline job: `KV secret retrieved: False`                           | The run identity lacks `Key Vault Secrets User`, the Managed Private Endpoint has not been approved, or the secret name in `<VarLibName>` does not match the one in Key Vault. For a scheduled run, check the schedule owner's vault access. See Section 4.1 and Section 4.2. |
+| Pipeline job: hundreds of `HTTP 429` in log, run > 2× expected time  | Graph audit-log endpoint throttling. Reduce `MaxConcurrency` (default `10`) in `<VarLibName>` — try `5`, then `2` for very large backfills.                    |
 | Pipeline job: `Graph API probe: v1.0 -> 404`                         | Expected. The pipeline probes v1.0 first and automatically falls back to the `/beta` endpoint. Non-fatal.                                                    |
-| Notebook cell fails with `pip: could not resolve host github.com`    | Your Fabric capacity is in a private network with no internet egress. Fork the repo into an internal-reachable mirror. |
+| Notebook clone fails with `Could not resolve host: github.com`      | Your Fabric capacity is in a private network with no internet egress. Mirror `microsoft/PAX-Fabric` at an internally reachable Git endpoint and pin the approved commit there. |
 | `Variable Library` values wrong                                      | Edit them in the Fabric UI. The deployment script only *initialises* them at create time.                              |
 | `[SQLITE]` followed by `unable to open database file`                | The notebook driver cannot create local temporary files. Restart the session and confirm Python `tempfile` points to a writable local path. Do not redirect the SQLite file to OneLake or ABFS. |
 | `[SQLITE]` followed by `database or disk is full`                    | Driver-local scratch space was exhausted. Reduce the processing window or use a larger Fabric Spark resource profile; the log's `freeMiB` value shows space available when processing started. |
@@ -375,16 +381,12 @@ or change the pipeline's default values via **Parameters** at the pipeline
 canvas level) for run-tunable knobs:
 
 - `StartDate` / `EndDate` — audit-log backfill window (leave empty to use
-  the rolling default from the Variable Library).
+  the built-in rolling date defaults).
 - `Rollup`, `IncludeM365Usage`, `IncludeUserInfo`, `OnlyUserInfo`,
-  `IncludeAgent365Info`, `OnlyAgent365Info`, `KeepScratch` — feature toggles.
+  `IncludeAgent365Info`, `OnlyAgent365Info` — feature toggles.
 - `GroupNames` — comma-separated Entra group display names used to scope the
   run (for example, `Finance Copilot Users,Legal Copilot Users`). Leave empty
   for no group filter.
-- `TargetSchema` — Lakehouse schema to write into (default `dbo`).
-- `RetentionDays` — how long processed data is kept.
-- `MaxConcurrency` — default `10`. Reduce when pulling large audit-log
-  windows or if the run log shows Graph `HTTP 429` throttling.
 - **v1.11.16 optional knobs (all default-off):** `Watermark`,
   `PurviewInputFile`, `UserHistory`, `HistoryEffectiveDate`,
   `EmitMetricsJson`, `MetricsPath`. See Section 4.5 for what each one does
@@ -407,15 +409,21 @@ empty), then add matching Base parameters to the `RunPaxNotebook` activity.
 Fresh deployments include all three automatically.
 
 **Edit the Variable Library** (Fabric portal → workspace → open
-`<VarLibName>` → active value set → edit → **Save**) for values the
-pipeline does *not* forward:
+`<VarLibName>` → active value set → edit → **Save**) for deployment-wide
+values:
 
-- `KeyVault.KeyVaultUri` and `KeyVault.KeyVaultSecret` — if you rotate the
-  vault or rename the secret (see Section 4.2).
-- `AppRegistration.TenantId` / `AppRegistration.ClientId` — if the app
-  registration changes.
-- `GitHub.GitHubRef` — bump to a new commit/tag to roll the pipeline code
-  forward on the next run.
+- `TargetSchema` — Lakehouse schema to write into (default `dbo`).
+- `RetentionDays` — how long processed data is kept; `0` disables
+  retention-based deletion.
+- `KeepScratch` — whether to retain intermediate scratch files.
+- `MaxConcurrency` — default `10`. Reduce when pulling large audit-log
+  windows or if the run log shows Graph `HTTP 429` throttling.
+- `KeyVaultUri` and `KeyVaultSecret` — if you rotate the vault or rename the
+  secret (see Section 4.2).
+- `TenantId` / `ClientId` — if the App Registration changes.
+- `GitHubRepoUrl` / `GitHubRef` — keep the repository set to
+  `https://github.com/microsoft/PAX-Fabric.git` and pin `GitHubRef` to the
+  approved commit.
 
 > **No redeploy is required** for either path. The deployment script only
 > *initialises* the pipeline defaults and Variable Library values at create
@@ -429,8 +437,8 @@ The script does not include a `-Uninstall` switch on purpose (destructive
 operations should be explicit). To remove everything:
 
 1. Fabric portal → workspace → for each of the four items → **`...`** → **Delete**.
-2. Remove the `Key Vault Secrets User` role assignment on the vault
-   (deployment user).
+2. Remove the `Key Vault Secrets User` role assignments on the vault for the
+   manual-run identities and schedule owner that no longer need access.
 3. Fabric portal → workspace → **Workspace settings → Outbound networking →
    Managed private endpoints** — select the MPE targeting the Key Vault and
    click **Delete**. Optionally remove the (now orphaned) private endpoint
