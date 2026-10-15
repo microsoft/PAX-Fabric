@@ -19,6 +19,9 @@ Each dict in the returned list is one written table::
 
 Behavior notes:
     * Same-shape CSVs from different runs land in the **same** Delta table.
+      The pipeline canonicalizes Copilot-only raw runs to
+      ``CopilotInteractions_Raw`` even when their non-combined scratch file
+      uses the generic ``Purview_Audit_<timestamp>.csv`` name.
       Dashboard-shaped outputs are namespaced by a short prefix
       (``AIO_`` / ``ValueLens_`` / ``M365_`` / ``AISID_``); dashboard-agnostic
       tables (``CopilotInteractions_Raw``, ``CombinedActivityTypes``,

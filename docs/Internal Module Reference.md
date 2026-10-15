@@ -140,8 +140,8 @@ Glue layer that walks a finished scratch directory and appends each file to its 
 
 Public surface: `csv_dir_to_delta(csv_dir, schema, run_id, write_mode, name_overrides, dashboard_prefix) -> list[dict]`.
 
-- Maps each scratch file stem to a stable Delta table name via `table_name_for`; for example, every `Purview_Audit_UsageActivity_CopilotInteraction_*.csv` is appended to the shared `CopilotInteractions_Raw` table.
-- **Dashboard namespacing.** Dashboard-shaped tables take a short prefix (`AIO_` / `ValueLens_` / `M365_`) so Copilot outputs from different dashboards do not collide. Shared tables (`CopilotInteractions_Raw`, `CombinedActivityTypes`, `Entra_Users_Raw`, `Audit_Raw`, `Agent365`, `Agent365_Status`) are never prefixed.
+- Maps each scratch file stem to a stable Delta table name via `table_name_for`; for example, every `Purview_Audit_UsageActivity_CopilotInteraction_*.csv` is appended to the shared `CopilotInteractions_Raw` table. The pipeline also overrides the generic `Purview_Audit_<timestamp>.csv` mapping for Copilot-only runs so raw-only and `RollupPlusRaw` runs append to that same table.
+- **Dashboard namespacing.** Dashboard-shaped tables take a short prefix (`AIO_` / `ValueLens_` / `M365_`) so Copilot outputs from different dashboards do not collide. Shared tables (`CopilotInteractions_Raw`, `CombinedActivityTypes`, `Entra_Users_Raw`, `Agent365`, `Agent365_Status`) are never prefixed.
 - Delegates the write to `mod16_pax_delta.write_delta_append`, which performs column-name sanitization, additive schema evolution (`schema_mode='merge'`), and removal of columns missing from the incoming data (`AUTO_DROP`).
 - Provenance columns (`Date_Added`, `Latest_Append_Date`, `In_Latest_Append`) flow through unchanged from the upstream merge phase.
 

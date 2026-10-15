@@ -1461,7 +1461,7 @@ def run(params: Optional[dict] = None) -> dict:
             f"got {target_schema!r}"
         )
     keep_scratch = bool(params.get("KeepScratch", False))
-    name_overrides = params.get("TableNameOverrides") or {}
+    name_overrides = dict(params.get("TableNameOverrides") or {})
     # None here = auto-resolve later from the validated config so the caller
     # can force "" to opt out of prefixing entirely.
     prefix_override = params.get("TableNamePrefix")
@@ -2489,6 +2489,17 @@ def run(params: Optional[dict] = None) -> dict:
         if output_mode == "delta":
             from . import delta_writer
             set_progress_phase("Export", status="Delta drain")
+            if (
+                list(getattr(config, "activity_types", None) or [])
+                == ["CopilotInteraction"]
+                and ctx.output_file
+            ):
+                # Keep one cumulative raw Copilot table whether or not
+                # CombinedOutput/RollupPlusRaw shaped the scratch filename.
+                name_overrides.setdefault(
+                    Path(ctx.output_file).stem,
+                    "CopilotInteractions_Raw",
+                )
             drain_prefix = (
                 str(prefix_override) if prefix_override is not None
                 else _resolve_dashboard_prefix(config)
