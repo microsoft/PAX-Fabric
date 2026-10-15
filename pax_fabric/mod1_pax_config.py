@@ -264,6 +264,23 @@ class PAXConfig:
     # attempts per partition with reduced concurrency on retry passes).
     partition_max_attempts: int = 5
     partition_retry_max_concurrency: int = 3
+    # Stall / failure driven window splitting. A Graph audit query that stays
+    # in `running` for too long, or ends `failed`, is abandoned and its window
+    # is split in half (down to min_split_window_minutes) instead of the same
+    # window being resubmitted. Only leaf windows that still fail go to the
+    # end-of-run retry sweep, and the run then fails as a whole (no partial
+    # export). min_split_window_minutes=0 restores the legacy behaviour.
+    min_split_window_minutes: int = 45
+    # Wait before giving up on a query = per_hour * window hours (30 => half the
+    # window length), never less than query_stall_min_minutes. 0 disables the
+    # stall limit (poll `failed` still splits).
+    query_stall_minutes_per_hour: float = 30.0
+    query_stall_min_minutes: float = 30.0
+    # Hard cap on extra queries created by splitting in one run (tenant limits:
+    # >=200 submissions/day, >=50 queued or running queries).
+    max_split_submissions: int = 80
+    # Runaway guard for record-cap subdivision lineage (PS $MaxSubdivisionLevel).
+    max_subdivision_level: int = 20
     # HTTP 429 / Retry-After throttle handling (v1.11.3+).
     # On a Graph throttle response, sleep at least throttle_min_wait_seconds
     # (or whatever Retry-After tells us, whichever is larger), capped at
@@ -1080,6 +1097,18 @@ def validate_config(config: PAXConfig) -> list[str]:
     # BlockHours must be positive
     if config.block_hours <= 0:
         errors.append("BlockHours must be positive.")
+
+    # Window-splitting knobs (negative values are never meaningful; 0 disables).
+    if int(getattr(config, "min_split_window_minutes", 0) or 0) < 0:
+        errors.append("MinSplitWindowMinutes must be >= 0 (0 disables window splitting).")
+    if float(getattr(config, "query_stall_minutes_per_hour", 0) or 0) < 0:
+        errors.append("QueryStallMinutesPerHour must be >= 0 (0 disables the stall limit).")
+    if float(getattr(config, "query_stall_min_minutes", 0) or 0) < 0:
+        errors.append("QueryStallMinMinutes must be >= 0.")
+    if int(getattr(config, "max_split_submissions", 0) or 0) < 0:
+        errors.append("MaxSplitSubmissions must be >= 0.")
+    if int(getattr(config, "max_subdivision_level", 1) or 0) < 1:
+        errors.append("MaxSubdivisionLevel must be >= 1.")
 
     # ExcludeAgents vs AgentId/AgentsOnly mutual exclusion
     if config.exclude_agents and (config.agent_id or config.agents_only):
@@ -2377,6 +2406,11 @@ def config_from_params(params: dict) -> "PAXConfig":
         ("maxnetworkoutageminutes", "max_network_outage_minutes", int),
         ("partitionmaxattempts", "partition_max_attempts", int),
         ("partitionretrymaxconcurrency", "partition_retry_max_concurrency", int),
+        ("minsplitwindowminutes", "min_split_window_minutes", int),
+        ("querystallminutesperhour", "query_stall_minutes_per_hour", float),
+        ("querystallminminutes", "query_stall_min_minutes", float),
+        ("maxsplitsubmissions", "max_split_submissions", int),
+        ("maxsubdivisionlevel", "max_subdivision_level", int),
         ("throttleminwaitseconds", "throttle_min_wait_seconds", float),
         ("throttlemaxwaitseconds", "throttle_max_wait_seconds", float),
     )

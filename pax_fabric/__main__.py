@@ -82,6 +82,14 @@ from .mod6_pax_checkpoint import (
     get_uncertain_partitions,
     mark_partition_uncertain,
     resolve_operator_cleared_uncertain,
+    ledger_completed_indices,
+    ledger_get,
+    ledger_has_progress,
+    ledger_max_index,
+    ledger_register_roots,
+    ledger_set_state,
+    ledger_split,
+    ledger_unfinished_leaves,
 )
 from .mod7_pax_graph_api import (
     GraphAuthExpiredError,
@@ -90,6 +98,7 @@ from .mod7_pax_graph_api import (
     detect_graph_audit_api_version,
     invoke_graph_audit_query,
     get_graph_audit_query_status,
+    delete_graph_audit_query,
     get_graph_audit_records,
     convert_from_graph_audit_record,
     get_current_headers,
@@ -117,6 +126,14 @@ from .mod11_pax_query_orchestrator import (
     invoke_partition_graph_processing,
 )
 from .mod12_pax_agent365 import invoke_agent365_phase
+from .mod19_pax_window_split import (
+    PartitionTreeFailed,
+    WindowSplitRequested,
+    from_iso,
+    resolve_resume_partition_hours,
+    split_window,
+    stall_limit_minutes,
+)
 from .mod13_pax_dual_mode import (
     _is_transient,
     disconnect_purview_audit,
@@ -1755,6 +1772,46 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     # block to record the final loss without re-deriving context.
     _partition_failure_context: dict[int, dict] = {}
 
+    # ------------------------------------------------------------------
+    # Stall / failure driven window splitting (shared run state)
+    # ------------------------------------------------------------------
+    # _node_split_ok[p_idx] is set by the window-tree runner right before it
+    # runs a window; the poll loop reads it to decide between "abandon the
+    # query and request a split" and the legacy "fail the partition" path.
+    _split_lock = threading.Lock()
+    _split_budget_used = [0]
+    _node_split_ok: dict[int, bool] = {}
+    _idx_lock = threading.Lock()
+    _idx_next = [0]
+
+    def _split_min_minutes() -> int:
+        return int(getattr(ctx.config, 'min_split_window_minutes', 0) or 0)
+
+    def _split_enabled() -> bool:
+        return _split_min_minutes() > 0 and not getattr(ctx.config, 'use_eom', False)
+
+    def _can_split_window(w_start, w_end) -> bool:
+        """True when the window is big enough to halve AND split budget remains."""
+        if split_window(w_start, w_end, _split_min_minutes()) is None:
+            return False
+        limit = int(getattr(ctx.config, 'max_split_submissions', 0) or 0)
+        with _split_lock:
+            return _split_budget_used[0] + 2 <= limit
+
+    def _reserve_split_budget(n: int) -> bool:
+        limit = int(getattr(ctx.config, 'max_split_submissions', 0) or 0)
+        with _split_lock:
+            if _split_budget_used[0] + n > limit:
+                return False
+            _split_budget_used[0] += n
+            return True
+
+    def _alloc_idx() -> int:
+        """Single source of fresh partition indices (splits and cap subdivisions)."""
+        with _idx_lock:
+            _idx_next[0] += 1
+            return _idx_next[0]
+
     class PartitionRetryableError(Exception):
         """Raised by ``_query_fn`` when a transient failure (auth, protocol,
         network, status='failed') should be handled by the end-of-run retry
@@ -2273,9 +2330,17 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         # Poll until succeeded or failed
         # PS: No fixed poll count — uses time-based deadline (240min for Agent365,
         # indefinite for main queries). Poll interval: 15s with backoff to 30s/60s.
+        # Fabric adds a per-window stall limit (see mod19.stall_limit_minutes): a
+        # query still unfinished after half its window length is abandoned and the
+        # window split, instead of being polled forever.
         import time as _time
         poll_interval = 15  # PS starts at 15s
         poll_start = _time.monotonic()
+        stall_limit_sec = 60.0 * stall_limit_minutes(
+            (block_end - block_start).total_seconds() / 3600.0,
+            getattr(config, 'query_stall_minutes_per_hour', 0.0),
+            getattr(config, 'query_stall_min_minutes', 0.0),
+        ) if _split_enabled() else 0.0
         last_log_minute = -1
         poll_sleep_override: float | None = None
         poll_403_retries = 0
@@ -2453,12 +2518,58 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             record_count = status_result.get('RecordCount', 0)
             if status == 'succeeded':
                 write_log(f"  Query {query_id[:8]}... succeeded ({record_count} records)")
+                if status_result.get('LimitExceeded'):
+                    # Graph ends an over-limit query as "succeeded" but stops
+                    # generating records, so the result is TRUNCATED. Splitting
+                    # the window is the only way to collect the rest.
+                    write_log(
+                        f"  [LIMIT] Query {query_id[:8]} exceeded its per-query record limit "
+                        f"(limit={status_result.get('RecordCountLimit')}, "
+                        f"approx returned={status_result.get('ApproximateRecordCount')}) — "
+                        f"results are truncated",
+                        level="WARNING",
+                    )
+                    if _node_split_ok.get(p_idx):
+                        raise WindowSplitRequested(
+                            "limit_exceeded",
+                            f"isRecordCountLimitExceeded=true for query_id={query_id}",
+                        )
+                    if _split_enabled():
+                        # Cannot split further (minimum window or split budget
+                        # used up): exporting this result would silently drop
+                        # records, so fail the window (atomic run failure).
+                        _record_data_loss(
+                            phase="poll",
+                            partition_index=p_idx,
+                            query_number=q_num,
+                            block_start=block_start,
+                            block_end=block_end,
+                            activity_type=activity_type,
+                            cause="protocol",
+                            reason=(
+                                f"record limit exceeded on a window that cannot be split "
+                                f"further (result truncated) query_id={query_id}"
+                            ),
+                        )
+                        raise PartitionRetryableError(
+                            f"poll limit exceeded (truncated) p={p_idx} q#{q_num} qid={query_id[:8]}"
+                        )
                 break
             if status in ('failed', 'cancelled'):
                 write_log(
                     f"  Query {query_id[:8]} status={status} — surfacing to partition retry sweep",
                     level="WARNING",
                 )
+                if _split_enabled():
+                    # Free the tenant query slot (PS deletes failed/cancelled queries).
+                    delete_graph_audit_query(query_id, http_client=http, api_version=api_version)
+                if _node_split_ok.get(p_idx):
+                    # Retrying the identical window fails the same way (the
+                    # logs showed 24/24 identical failures); split it instead.
+                    raise WindowSplitRequested(
+                        "poll_failed",
+                        f"server returned status='{status}' for query_id={query_id}",
+                    )
                 _record_data_loss(
                     phase="poll",
                     partition_index=p_idx,
@@ -2471,6 +2582,37 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 )
                 raise PartitionRetryableError(
                     f"poll status={status} p={p_idx} q#{q_num} qid={query_id[:8]}"
+                )
+
+            # Stall limit: the service keeps answering notStarted/running but
+            # never finishes. Abandon the query so the window can be split (or,
+            # at the minimum window, failed and retried) instead of waiting
+            # indefinitely.
+            if stall_limit_sec > 0 and (_time.monotonic() - poll_start) >= stall_limit_sec:
+                _stalled_min = (_time.monotonic() - poll_start) / 60.0
+                _stall_detail = (
+                    f"status='{status}' for {_stalled_min:.0f} min "
+                    f"(limit {stall_limit_sec / 60.0:.0f} min) query_id={query_id}"
+                )
+                write_log(
+                    f"  [STALL] p={p_idx} q#{q_num} id={query_id[:8]} {_stall_detail} — abandoning query",
+                    level="WARNING",
+                )
+                delete_graph_audit_query(query_id, http_client=http, api_version=api_version)
+                if _node_split_ok.get(p_idx):
+                    raise WindowSplitRequested("poll_stall", _stall_detail)
+                _record_data_loss(
+                    phase="poll",
+                    partition_index=p_idx,
+                    query_number=q_num,
+                    block_start=block_start,
+                    block_end=block_end,
+                    activity_type=activity_type,
+                    cause="protocol",
+                    reason=f"poll stall at minimum window: {_stall_detail}",
+                )
+                raise PartitionRetryableError(
+                    f"poll stall p={p_idx} q#{q_num} qid={query_id[:8]}"
                 )
 
             # Heartbeat logging every 5 minutes (PS: heartbeat per StatusIntervalSeconds)
@@ -2644,10 +2786,27 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     # Outer slice: honor the user's PartitionHours when they supplied one
     # (any value > 0). Only fall back to the 12h auto-default when the user
     # left it unset (config default = 0). PS L22128 parity.
-    if config.partition_hours > 0:
-        effective_partition_hours = config.partition_hours
+    # On resume the checkpoint's partition indices (and the window ledger) are
+    # only meaningful for the PartitionHours the original run used. PS restores
+    # it from the checkpoint; Fabric adopts it when not supplied and refuses a
+    # conflicting value (a different slicing would skip never-fetched windows).
+    _requested_partition_hours = config.partition_hours
+    _partition_hours_source = "user-supplied"
+    if is_resume_mode() and not use_eom:
+        _resume_cp = get_checkpoint_data() or {}
+        _resume_progress = bool(
+            (_resume_cp.get("partitions") or {}).get("completed")
+            or ledger_has_progress()
+        )
+        _requested_partition_hours, _partition_hours_source = resolve_resume_partition_hours(
+            config.partition_hours,
+            int((_resume_cp.get("parameters") or {}).get("partitionHours") or 0),
+            _resume_progress,
+        )
+    if _requested_partition_hours > 0:
+        effective_partition_hours = _requested_partition_hours
         write_log(
-            f"PartitionHours={effective_partition_hours}h (user-supplied)"
+            f"PartitionHours={effective_partition_hours}h ({_partition_hours_source})"
         )
     else:
         effective_partition_hours = 12
@@ -2752,6 +2911,8 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
 
     # Track skipped partition indices across groups for resume merge
     skipped_indices: list[int] = []
+    # Window-ledger windows already Completed when this (resumed) run started.
+    _prior_ledger_done: set[int] = set()
 
     for group_idx, group in enumerate(plan):
         activities = group.get('Activities', [])
@@ -2839,6 +3000,47 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     f"  [RESUME] {len(create_and_fetch)} partition(s) need full processing"
                 )
 
+        # --- Window ledger: register roots; on resume re-run only the
+        # unfinished leaf windows of partitions split in a prior run. ---
+        def _window_scope(w_idx: int) -> str:
+            return f"g{group_idx}:{partition_service_by_index.get(w_idx) or ''}"
+
+        _idx_next[0] = max(num_partitions, ledger_max_index() if _split_enabled() else 0)
+        if is_resume_mode():
+            # Windows a prior (split-enabled) run completed under fresh indices:
+            # their shards are merged below even when this resume has splitting
+            # off, otherwise those records would be silently dropped.
+            _prior_ledger_done |= ledger_completed_indices()
+        if _split_enabled():
+            _roots_by_scope: dict[str, list[tuple]] = {}
+            for r_start, r_end, r_idx in partitions:
+                _roots_by_scope.setdefault(_window_scope(r_idx), []).append(
+                    (r_idx, r_start, r_end)
+                )
+            _classic_done = set(skipped_indices) if is_resume_mode() else set()
+            for _scope, _roots in _roots_by_scope.items():
+                ledger_register_roots(_scope, query_start, query_end, _roots, _classic_done)
+            if is_resume_mode():
+                _expanded: list[tuple] = []
+                for ps, pe, pidx in active_partitions:
+                    _leaves = ledger_unfinished_leaves(_window_scope(pidx), pidx)
+                    if _leaves is None:
+                        _expanded.append((ps, pe, pidx))
+                        continue
+                    write_log(
+                        f"  [RESUME] Partition {pidx} was split in a prior run: "
+                        f"{len(_leaves)} unfinished window(s) to re-run "
+                        f"{[lf['index'] for lf in _leaves]}"
+                    )
+                    for lf in _leaves:
+                        partition_service_by_index[int(lf['index'])] = (
+                            partition_service_by_index.get(pidx)
+                        )
+                        _expanded.append(
+                            (from_iso(lf['start']), from_iso(lf['end']), int(lf['index']))
+                        )
+                active_partitions = _expanded
+
         write_log(
             f"  Partition plan (group {group_idx + 1}/{len(plan)}): "
             f"{num_partitions} partition(s) x {slice_hours:.2f}h outer "
@@ -2882,8 +3084,14 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         for activity in activity_list:
             # Defined once per activity so both the initial pass and the
             # end-of-run retry pass below can reuse it.
-            def _run_partition(p_start, p_end, p_idx, p_total, act):
-                """Execute a single partition in a thread; spill records to disk before returning."""
+            def _run_partition_single(p_start, p_end, p_idx, p_total, act):
+                """Execute ONE window attempt in a thread; spill records to disk before returning.
+
+                Returns the record count, or a ``_NeedsSubdivision`` sentinel when the
+                1M record cap was hit. Raises ``WindowSplitRequested`` when the poll
+                loop abandoned the query and the window should be split (only for
+                windows the window-tree runner marked splittable).
+                """
                 # Each thread gets its own OrchestratorState to avoid
                 # concurrent mutation of learned block sizes / circuit breaker.
                 thread_orch = OrchestratorState(
@@ -3121,6 +3329,151 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 )
                 return count
 
+            # ----------------------------------------------------------
+            # Window-tree runner (stall / failure driven splitting)
+            # ----------------------------------------------------------
+            def _run_window_tree(root_start, root_end, root_idx, p_total, act):
+                """Run a window; when its query stalls / fails (or the record
+                cap is hit) split it in half and run the halves right here, in
+                the same worker, down to the minimum window size.
+
+                * Splitting happens in the FIRST run, as soon as the problem is
+                  seen — not after the whole pass and the retry sweep.
+                * Sibling windows keep running when one leaf fails, so only the
+                  failing leaf windows are left for the retry sweep.
+                * Every window is recorded in the checkpoint's window ledger so
+                  resume re-runs only unfinished leaves and the pipeline can
+                  prove coverage before exporting anything.
+
+                Returns the number of records collected. Raises
+                ``PartitionTreeFailed`` (carrying the failed leaf windows and
+                the records that DID complete) if any leaf window failed.
+                """
+                scope = _window_scope(root_idx)
+                min_minutes = _split_min_minutes()
+                root_entry = ledger_get(scope, root_idx)
+                root_level = int(root_entry.get('level') or 0) if root_entry else 0
+                pending = [(root_start, root_end, root_idx, root_level)]
+                completed_count = 0
+                failed_leaves: list[tuple] = []
+                errors: list[str] = []
+                split_happened = False
+
+                def _enqueue_children(parent_idx, windows, level, trigger):
+                    nodes = []
+                    for k_start, k_end in windows:
+                        k_idx = _alloc_idx()
+                        partition_service_by_index[k_idx] = partition_service_by_index.get(parent_idx)
+                        nodes.append((k_start, k_end, k_idx, level))
+                    ledger_split(
+                        scope, parent_idx, [(n[2], n[0], n[1]) for n in nodes], trigger
+                    )
+                    return nodes
+
+                def _fail_window(w_start, w_end, w_idx, message):
+                    ledger_set_state(scope, w_idx, 'Failed', error=message)
+                    failed_leaves.append((w_start, w_end, w_idx))
+                    errors.append(message)
+
+                while pending:
+                    w_start, w_end, w_idx, w_level = pending.pop(0)
+                    _node_split_ok[w_idx] = _can_split_window(w_start, w_end)
+                    ledger_set_state(scope, w_idx, 'Pending', attempt=True)
+                    try:
+                        outcome = _run_partition_single(
+                            w_start, w_end, w_idx, max(p_total, w_idx), act
+                        )
+                    except WindowSplitRequested as sig:
+                        halves = split_window(w_start, w_end, min_minutes)
+                        if halves is None or not _reserve_split_budget(2):
+                            # _node_split_ok was derived from the same inputs, so
+                            # this is a defensive guard (e.g. budget raced away).
+                            _fail_window(w_start, w_end, w_idx, f"split refused: {sig}")
+                            continue
+                        write_log(
+                            f"  [SPLIT] p={w_idx} {w_start.strftime('%Y-%m-%d %H:%M')} -> "
+                            f"{w_end.strftime('%Y-%m-%d %H:%M')} UTC "
+                            f"({(w_end - w_start).total_seconds() / 3600.0:.2f}h) "
+                            f"reason={sig.reason}: halving into "
+                            f"{(halves[0][1] - halves[0][0]).total_seconds() / 60.0:.0f} + "
+                            f"{(halves[1][1] - halves[1][0]).total_seconds() / 60.0:.0f} min windows",
+                            level="WARNING",
+                        )
+                        pending[0:0] = _enqueue_children(w_idx, halves, w_level + 1, sig.reason)
+                        split_happened = True
+                        continue
+                    except Exception as exc:
+                        write_log(
+                            f"  Window p={w_idx} {w_start.strftime('%Y-%m-%d %H:%M')} -> "
+                            f"{w_end.strftime('%Y-%m-%d %H:%M')} UTC failed: {exc}",
+                            level="ERROR",
+                        )
+                        _fail_window(w_start, w_end, w_idx, str(exc))
+                        continue
+                    finally:
+                        _node_split_ok.pop(w_idx, None)
+
+                    if isinstance(outcome, _NeedsSubdivision):
+                        # 1M-record cap hit: halve and run the halves in this
+                        # worker (same split engine and ledger as stall splits).
+                        if w_level >= int(getattr(config, 'max_subdivision_level', 20) or 20):
+                            _fail_window(
+                                w_start, w_end, w_idx,
+                                f"reached maximum subdivision depth ({w_level}) and the "
+                                f"window still exceeds the record cap",
+                            )
+                            continue
+                        pending[0:0] = _enqueue_children(
+                            w_idx, outcome.sub_windows, w_level + 1, 'cap_hit'
+                        )
+                        split_happened = True
+                        continue
+
+                    window_count = int(outcome or 0)
+                    completed_count += window_count
+                    ledger_set_state(scope, w_idx, 'Completed', records=window_count)
+
+                if failed_leaves:
+                    raise PartitionTreeFailed(
+                        f"{len(failed_leaves)} window(s) under partition {root_idx} failed: "
+                        f"{errors[0] if errors else 'unknown error'}",
+                        failed_leaves,
+                        completed_count,
+                    )
+                if split_happened:
+                    # Every sub-window finished: record the parent partition as
+                    # complete in the classic lists too (progress + legacy resume).
+                    save_checkpoint(
+                        partition_index=root_idx,
+                        state='Completed',
+                        query_id=f'graph_{root_idx}',
+                        partition_start=root_start,
+                        partition_end=root_end,
+                        record_count=0,
+                    )
+                return completed_count
+
+            def _run_partition(p_start, p_end, p_idx, p_total, act):
+                """Dispatcher entry point: legacy single attempt, or the window
+                tree when stall/failure splitting is enabled (Graph API mode)."""
+                if not _split_enabled():
+                    return _run_partition_single(p_start, p_end, p_idx, p_total, act)
+                return _run_window_tree(p_start, p_end, p_idx, p_total, act)
+
+            def _failed_windows(exc, fallback):
+                """Windows to hand to the retry sweep for a failed worker: the
+                failed LEAF windows of a split tree, else the partition itself."""
+                leaves = getattr(exc, 'failed_leaves', None)
+                return list(leaves) if leaves else [fallback]
+
+            def _credit_tree_progress(exc):
+                """Keep the records counter right for windows that completed
+                inside a tree that nevertheless failed as a whole."""
+                n = int(getattr(exc, 'completed_count', 0) or 0)
+                if n and config.memory_flush_enabled:
+                    with _shard_lock:
+                        _records_counter[0] += n
+
             # Track partitions that fail their initial pass so we can retry
             # them at the end of the activity (PS parity v1.11.3 L25686).
             failed_partitions: list[tuple] = []
@@ -3186,7 +3539,10 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                                     f"  Partition {p_idx}/{num_partitions} failed: {exc}",
                                     level="ERROR",
                                 )
-                                failed_partitions.append((p_start, p_end, p_idx))
+                                _credit_tree_progress(exc)
+                                failed_partitions.extend(
+                                    _failed_windows(exc, (p_start, p_end, p_idx))
+                                )
 
                 else:
                     # --- SEQUENTIAL EXECUTION (single partition or EOM mode) ---
@@ -3201,7 +3557,10 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                                 f"  Partition {p_idx}/{num_partitions} failed: {exc}",
                                 level="ERROR",
                             )
-                            failed_partitions.append((p_start, p_end, p_idx))
+                            _credit_tree_progress(exc)
+                            failed_partitions.extend(
+                                _failed_windows(exc, (p_start, p_end, p_idx))
+                            )
                             continue
                         if isinstance(result, _NeedsSubdivision):
                             pending_subdivisions.append(
@@ -3215,7 +3574,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 pass_partitions = []
                 for parent_idx, sub_windows in pending_subdivisions:
                     for sw_start, sw_end in sub_windows:
-                        next_partition_idx += 1
+                        next_partition_idx = _alloc_idx()
                         partition_service_by_index[next_partition_idx] = (
                             partition_service_by_index.get(parent_idx)
                         )
@@ -3228,7 +3587,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                             f"{(sw_end - sw_start).total_seconds() / 3600.0:.2f}h)"
                         )
                 if pass_partitions:
-                    num_partitions = next_partition_idx
+                    num_partitions = max(num_partitions, next_partition_idx)
                 subdivision_pass_no += 1
 
             # --- END-OF-RUN PARTITION RETRY (PS v1.11.3 L25686-L25830) ---
@@ -3237,6 +3596,9 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             # transient Graph API failures (gateway 502/503/504, query gone,
             # token blips) on individual partitions cause permanent data loss
             # while their siblings succeed.
+            # Windows created by splitting took fresh indices; keep the "p/total"
+            # shown in the retry logs consistent with them.
+            num_partitions = max(num_partitions, _idx_next[0])
             max_attempts = max(1, int(getattr(config, 'partition_max_attempts', 5)))
             retry_concurrency_cap = max(1, int(getattr(config, 'partition_retry_max_concurrency', 3)))
             retry_pass = 1
@@ -3278,7 +3640,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                                 # so the next retry pass picks them up; pretend
                                 # this index "failed" so we don't lose the work.
                                 for sw_start, sw_end in retry_count.sub_windows:
-                                    next_partition_idx += 1
+                                    next_partition_idx = _alloc_idx()
                                     partition_service_by_index[next_partition_idx] = (
                                         partition_service_by_index.get(p_idx)
                                     )
@@ -3290,7 +3652,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                                         f"{sw_end.strftime('%Y-%m-%d %H:%M')} UTC)",
                                         level="WARNING",
                                     )
-                                num_partitions = next_partition_idx
+                                num_partitions = max(num_partitions, next_partition_idx)
                                 continue
                             if config.memory_flush_enabled and retry_count:
                                 with _shard_lock:
@@ -3306,7 +3668,10 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                                 f"still failing on attempt {retry_pass}/{max_attempts}: {rexc}",
                                 level="ERROR",
                             )
-                            still_failed.append((p_start, p_end, p_idx))
+                            _credit_tree_progress(rexc)
+                            still_failed.extend(
+                                _failed_windows(rexc, (p_start, p_end, p_idx))
+                            )
                 failed_partitions = still_failed
 
             if failed_partitions:
@@ -3331,13 +3696,17 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     # When resuming, partitions that were already completed in the prior run
     # have their data saved as JSONL shards in .pax_incremental. We need to
     # include those shards in the spilled_shards list so Phase 6 processes them.
-    if is_resume_mode() and skipped_indices:
+    # Windows completed in a prior run are tracked by the window ledger as well
+    # (split partitions complete as sub-windows with fresh indices); their
+    # shards must be merged too or those records would be silently dropped.
+    _prior_complete_idx = set(skipped_indices) | _prior_ledger_done
+    if is_resume_mode() and _prior_complete_idx:
         prior_shard_dir = incremental_dir
         if prior_shard_dir.is_dir():
             import re as _re_merge
             prior_count = 0
             prior_record_count = 0
-            _skipped_set = set(skipped_indices)
+            _skipped_set = set(_prior_complete_idx)
             for fname in sorted(prior_shard_dir.iterdir()):
                 if not fname.name.endswith('.jsonl'):
                     continue

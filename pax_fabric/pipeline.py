@@ -67,6 +67,8 @@ from .mod6_pax_checkpoint import (
     get_checkpoint_data,
     get_checkpoint_path,
     is_checkpoint_enabled,
+    ledger_has_entries,
+    ledger_verify_coverage,
     read_checkpoint,
     remove_checkpoint,
     reset_checkpoint_state,
@@ -201,6 +203,40 @@ def _assert_delta_publication_complete(results: list[dict[str, Any]]) -> None:
         for item in failures
     )
     raise RuntimeError(f"Delta publication incomplete: {detail}")
+
+
+def _enforce_window_coverage(config: PAXConfig) -> None:
+    """Atomicity gate for stall/failure-driven window splitting.
+
+    Before any export or Delta write the finished query windows (checkpoint
+    window ledger) must tile the requested range exactly: no failed or pending
+    window, no gap, no overlap. Raises ``RuntimeError`` otherwise, leaving the
+    checkpoint intact so a resume re-runs only the unfinished windows. A no-op
+    when splitting is disabled for the run (the ledger is not maintained then,
+    e.g. ``MinSplitWindowMinutes=0``), in EOM mode, or when no ledger exists.
+    """
+    if int(getattr(config, "min_split_window_minutes", 0) or 0) <= 0:
+        return
+    if getattr(config, "use_eom", False):
+        return
+    problems = ledger_verify_coverage()
+    if problems:
+        write_log("")
+        write_log("  WINDOW COVERAGE CHECK FAILED (checkpoint preserved)", level="ERROR")
+        for problem in problems[:25]:
+            write_log(f"    {problem}", level="ERROR")
+        if len(problems) > 25:
+            write_log(f"    ... and {len(problems) - 25} more", level="ERROR")
+        cp_path = get_checkpoint_path()
+        if cp_path:
+            write_log(f"  Checkpoint:    {cp_path}")
+            write_log("  Resume with the path above to re-run only the unfinished windows.")
+        raise RuntimeError(
+            f"Window coverage check failed: {len(problems)} problem(s); "
+            "checkpoint preserved and export/delta stages skipped."
+        )
+    if ledger_has_entries():
+        write_log("  [COVERAGE] All query windows completed and tile the requested range.")
 
 
 def _write_delta_completion_manifest(
@@ -2074,6 +2110,13 @@ def run(params: Optional[dict] = None) -> dict:
                 f"Unrecovered partition loss detected: {unrecovered} partition(s) "
                 "failed after retry sweep; checkpoint preserved and export/delta stages skipped."
             )
+
+        # Coverage proof (window ledger): before ANY export or Delta write, the
+        # finished windows must tile the requested range exactly — no failed or
+        # pending window, no gap, no overlap. This is the atomicity gate for
+        # stall/failure-driven window splitting; it only applies when splitting
+        # is enabled for this run (otherwise the ledger is not maintained).
+        _enforce_window_coverage(ctx.config)
 
         # --------------------------------------------------------------
         # 5. Post-query: dedupe + trim + explosion + CSV export (STREAMING).

@@ -633,6 +633,13 @@ def get_graph_audit_query_status(
             "Status": data.get("status"),
             "RecordCount": 0,
             "RecordCountAvailable": "recordCount" in data,
+            # Documented auditLogQuery fields. A query that exceeds its
+            # per-query record limit still ends as "succeeded" and silently
+            # stops generating records, so the flag is the authoritative
+            # truncation signal (never inferred from the count).
+            "LimitExceeded": bool(data.get("isRecordCountLimitExceeded")),
+            "RecordCountLimit": data.get("recordCountLimit"),
+            "ApproximateRecordCount": data.get("approximateReturnedRecordCount"),
         }
 
         # Some status responses include record count
@@ -676,6 +683,46 @@ def get_graph_audit_query_status(
 
         logger.error("ERROR: Failed to get Graph query status: %s", e)
         return None
+
+
+def delete_graph_audit_query(
+    query_id: str,
+    *,
+    http_client: Any = None,
+    api_version: str = "v1.0",
+    get_uri_fn: Optional[Callable[[str], str]] = None,
+) -> bool:
+    """
+    Best-effort DELETE of a server-side audit query that is being abandoned
+    (stalled, failed or cancelled) so it stops occupying a tenant query slot.
+
+    PS equivalent: the DELETE issued for 'failed'/'cancelled' status in the
+    partition worker. Never raises: cleanup must not turn a recoverable
+    window failure into a different error.
+
+    Returns:
+        True if the service accepted the delete (or the query is already gone).
+    """
+    if not query_id or http_client is None:
+        return False
+    try:
+        if get_uri_fn:
+            uri = get_uri_fn(f"queries/{query_id}")
+        else:
+            uri = get_audit_uri(f"queries/{query_id}", api_version=api_version)
+        response = http_client.delete(uri)
+        code = getattr(response, "status_code", None)
+        ok = code in (200, 202, 204, 404)
+        if ok:
+            logger.info("  Deleted abandoned Graph audit query %s (HTTP %s)", query_id[:8], code)
+        else:
+            logger.warning(
+                "  Could not delete abandoned Graph audit query %s (HTTP %s)", query_id[:8], code
+            )
+        return ok
+    except Exception as e:  # pragma: no cover - cleanup is best effort
+        logger.warning("  Could not delete abandoned Graph audit query %s: %s", query_id[:8], e)
+        return False
 
 
 # ---------------------------------------------------------------------------

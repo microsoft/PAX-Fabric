@@ -36,6 +36,8 @@ from typing import (
 )
 from dataclasses import dataclass, field
 
+from .mod19_pax_window_split import WindowSplitRequested
+
 logger = logging.getLogger(__name__)
 
 
@@ -1244,6 +1246,10 @@ def invoke_partition_graph_processing(
                 log_ctx,
                 page_callback=page_cb,
             )
+        except WindowSplitRequested:
+            # Not a failure: the poll loop abandoned the query and wants the
+            # window split. Let the caller's window-tree runner handle it.
+            raise
         except Exception as exc:
             err_tag = _classify_exception(exc)
             is_throttle = _is_throttling_exception(exc)

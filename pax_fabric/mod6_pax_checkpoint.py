@@ -39,6 +39,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable, IO, Optional
 
+from . import mod19_pax_window_split as _w
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -799,7 +801,10 @@ def save_checkpoint_to_disk(
 
     # Serialize across worker threads — the .tmp + rename pattern shares one
     # filename, so concurrent callers used to race and the losers saw errno 2.
-    with _checkpoint_save_lock:
+    # The window-ledger lock is taken first (same order as every ledger
+    # mutator) so json.dump never iterates the ledger while another thread
+    # adds entries to it.
+    with _ledger_lock, _checkpoint_save_lock:
         try:
             # Update timestamp
             _checkpoint_data["lastUpdated"] = (
@@ -969,6 +974,243 @@ def save_checkpoint(
 
     # Save to disk
     save_checkpoint_to_disk()
+
+
+# ---------------------------------------------------------------------------
+# WINDOW LEDGER (stall / failure driven window splitting)
+# ---------------------------------------------------------------------------
+# The classic checkpoint tracks partitions by INDEX only. When a window is split
+# into sub-windows the children get fresh indices, so completed work could not be
+# mapped back to a time range on resume. The ledger records every window by its
+# (scope, index) with its exact UTC start/end, parent/children and state so that:
+#   * resume re-runs only the unfinished leaf windows of a split partition, and
+#   * a coverage proof (verify_tiling) can show the finished windows tile the
+#     requested range before anything is exported.
+# Stored under the additive top-level key ``windows`` (older readers ignore it).
+
+_ledger_lock = threading.RLock()
+
+
+def _ledger_block(create: bool = True) -> Optional[dict[str, Any]]:
+    if not _checkpoint_data:
+        return None
+    blk = _checkpoint_data.get("windows")
+    if blk is None and create:
+        blk = {"ranges": {}, "entries": {}}
+        _checkpoint_data["windows"] = blk
+    return blk
+
+
+def ledger_key(scope: str, index: int) -> str:
+    return f"{scope}#{int(index)}"
+
+
+def ledger_has_entries() -> bool:
+    blk = _ledger_block(create=False)
+    return bool(blk and blk.get("entries"))
+
+
+def ledger_has_progress() -> bool:
+    """True when at least one window has Completed or been Split (i.e. real
+    work depends on the current slicing; Pending roots alone do not)."""
+    with _ledger_lock:
+        blk = _ledger_block(create=False)
+        if not blk:
+            return False
+        return any(
+            e.get("state") in (_w.STATE_COMPLETED, _w.STATE_SPLIT)
+            for e in blk["entries"].values()
+        )
+
+
+def ledger_get(scope: str, index: int) -> Optional[dict[str, Any]]:
+    """Returns a copy of the ledger entry, or None."""
+    with _ledger_lock:
+        blk = _ledger_block(create=False)
+        if not blk:
+            return None
+        e = blk["entries"].get(ledger_key(scope, index))
+        return dict(e) if e else None
+
+
+def ledger_max_index() -> int:
+    """Highest partition index known to the ledger or the classic lists."""
+    with _ledger_lock:
+        highest = 0
+        blk = _ledger_block(create=False)
+        if blk:
+            for e in blk["entries"].values():
+                highest = max(highest, int(e.get("index") or 0))
+        if _checkpoint_data:
+            parts = _checkpoint_data.get("partitions") or {}
+            for lst in (parts.get("completed") or [], parts.get("queryCreated") or []):
+                for p in lst:
+                    try:
+                        highest = max(highest, int(p.get("index") or 0))
+                    except (TypeError, ValueError):
+                        pass
+        return highest
+
+
+def ledger_completed_indices() -> set[int]:
+    """Indices of ledger windows already Completed (used to merge prior shards)."""
+    with _ledger_lock:
+        blk = _ledger_block(create=False)
+        if not blk:
+            return set()
+        return {
+            int(e["index"]) for e in blk["entries"].values()
+            if e.get("state") == _w.STATE_COMPLETED
+        }
+
+
+def ledger_register_roots(
+    scope: str,
+    range_start: datetime,
+    range_end: datetime,
+    roots: list[tuple[int, datetime, datetime]],
+    completed_indices: Optional[set[int]] = None,
+) -> None:
+    """Registers the planned root windows of a scope (idempotent).
+
+    Roots already present keep their state (a resumed run). A root that the
+    classic checkpoint lists as Completed is recorded as Completed.
+    """
+    if not _checkpoint_data:
+        return
+    completed_indices = completed_indices or set()
+    with _ledger_lock:
+        blk = _ledger_block()
+        blk["ranges"][scope] = {
+            "start": _w.to_iso(range_start),
+            "end": _w.to_iso(range_end),
+        }
+        for idx, p_start, p_end in roots:
+            key = ledger_key(scope, idx)
+            existing = blk["entries"].get(key)
+            if existing is None:
+                blk["entries"][key] = {
+                    "scope": scope,
+                    "index": int(idx),
+                    "parent": None,
+                    "level": 0,
+                    "start": _w.to_iso(p_start),
+                    "end": _w.to_iso(p_end),
+                    "state": (
+                        _w.STATE_COMPLETED if idx in completed_indices else _w.STATE_PENDING
+                    ),
+                    "records": 0,
+                    "attempts": 0,
+                    "trigger": None,
+                    "lastError": None,
+                    "children": [],
+                }
+            elif idx in completed_indices and existing.get("state") == _w.STATE_PENDING:
+                existing["state"] = _w.STATE_COMPLETED
+        save_checkpoint_to_disk()
+
+
+def ledger_set_state(
+    scope: str,
+    index: int,
+    state: str,
+    *,
+    records: Optional[int] = None,
+    error: Optional[str] = None,
+    attempt: bool = False,
+    save: bool = True,
+) -> None:
+    """Updates a window's state (no-op when the window is not in the ledger)."""
+    with _ledger_lock:
+        blk = _ledger_block(create=False)
+        if not blk:
+            return
+        e = blk["entries"].get(ledger_key(scope, index))
+        if e is None:
+            return
+        e["state"] = state
+        if records is not None:
+            e["records"] = int(records)
+        if error is not None:
+            e["lastError"] = str(error)[:500]
+        elif state == _w.STATE_COMPLETED:
+            e["lastError"] = None
+        if attempt:
+            e["attempts"] = int(e.get("attempts") or 0) + 1
+        if save:
+            save_checkpoint_to_disk()
+
+
+def ledger_split(
+    scope: str,
+    parent_index: int,
+    children: list[tuple[int, datetime, datetime]],
+    trigger: str,
+) -> None:
+    """Marks the parent Split and registers its children in one atomic save."""
+    with _ledger_lock:
+        blk = _ledger_block()
+        if blk is None:
+            return
+        parent = blk["entries"].get(ledger_key(scope, parent_index))
+        level = int(parent.get("level") or 0) + 1 if parent else 1
+        if parent is not None:
+            parent["state"] = _w.STATE_SPLIT
+            parent["trigger"] = trigger
+            parent["children"] = [int(c[0]) for c in children]
+        for idx, c_start, c_end in children:
+            blk["entries"][ledger_key(scope, idx)] = {
+                "scope": scope,
+                "index": int(idx),
+                "parent": int(parent_index),
+                "level": level,
+                "start": _w.to_iso(c_start),
+                "end": _w.to_iso(c_end),
+                "state": _w.STATE_PENDING,
+                "records": 0,
+                "attempts": 0,
+                "trigger": None,
+                "lastError": None,
+                "children": [],
+            }
+        # The abandoned query of the parent must not linger as "query created".
+        if _checkpoint_data:
+            qc = _checkpoint_data.get("partitions", {}).get("queryCreated")
+            if isinstance(qc, list):
+                _checkpoint_data["partitions"]["queryCreated"] = [
+                    q for q in qc if q.get("index") != parent_index
+                ]
+        save_checkpoint_to_disk()
+
+
+def ledger_unfinished_leaves(scope: str, root_index: int) -> Optional[list[dict[str, Any]]]:
+    """See :func:`mod19_pax_window_split.unfinished_leaves` (thread-safe copy)."""
+    with _ledger_lock:
+        blk = _ledger_block(create=False)
+        if not blk:
+            return None
+        return _w.unfinished_leaves(blk["entries"], scope, root_index)
+
+
+def ledger_verify_coverage() -> list[str]:
+    """Coverage proof over every registered scope. Empty list == fully covered
+    (or no ledger in use)."""
+    with _ledger_lock:
+        blk = _ledger_block(create=False)
+        if not blk or not blk.get("entries"):
+            return []
+        problems: list[str] = []
+        by_scope: dict[str, list[dict[str, Any]]] = {}
+        for e in blk["entries"].values():
+            by_scope.setdefault(e.get("scope", ""), []).append(e)
+        for scope, entries in sorted(by_scope.items()):
+            rng = blk["ranges"].get(scope)
+            if not rng:
+                problems.append(f"[{scope}] no registered range")
+                continue
+            for p in _w.verify_tiling(entries, _w.from_iso(rng["start"]), _w.from_iso(rng["end"])):
+                problems.append(f"[{scope}] {p}")
+        return problems
 
 
 # ---------------------------------------------------------------------------
