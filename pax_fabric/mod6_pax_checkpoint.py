@@ -775,6 +775,47 @@ def initialize_checkpoint_for_new_run(
 # 40. Save-CheckpointToDisk (Line 9276) — CHANGED in v1.11.1: +comment only
 # ---------------------------------------------------------------------------
 
+def _write_checkpoint_json_durable(path: str, data: dict[str, Any]) -> None:
+    """Write ``data`` to ``path`` and push it to storage as far as the mount allows.
+
+    ``flush`` + ``fsync`` make the bytes durable before the caller swaps the
+    file into place. ``fsync`` is best effort: some mounts (FUSE / network
+    backed) reject it, which must never break a checkpoint save.
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+
+
+def _swap_checkpoint_into_place(temp_path: str, final_path: str) -> None:
+    """Replace ``final_path`` with ``temp_path`` without a window in which no
+    checkpoint exists.
+
+    ``os.replace`` swaps the directory entry in one step (the same pattern this
+    package already uses for the watermark state and the Delta manifest), so a
+    crash leaves either the previous checkpoint or the new one - never neither.
+    If the mount rejects it, fall back to the previous remove-then-rename
+    behaviour so a save can never fail where it used to succeed.
+    """
+    try:
+        os.replace(temp_path, final_path)
+        return
+    except OSError as exc:
+        logger.warning(
+            f"  Checkpoint atomic replace failed ({exc}); falling back to remove-then-rename."
+        )
+    if os.path.exists(final_path):
+        try:
+            os.remove(final_path)
+        except OSError:
+            pass
+    os.rename(temp_path, final_path)
+
+
 def save_checkpoint_to_disk(
     dest_tier: Optional[dict[str, str]] = None,
     run_timestamp: Optional[str] = None,
@@ -822,20 +863,11 @@ def save_checkpoint_to_disk(
                 total - completed_count - query_created_count
             )
 
-            # Write to temp file first (atomic write pattern)
+            # Write to temp file first (atomic write pattern), then swap it into
+            # place in a single step so no moment exists without a checkpoint.
             temp_path = f"{_checkpoint_path}.tmp"
-            with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump(_checkpoint_data, f, indent=2, ensure_ascii=False)
-
-            # Remove destination first if it exists
-            if os.path.exists(_checkpoint_path):
-                try:
-                    os.remove(_checkpoint_path)
-                except OSError:
-                    pass
-
-            # Rename to final (atomic on most filesystems)
-            os.rename(temp_path, _checkpoint_path)
+            _write_checkpoint_json_durable(temp_path, _checkpoint_data)
+            _swap_checkpoint_into_place(temp_path, _checkpoint_path)
 
             # v1.11.2: Fabric tier — mirror full resume artifact set to OneLake (PS L11726-11728)
             if dest_tier and dest_tier.get("Purview") == "Fabric":
@@ -1440,6 +1472,85 @@ def invoke_hardened_partition_create(
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint recovery from a leftover temp file
+# ---------------------------------------------------------------------------
+# The save writes the COMPLETE new checkpoint to ``<name>.json.tmp`` and then
+# swaps it into place. If a process dies in an unlucky moment (or a mount does
+# not honour the atomic swap) the ``.json`` can be missing while the ``.tmp``
+# still holds the newest full snapshot. Resume may adopt it, but ONLY after the
+# file proves complete: it must parse, carry every required section and belong
+# to the same run as the file name. A partial ``.tmp`` is never used.
+
+_CHECKPOINT_NAME_RE = re.compile(r"^\.pax_checkpoint_(.+)\.json$")
+_CHECKPOINT_TMP_REQUIRED_KEYS = (
+    "version", "runTimestamp", "outputFiles", "partitions", "parameters", "statistics",
+)
+# Auto-discovery looks into OTHER run folders; leave a fresh .tmp alone so a
+# live run that is between its two save steps is never disturbed.
+_TMP_RECOVERY_MIN_AGE_SECONDS = 60.0
+
+
+def _checkpoint_tmp_problem(tmp_path: str, final_path: str) -> Optional[str]:
+    """Return None when ``tmp_path`` is a complete checkpoint for ``final_path``,
+    otherwise a short reason it must not be used."""
+    try:
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        return f"not readable JSON ({exc})"
+    if not isinstance(data, dict):
+        return "not a JSON object"
+    for key in _CHECKPOINT_TMP_REQUIRED_KEYS:
+        if key not in data:
+            return f"missing section '{key}'"
+    m = _CHECKPOINT_NAME_RE.match(os.path.basename(final_path))
+    if m and str(data.get("runTimestamp")) != m.group(1):
+        return "runTimestamp does not match the checkpoint file name"
+    parts = data["partitions"]
+    if (
+        not isinstance(parts, dict)
+        or not isinstance(parts.get("completed"), list)
+        or not isinstance(parts.get("queryCreated"), list)
+    ):
+        return "partitions section is malformed"
+    return None
+
+
+def recover_checkpoint_from_tmp(checkpoint_path: str, min_age_seconds: float = 0.0) -> bool:
+    """Promote ``<checkpoint_path>.tmp`` to ``checkpoint_path`` when the checkpoint
+    is missing and the temp file is a complete snapshot.
+
+    Does nothing (returns False) if the checkpoint exists, no temp file exists,
+    the temp file is younger than ``min_age_seconds`` or fails validation.
+    """
+    tmp_path = f"{checkpoint_path}.tmp"
+    if os.path.exists(checkpoint_path) or not os.path.exists(tmp_path):
+        return False
+    if min_age_seconds > 0:
+        try:
+            if time.time() - os.path.getmtime(tmp_path) < min_age_seconds:
+                return False
+        except OSError:
+            return False
+    problem = _checkpoint_tmp_problem(tmp_path, checkpoint_path)
+    if problem:
+        logger.warning(
+            f"[CHECKPOINT-RECOVERY] Ignoring leftover {os.path.basename(tmp_path)}: {problem}."
+        )
+        return False
+    try:
+        os.replace(tmp_path, checkpoint_path)
+    except OSError as exc:
+        logger.warning(f"[CHECKPOINT-RECOVERY] Could not restore checkpoint from temp file: {exc}")
+        return False
+    logger.warning(
+        f"[CHECKPOINT-RECOVERY] {os.path.basename(checkpoint_path)} was missing; restored it from "
+        f"the complete temp snapshot left by an interrupted save. Resuming from that snapshot."
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # 42. Read-Checkpoint (Line 9434)
 # ---------------------------------------------------------------------------
 
@@ -1468,6 +1579,11 @@ def read_checkpoint(
         True if valid and loaded, False if invalid.
     """
     global _checkpoint_path, _checkpoint_data, _partial_output_path, _is_resume_mode
+
+    # An interrupted save can leave the checkpoint missing but a complete
+    # ``.tmp`` snapshot behind; adopt it only if it validates.
+    if not os.path.exists(checkpoint_path):
+        recover_checkpoint_from_tmp(checkpoint_path)
 
     if not os.path.exists(checkpoint_path):
         logger.error(f"ERROR: Checkpoint file not found: {checkpoint_path}")
@@ -1624,6 +1740,13 @@ def find_checkpoints(output_path: str) -> list[dict[str, Any]]:
         for fname in os.listdir(output_path):
             if re.match(r"^\.pax_checkpoint_.*\.json$", fname):
                 checkpoint_files.append(os.path.join(output_path, fname))
+            elif re.match(r"^\.pax_checkpoint_.*\.json\.tmp$", fname):
+                # Orphaned temp snapshot (checkpoint missing): recover if complete.
+                final_path = os.path.join(output_path, fname[: -len(".tmp")])
+                if recover_checkpoint_from_tmp(
+                    final_path, min_age_seconds=_TMP_RECOVERY_MIN_AGE_SECONDS
+                ):
+                    checkpoint_files.append(final_path)
     except OSError:
         return []
 
