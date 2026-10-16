@@ -273,9 +273,11 @@ class PAXConfig:
     min_split_window_minutes: int = 45
     # Wait before giving up on a query = per_hour * window hours (30 => half the
     # window length), never less than query_stall_min_minutes. 0 disables the
-    # stall limit (poll `failed` still splits).
+    # stall limit (poll `failed` still splits). The 45 min floor equals the
+    # smallest splittable window, so windows that cannot be split further wait
+    # a full 45 min while larger windows keep "half their length".
     query_stall_minutes_per_hour: float = 30.0
-    query_stall_min_minutes: float = 30.0
+    query_stall_min_minutes: float = 45.0
     # Hard cap on extra queries created by splitting in one run (tenant limits:
     # >=200 submissions/day, >=50 queued or running queries).
     max_split_submissions: int = 80
